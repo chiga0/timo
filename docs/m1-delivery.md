@@ -2,6 +2,8 @@
 
 目标是从本地入口交办一份合成 SSE 日志诊断，经固定版 T3 执行，独立检查候选，重启后仍能查询最终交付。实现使用 [技术设计](technical-design.md) 的单包、Unix socket 和 SQLite。M1.4–M1.6 单独验收。
 
+**实现状态（2026-11-26）：M1.1–M1.3 代码完成，工程测试通过；固定版 T3 上的真实运行验收已通过（第 2、3 步），第 1 步与新进程重启后的续跑待补。** 模块位置：`src/cli.ts`（命令与退出码）、`src/service/task-service.ts`（应用层与状态规则）、`src/store/`（迁移、任务、制品）、`src/adapters/t3.ts`（MCP 适配器）与 `src/adapters/retry.ts`（有界恢复）、`src/service/runner.ts`（后台推进）、`src/sse/contract.ts`（`sse-v1` 验收器）。测试为 `test/sse.test.ts`、`test/store.test.ts`、`test/runner.test.ts`、`test/cli.test.ts`，用 `test/support/fake-t3.ts` 作为替换传输。`npm run build && npm test` 在 Node 24.15.0、TypeScript 5.9.3、`@modelcontextprotocol/sdk` 1.32.2 上 33 项全通过。
+
 ## 启动与命令
 
 实现后从干净检出执行 npm ci、npm run build、npm test。CLI 构建入口为 node dist/cli.js，发布时命令名为 timo。
@@ -23,7 +25,22 @@
 
 持久化状态使用 accepted、running、waiting、verifying、completed、failed。允许按 [业务状态图](domain-model.md) 推进；M1.1–M1.3 实现 happy path、T3 不可达等待、明确失败和未知外部效果等待。首次状态快照和派发意图在同一事务提交；SQLite 为唯一写入点。重启后已完成结果原样读回，未发送任务可继续执行，已知外部标识优先复查。无法证明远端结果时留在 waiting，并明确原因，跨 OAuth 代次安全重放归 M1.4。
 
-出站顺序为绑定项目 → launch 空线程 → 保存 threadId → queue 发送 → 保存 runId → 等待并读取该 run 的候选。创建和发送分别使用持久、稳定的请求 ID。网络调用期间不持有数据库事务。T3 的 completed 只推动任务进入 verifying。只有独立检查成功才写入 completed。适配器采用公开 OAuth MCP，检查工具错误与结构化输出。真实运行测试使用隔离项目和合成数据。 [接入合同](t3-adoption.md)
+出站顺序为 `t3_thread_launch`（携带首个 prompt、`outputSchema` 与 `modelSelection.instanceId`）→ 保存 threadId 与 runId → 用 `t3_thread_wait`（`untilOutput: true`）等待并从 `output` 读取结构化候选。固定版没有"先建空线程再发送"这一步：launch 本身就是外部效果，因此重放前必须已有持久化的 threadId。`modelSelection` 的线上字段是 `instanceId`，不是 `providerInstanceId`。创建与发送共用持久、稳定的 `clientRequestId`；去重作用域随 OAuth 授权代次变化，新授权下同键会得到不同线程。网络调用期间不持有数据库事务。T3 的 completed 只推动任务进入 verifying。只有独立检查成功才写入 completed。适配器采用公开 OAuth MCP，检查工具错误与结构化输出。真实运行测试使用隔离项目和合成数据。 [接入合同](t3-adoption.md)
+
+## 固定版实测证据（2026-11-26）
+
+环境：T3 `v0.1.12`（GitHub 发行资产 `t3-0.1.12-darwin-arm64.tar.gz`，按 `SHA256SUMS` 核验，自报 `t3 v0.1.12`）；隔离 `--base-dir` 与只含一个合成 Git 仓的项目；Pi provider（`pi` / `default`，PAI-EAS 身份）；MCP 走 `orchestration:read`+`orchestration:operate` 的 `approval-required` 授权；Timo 用 `TIMO_T3_TOKEN` 注入短期 token。
+
+| 项 | 实测结果 | 状态 |
+| --- | --- | --- |
+| 正例（`disconnect.log`） | 任务 `completed`，`threadId` 为 `mcp:launch:<sha256>`，`runId` 为 `run:thread:<...>:ordinal:1`；结果为 `disconnected`，事故 `alpha` 2→4、`beta` 6→null；`verification.result` 为 `accepted`，`verifierVersion` 为 `sse-v1` | PASS |
+| 重启后读回 | 停止并重启 `timo serve` 后，同一 taskId 的 `result`、`threadId`、`runId` 与重启前逐字段一致 | PASS |
+| 幂等与冲突 | 同 request-id 同字节返回原 taskId；同 request-id 不同字节退出 4；未知任务退出 3 | PASS |
+| T3 拒绝路径 | 两次真实拒绝均被适配器如实记录并置 `failed`：`modelSelection.instanceId` 字段名错误；`Provider instance "pi" is disabled for project` | PASS（发现接口偏差并已修正） |
+
+本轮暴露并修正的适配点：`t3_thread_send`/`launch` 的 `modelSelection` 字段为 `instanceId`；结构化结果来自 `t3_thread_wait` 的 `output` 而非 `t3_thread_read`；Pi 驱动在 T3 中默认关闭，需在隔离实例的 `userdata/settings.json` 写入 `providerInstances.pi = {"driver":"pi","enabled":true}` 才能用于验收（该文件缺失 `driver` 会导致 T3 回退到默认设置）。
+
+未覆盖：进程被强杀（SIGKILL）后由新进程续跑同一派发；跨 OAuth 代次的重放；长任务超过 deadline 时的 `effect_unknown` 实机反例。
 
 ## SSE 诊断合同
 
