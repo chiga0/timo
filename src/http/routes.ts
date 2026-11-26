@@ -2,6 +2,7 @@ import type { Router } from "../http/server.js";
 import { RouteError } from "../http/server.js";
 import type { TaskService } from "../service/task-service.js";
 import { TaskConflictError, TaskNotFoundError, InvalidInputError } from "../service/task-service.js";
+import { ProposalConflictError } from "../auth/proposals.js";
 import { RequestConflictError } from "../store/tasks.js";
 import { CommandError } from "../ipc.js";
 import type { EventLedger } from "../events/ledger.js";
@@ -72,9 +73,14 @@ export function registerApi(router: Router, deps: ApiDeps): void {
 
   router.add("GET", "/api/tasks/:id/events", (context) => {
     const taskId = context.params.id!;
+    const afterSeq = parseNonNegativeInt(context.query.get("afterSeq"), 0);
+    const wantsJson = context.query.get("format") === "json" || !context.accept.includes("text/event-stream");
+    if (wantsJson) {
+      const limit = parsePositiveInt(context.query.get("limit"), 500);
+      return { body: { events: deps.ledger.forTask(taskId, afterSeq, limit) } };
+    }
     return {
       stream: async (res, signal) => {
-        const afterSeq = parseNonNegativeInt(context.query.get("afterSeq"), 0);
         await streamEvents(deps, res, signal, { afterSeq, heartbeatMs, filter: (event) => event.taskId === taskId });
       },
     };
@@ -155,20 +161,34 @@ export function registerApi(router: Router, deps: ApiDeps): void {
     return { body: { taskId, ...result } };
   });
 
+  router.add("GET", "/api/tasks/:id/proposals", (context) => {
+    const taskId = context.params.id!;
+    return { body: { proposals: withMappedErrors(() => deps.service.listProposals(taskId)) } };
+  });
+
   router.add("POST", "/api/tasks/:id/proposals", (context) => {
     const taskId = context.params.id!;
     const body = asRecord(context.body);
     const kind = body.kind === "grant" ? "grant" : "brief";
-    const diff = Array.isArray(body.diff)
+    let diff = Array.isArray(body.diff)
       ? body.diff.filter(
           (item): item is { field: string; before: string; after: string } =>
             !!item && typeof item === "object" && typeof (item as { field?: unknown }).field === "string",
         )
       : [];
+    let briefPayload = body.brief;
+    // Shorthand: allow callers (like the web UI) to propose a new `goal` and
+    // auto-compute the full brief + before/after diff against the current brief.
+    if (kind === "brief" && !briefPayload && typeof body.goal === "string" && body.goal.trim() !== "") {
+      const current = withMappedErrors(() => deps.service.getBrief(taskId));
+      const nextGoal = body.goal.trim();
+      briefPayload = { ...current, goal: nextGoal };
+      if (diff.length === 0) diff = [{ field: "goal", before: current.goal, after: nextGoal }];
+    }
     const change = {
       kind,
       diff,
-      ...(kind === "brief" && body.brief ? { brief: body.brief } : {}),
+      ...(kind === "brief" && briefPayload ? { brief: briefPayload } : {}),
       ...(kind === "grant" && Array.isArray(body.grants) ? { grants: body.grants } : {}),
     } as Parameters<TaskService["proposeChange"]>[1]["change"];
     const proposal = withMappedErrors(() => deps.service.proposeChange(taskId, { change, reason: optionalString(body.reason) ?? "proposed change" }));
@@ -271,6 +291,7 @@ export function toRouteError(error: unknown): RouteError {
   if (error instanceof RouteError) return error;
   if (error instanceof TaskNotFoundError) return new RouteError(404, "not_found", error.message);
   if (error instanceof TaskConflictError) return new RouteError(409, error.code, error.message, error.details);
+  if (error instanceof ProposalConflictError) return new RouteError(409, error.code, error.message);
   if (error instanceof RequestConflictError) return new RouteError(409, "request_conflict", error.message);
   if (error instanceof InvalidInputError) return new RouteError(400, "invalid_input", error.message);
   if (error instanceof CommandError) {

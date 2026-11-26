@@ -13,6 +13,14 @@ import { toIso, newId } from "../util.js";
 import { SSE_CANDIDATE_SCHEMA } from "../sse/contract.js";
 import { WatchdogMonitor, type WatchdogThresholds } from "../watchdog/monitor.js";
 
+const NON_RUNNABLE_WAIT_REASONS: ReadonlySet<string> = new Set([
+  "needs_human_decision",
+  "needs_cos_triage",
+  "input_incomplete",
+  "waiting_external_ci",
+  "budget_exhausted",
+]);
+
 export interface RunnerOptions {
   store: TaskStore;
   service: TaskService;
@@ -95,6 +103,12 @@ export class TaskRunner {
       };
       this.unsubscribes.push(this.options.bus.on("task_created", wake));
       this.unsubscribes.push(this.options.bus.on("task_stopping", wake));
+      this.unsubscribes.push(
+        this.options.bus.on("run_observed", (event) => {
+          const auth = (event.payload as { authorization?: { approved?: boolean } } | null)?.authorization;
+          if (auth?.approved === true) wake();
+        }),
+      );
     }
     schedule(0);
   }
@@ -135,7 +149,7 @@ export class TaskRunner {
         const task = this.options.store.get(job.taskId);
         if (!task) continue;
         if (task.status === "stopping") work.set(job.taskId, "stop");
-        else if (this.isRunnable(task.status)) {
+        else if (this.isTaskRunnable(task)) {
           if (!work.has(job.taskId) || work.get(job.taskId) === "reconcile") work.set(job.taskId, "dispatch");
         }
       }
@@ -146,10 +160,11 @@ export class TaskRunner {
       }
       for (const item of this.options.store.listPendingDispatches()) {
         const task = this.options.store.get(item.taskId);
-        if (!task || !this.isRunnable(task.status)) continue;
+        if (!task || !this.isTaskRunnable(task)) continue;
         if (!work.has(item.taskId)) work.set(item.taskId, "dispatch");
       }
       for (const item of this.options.store.listInflightTasks()) {
+        if (!this.isTaskRunnable(item)) continue;
         if (!work.has(item.taskId)) work.set(item.taskId, "reconcile");
       }
 
@@ -186,9 +201,17 @@ export class TaskRunner {
     }
   }
 
-  /** Only these states may still be dispatched or reconciled. */
+  /** Only these states may be automatically dispatched or reconciled without human input. */
   private isRunnable(status: TaskStatus): boolean {
     return status === "accepted" || status === "running" || status === "waiting";
+  }
+
+  private isTaskRunnable(task: { status: TaskStatus; waitingReason: WaitingReason | null }): boolean {
+    if (task.status === "accepted" || task.status === "running") return true;
+    if (task.status !== "waiting") return false;
+    // Human-gated, incomplete, budget-exhausted, and external-CI waits must never be auto-dispatched.
+    if (task.waitingReason === null) return true;
+    return !NON_RUNNABLE_WAIT_REASONS.has(task.waitingReason);
   }
 
   /**
@@ -202,13 +225,14 @@ export class TaskRunner {
     const now = new Date();
     const observations = store.listInflightTasks().map((item) => {
       const lastActivity = store.getEvidence<string>(item.taskId, "lastActivityAt") ?? item.updatedAt;
+      const runStartedAt = store.getEvidence<string>(item.taskId, "runStartedAt") ?? null;
       const failures = store.getEvidence<string[]>(item.taskId, "recentFailures") ?? [];
       return {
         taskId: item.taskId,
         status: item.status,
         waitingReason: item.waitingReason,
         lastActivityAt: lastActivity,
-        runStartedAt: item.updatedAt,
+        runStartedAt,
         hasProgress: store.getEvidence<boolean>(item.taskId, "hasProgress") === true,
         failureFingerprints: failures,
         changedFiles: store.getEvidence<string[]>(item.taskId, "changedFiles") ?? [],
@@ -221,6 +245,7 @@ export class TaskRunner {
     }
     for (const signal of report.signals) {
       // Only the signal is committed here; triage/steering is Step 5.2's job.
+      // Never enqueue a duplicate JOB_DISPATCH for an already-running task.
       this.options.writer.commit({
         taskId: signal.taskId,
         type: "watchdog_signal",
@@ -228,7 +253,6 @@ export class TaskRunner {
         options: {
           idempotencyKey: `watchdog:${signal.kind}:${signal.observedAt}`,
           now: signal.observedAt,
-          enqueue: [{ kind: JOB_DISPATCH, dedupeKey: `watchdog:${signal.kind}:${signal.observedAt}`, runAfter: signal.observedAt }],
         },
       });
       this.options.log(`watchdog ${signal.kind} on ${signal.taskId}: ${signal.detail}`);
@@ -359,6 +383,8 @@ export class TaskRunner {
       payload: { threadId, runId, runStatus: "completed" },
       options: { idempotencyKey: `observed:${runId}:completed`, now },
       project: () => {
+        store.setEvidence(taskId, "hasProgress", true, now);
+        store.setEvidence(taskId, "lastActivityAt", now, now);
         store.setStatus(taskId, "verifying", null, now);
       },
     });
@@ -386,7 +412,7 @@ export class TaskRunner {
   private async advance(taskId: string): Promise<void> {
     const { store, t3 } = this.options;
     const task = store.get(taskId);
-    if (!task || !this.isRunnable(task.status)) return;
+    if (!task || !this.isTaskRunnable(task)) return;
     const now = () => toIso(new Date());
 
     if (!t3) {
@@ -416,13 +442,16 @@ export class TaskRunner {
       return;
     }
 
+    const startedIso = now();
     this.options.writer.commit({
       taskId,
       type: "dispatch_started",
       payload: { operationId: operation.operationId },
-      options: { idempotencyKey: `dispatch:${operation.operationId}`, now: now() },
+      options: { idempotencyKey: `dispatch:${operation.operationId}`, now: startedIso },
       project: () => {
-        store.setStatus(taskId, "running", null, now());
+        store.setStatus(taskId, "running", null, startedIso);
+        if (!store.getEvidence<string>(taskId, "runStartedAt")) store.setEvidence(taskId, "runStartedAt", startedIso, startedIso);
+        store.setEvidence(taskId, "lastActivityAt", startedIso, startedIso);
       },
     });
     const retry = new RetryTracker(this.options.retryPolicy ?? DEFAULT_RETRY_POLICY);
@@ -516,9 +545,11 @@ export class TaskRunner {
           return;
         }
         if (!waited.ok) {
+          this.recordFailureFingerprint(taskId, failureFingerprint(waited.error), now());
           if (waited.error.retryable) continue;
           return this.failFromError(taskId, waited.error, attemptId, "wait", { externalEffect: true });
         }
+        store.setEvidence(taskId, "lastActivityAt", now(), now());
         if (waited.value.output !== undefined) awaitedOutput = waited.value.output;
         if (!waited.value.timedOut) {
           finalStatus = waited.value.status;
@@ -717,6 +748,12 @@ export class TaskRunner {
     const previous = store.getEvidence<number>(taskId, "dispatchFailures") ?? 0;
     const count = previous + 1;
     return Math.min(policy.maxDelayMs, Math.max(policy.firstDelayMs, this.options.pollIntervalMs * 4 * 2 ** Math.min(count - 1, 6)));
+  }
+
+  private recordFailureFingerprint(taskId: string, fingerprint: string, now: string): void {
+    const { store } = this.options;
+    const previous = store.getEvidence<string[]>(taskId, "recentFailures") ?? [];
+    store.setEvidence(taskId, "recentFailures", [...previous.slice(-9), fingerprint], now);
   }
 
   private backoffFor(taskId: string): number {

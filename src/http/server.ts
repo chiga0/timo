@@ -16,6 +16,8 @@ export interface RouteContext {
   query: URLSearchParams;
   params: Record<string, string>;
   body: unknown;
+  /** Raw Accept header, used to negotiate JSON vs SSE on `/events` endpoints. */
+  accept: string;
   /** True when the caller authenticated as the local CLI over the Unix socket. */
   trustedLocal: boolean;
 }
@@ -205,12 +207,14 @@ async function handleRequest(
       return;
     }
 
+    const accept = typeof req.headers.accept === "string" ? req.headers.accept : "";
     const dispatched = await options.router.dispatch({
       method: req.method ?? "GET",
       path,
       query: url.searchParams,
       params: {},
       body: undefined,
+      accept,
       trustedLocal,
     });
     if (!dispatched) {
@@ -229,6 +233,7 @@ async function handleRequest(
       query: url.searchParams,
       params: dispatched.params,
       body,
+      accept,
       trustedLocal,
     });
 

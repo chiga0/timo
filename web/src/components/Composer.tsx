@@ -22,7 +22,7 @@ export function Composer(props: { disabled: boolean; onSubmit: (text: string) =>
               placeholder="交办一件事：粘贴一段合成 SSE 日志，或描述你要核对的现象…"
               onChange={(event) => setText(event.target.value)}
               onKeyDown={(event) => {
-                if (event.key === "Enter" && !event.shiftKey) {
+                if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
                   event.preventDefault();
                   submit();
                 }

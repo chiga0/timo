@@ -253,6 +253,14 @@ const MIGRATIONS: ReadonlyArray<{ id: string; sql: string }> = [
       CREATE INDEX authorization_audit_task ON authorization_audit (task_id, created_at);
     `,
   },
+  {
+    // Store the structured action on inbox decision cards so UI approval never
+    // guesses the action name by parsing human summary text.
+    id: "0006-inbox-action",
+    sql: `
+      ALTER TABLE inbox_items ADD COLUMN action TEXT;
+    `,
+  },
 ];
 
 export interface MigrationResult {

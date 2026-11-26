@@ -9,6 +9,8 @@ export interface InboxItem {
   decisionKey: DecisionKey;
   title: string;
   summary: string;
+  /** Structured action name for `decision_required` cards (never parsed from prose). */
+  action: string | null;
   options: string[];
   createdAt: string;
   updatedAt: string;
@@ -42,29 +44,31 @@ export class Inbox {
     const body = asRecord(event.payload);
     const title = titleFor(decisionKey, event.type);
     const summary = typeof body.detail === "string" ? body.detail : typeof body.reason === "string" ? body.reason : title;
+    const action = typeof body.action === "string" && body.action.trim() !== "" ? body.action.trim() : null;
     const options = Array.isArray(body.options) ? body.options.filter((item): item is string => typeof item === "string") : defaultOptions(decisionKey);
-    this.upsert({ taskId: event.taskId, decisionKey, title, summary, options, now: event.createdAt });
+    this.upsert({ taskId: event.taskId, decisionKey, title, summary, action, options, now: event.createdAt });
     return true;
   }
 
   /** Idempotent in-place upsert; the card identity never changes. */
-  upsert(input: { taskId: string; decisionKey: DecisionKey; title: string; summary: string; options: string[]; now?: string }): InboxItem {
+  upsert(input: { taskId: string; decisionKey: DecisionKey; title: string; summary: string; action?: string | null; options: string[]; now?: string }): InboxItem {
     const now = input.now ?? toIso(new Date());
+    const action = input.action ?? null;
     return this.db.transaction(() => {
       const existing = this.get(input.taskId, input.decisionKey);
       if (existing) {
         // Same card, refreshed content: address (update) rather than append.
         this.db
-          .prepare("UPDATE inbox_items SET title = ?, summary = ?, options_json = ?, updated_at = ? WHERE item_id = ?")
-          .run(input.title, input.summary, JSON.stringify(input.options), now, `${input.taskId}:${input.decisionKey}`);
+          .prepare("UPDATE inbox_items SET title = ?, summary = ?, action = ?, options_json = ?, updated_at = ? WHERE item_id = ?")
+          .run(input.title, input.summary, action, JSON.stringify(input.options), now, `${input.taskId}:${input.decisionKey}`);
         return this.get(input.taskId, input.decisionKey)!;
       }
       this.db
         .prepare(
-          `INSERT INTO inbox_items (item_id, task_id, decision_key, title, summary, options_json, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+          `INSERT INTO inbox_items (item_id, task_id, decision_key, title, summary, action, options_json, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
-        .run(`${input.taskId}:${input.decisionKey}`, input.taskId, input.decisionKey, input.title, input.summary, JSON.stringify(input.options), now, now);
+        .run(`${input.taskId}:${input.decisionKey}`, input.taskId, input.decisionKey, input.title, input.summary, action, JSON.stringify(input.options), now, now);
       return this.get(input.taskId, input.decisionKey)!;
     });
   }
@@ -99,6 +103,7 @@ interface InboxRow {
   decision_key: DecisionKey;
   title: string;
   summary: string;
+  action: string | null;
   options_json: string;
   created_at: string;
   updated_at: string;
@@ -110,6 +115,7 @@ function toItem(row: InboxRow): InboxItem {
     decisionKey: row.decision_key,
     title: row.title,
     summary: row.summary,
+    action: row.action ?? null,
     options: JSON.parse(row.options_json) as string[],
     createdAt: row.created_at,
     updatedAt: row.updated_at,

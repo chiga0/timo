@@ -60,8 +60,7 @@ export class TaskService {
   private readonly loadedPolicy: LoadedPolicy;
   private readonly evaluator: AuthorizationEvaluator;
   private readonly proposalStore: ProposalStore;
-  /** Built after `writer` exists so it can project only committed events. */
-  private inboxStore!: Inbox;
+  private readonly inboxStore: Inbox;
 
   constructor(private readonly deps: TaskServiceDeps) {
     this.db = deps.db;
@@ -72,6 +71,7 @@ export class TaskService {
     this.loadedPolicy = deps.policy ?? { policy: DEFAULT_POLICY, source: "default" };
     this.evaluator = new AuthorizationEvaluator(this.loadedPolicy.policy);
     this.proposalStore = new ProposalStore(this.db);
+    this.inboxStore = new Inbox(this.db);
   }
 
   static open(
@@ -103,11 +103,10 @@ export class TaskService {
    * it ignores everything outside the three permitted event classes.
    */
   private attachInbox(bus: TypedEventBus): void {
-    this.inboxStore = new Inbox(this.db);
     bus.on("*", (event) => {
       // Resolve a stale card before projecting: a completed task clears its
       // "needs decision" card instead of leaving both on screen.
-      if (event.type === "task_completed" || event.type === "task_failed") {
+      if (event.type === "task_completed" || event.type === "task_failed" || event.type === "task_stopped") {
         this.inboxStore.resolve(event.taskId, "decision_required");
       }
       this.inboxStore.project(event);
@@ -430,6 +429,7 @@ export class TaskService {
       project: () => {
         this.store.setStatus(taskId, "stopping", null, now);
         this.store.revokeExecutions(taskId, now);
+        this.inboxStore.resolve(taskId, "decision_required", now);
         // Leaving this job queued would resurrect a stopped task after restart.
         this.writer.outbox.byTask(taskId).forEach((job) => {
           if (job.status === "pending" || job.status === "leased") this.writer.outbox.complete(job.jobId, now);
@@ -525,6 +525,8 @@ export class TaskService {
     }
 
     // Tier 2 red line: park the task and raise exactly one decision card.
+    // Deliberately do NOT enqueue a dispatch job here; execution must remain
+    // paused until the user explicitly resolves the red-line decision.
     const reason = decision.reason;
     this.writer.commit({
       taskId,
@@ -539,7 +541,6 @@ export class TaskService {
       options: {
         idempotencyKey: `decision:${request.action}:${view.authorizationVersion}`,
         now,
-        enqueue: [{ kind: JOB_DISPATCH, dedupeKey: `resume:${request.action}`, runAfter: now }],
       },
       project: () => {
         this.store.setStatus(taskId, "waiting", "needs_human_decision", now);
@@ -554,13 +555,25 @@ export class TaskService {
   resolveAuthorization(taskId: string, input: { action: string; approved: boolean; reason?: string }): { status: TaskStatus } {
     const view = this.store.view(taskId);
     if (!view) throw new TaskNotFoundError(`task ${taskId} not found`);
+    if (view.task.status !== "waiting" || view.task.waitingReason !== "needs_human_decision") {
+      throw new TaskConflictError("invalid_state", `task ${taskId} is not waiting for a human authorization decision`);
+    }
+    const pendingCard = this.inboxStore.get(taskId, "decision_required");
+    if (pendingCard?.action && pendingCard.action !== input.action) {
+      throw new InvalidInputError(`pending decision is for action ${pendingCard.action}, not ${input.action}`);
+    }
     const now = toIso(this.now());
+    const nextGrantVersion = view.authorizationVersion + 1;
     let grantVersion = view.authorizationVersion;
     this.writer.commit({
       taskId,
       type: "run_observed",
-      payload: { authorization: { action: input.action, approved: input.approved } },
-      options: { idempotencyKey: `decision-resolved:${input.action}:${input.approved}`, now },
+      payload: { authorization: { action: input.action, approved: input.approved, grantVersion: input.approved ? nextGrantVersion : view.authorizationVersion } },
+      options: {
+        idempotencyKey: `decision-resolved:${input.action}:${nextGrantVersion}:${input.approved}`,
+        now,
+        enqueue: input.approved ? [{ kind: JOB_DISPATCH, dedupeKey: `resume:${nextGrantVersion}`, runAfter: now }] : [],
+      },
       project: () => {
         this.inboxStore.resolve(taskId, "decision_required", now);
         if (input.approved) {
@@ -579,6 +592,20 @@ export class TaskService {
     });
     this.audit(taskId, { action: input.action }, 2, "user", input.approved ? "user approved" : "user declined", now, grantVersion);
     return { status: this.store.get(taskId)!.status };
+  }
+
+  /** Pending proposals for one task so the UI can render Amendment Diff cards. */
+  listProposals(taskId: string): Proposal[] {
+    const task = this.store.get(taskId);
+    if (!task) throw new TaskNotFoundError(`task ${taskId} not found`);
+    return this.proposalStore.listPending(taskId);
+  }
+
+  /** Current brief requirements for drafting diff proposals. */
+  getBrief(taskId: string): BriefRequirements {
+    const view = this.store.view(taskId);
+    if (!view) throw new TaskNotFoundError(`task ${taskId} not found`);
+    return view.brief;
   }
 
   /** Two-phase change: records the diff card without touching the task. */

@@ -1,4 +1,4 @@
-import { closeSync, existsSync, openSync, writeSync } from "node:fs";
+import { closeSync, openSync, writeSync } from "node:fs";
 import { constants } from "node:fs";
 import type { ServiceConfig, T3RuntimeConfig } from "../config.js";
 import { defaultConfig } from "../config.js";
@@ -123,8 +123,4 @@ export async function serve(): Promise<void> {
   process.on("SIGTERM", () => void shutdown("SIGTERM"));
 
   await new Promise<void>(() => undefined);
-}
-
-function readWebIndex(home: string): boolean {
-  return existsSync(`${home}/web/index.html`);
 }

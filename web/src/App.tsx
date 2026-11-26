@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Api, ApiError, readSessionToken, subscribeEvents, type InboxItem, type PolicySnapshot, type TaskDetail, type TaskEvent, type TaskSummary } from "./api.js";
+import { Api, ApiError, readSessionToken, subscribeEvents, type InboxItem, type PolicySnapshot, type Proposal, type TaskDetail, type TaskEvent, type TaskSummary } from "./api.js";
 import { Composer } from "./components/Composer.js";
 import { Inspector } from "./components/Inspector.js";
 import { Palette } from "./components/Palette.js";
@@ -16,6 +16,7 @@ export interface WorkbenchState {
   selectedId: string | null;
   detail: TaskDetail | null;
   events: TaskEvent[];
+  proposals: Proposal[];
   connection: "open" | "reconnecting" | "closed";
   error: string | null;
 }
@@ -34,6 +35,7 @@ export function App(): React.JSX.Element {
     selectedId: null,
     detail: null,
     events: [],
+    proposals: [],
     connection: "closed",
     error: null,
   });
@@ -44,8 +46,9 @@ export function App(): React.JSX.Element {
     try {
       const [tasks, inbox, policy] = await Promise.all([api.listTasks(), api.inbox(), api.policy()]);
       const nextId = selectId ?? selectedRef.current ?? tasks.tasks[0]?.taskId ?? null;
-      const detail = nextId ? await api.getTask(nextId) : null;
-      const events = nextId ? await api.taskEvents(nextId, 0) : [];
+      const [detail, events, proposalsRes] = nextId
+        ? await Promise.all([api.getTask(nextId), api.taskEvents(nextId, 0), api.listProposals(nextId)])
+        : [null, [], { proposals: [] }];
       setState((previous) => ({
         ...previous,
         tasks: tasks.tasks,
@@ -54,6 +57,7 @@ export function App(): React.JSX.Element {
         selectedId: nextId,
         detail,
         events,
+        proposals: proposalsRes.proposals,
         error: null,
       }));
     } catch (error) {
@@ -115,17 +119,21 @@ export function App(): React.JSX.Element {
   const select = async (taskId: string) => {
     setState((previous) => ({ ...previous, selectedId: taskId }));
     try {
-      const [detail, events] = await Promise.all([api.getTask(taskId), api.taskEvents(taskId, 0)]);
-      setState((previous) => ({ ...previous, detail, events }));
+      const [detail, events, proposalsRes] = await Promise.all([
+        api.getTask(taskId),
+        api.taskEvents(taskId, 0),
+        api.listProposals(taskId),
+      ]);
+      setState((previous) => ({ ...previous, detail, events, proposals: proposalsRes.proposals }));
     } catch (error) {
       setState((previous) => ({ ...previous, error: describe(error) }));
     }
   };
 
-  const run = async (action: () => Promise<unknown>) => {
+  const run = async (action: () => Promise<string | void>) => {
     try {
-      await action();
-      await refresh();
+      const nextSelected = await action();
+      await refresh(typeof nextSelected === "string" ? nextSelected : undefined);
     } catch (error) {
       setState((previous) => ({ ...previous, error: describe(error) }));
     }
@@ -162,7 +170,17 @@ export function App(): React.JSX.Element {
         )}
         <main className="center">
           {state.error && <div className="banner">{state.error}</div>}
-          <Thread detail={state.detail} events={state.events} connection={state.connection} tab={tab} onSelect={() => undefined} />
+          <Thread
+            detail={state.detail}
+            events={state.events}
+            proposals={state.proposals}
+            inbox={state.inbox}
+            connection={state.connection}
+            tab={tab}
+            onResolve={(taskId, action, approved) => run(async () => { await api.resolve(taskId, action, approved); })}
+            onConfirmProposal={(proposalId) => run(async () => { await api.confirmProposal(proposalId); })}
+            onCancelProposal={(proposalId) => run(async () => { await api.cancelProposal(proposalId); })}
+          />
           <Composer
             disabled={false}
             onSubmit={(text) =>
@@ -171,7 +189,8 @@ export function App(): React.JSX.Element {
                 if (legal === "") return;
                 const requestId = `web-${Date.now()}`;
                 const log = btoa(new TextEncoder().encode(legal).reduce((acc, byte) => acc + String.fromCharCode(byte), ""));
-                await api.createTask(requestId, log);
+                const created = await api.createTask(requestId, log);
+                return created.taskId;
               })
             }
           />
@@ -181,9 +200,12 @@ export function App(): React.JSX.Element {
             <Inspector
               detail={state.detail}
               events={state.events}
-              onStop={(taskId) => run(() => api.stop(taskId))}
-              onAmend={(taskId, version, goal) => run(() => api.amend(taskId, version, goal))}
-              onResolve={(taskId, action, approved) => run(() => api.resolve(taskId, action, approved))}
+              proposals={state.proposals}
+              onStop={(taskId) => run(async () => { await api.stop(taskId); })}
+              onProposeGoal={(taskId, goal) => run(async () => { await api.proposeGoal(taskId, goal); })}
+              onConfirmProposal={(proposalId) => run(async () => { await api.confirmProposal(proposalId); })}
+              onCancelProposal={(proposalId) => run(async () => { await api.cancelProposal(proposalId); })}
+              onResolve={(taskId, action, approved) => run(async () => { await api.resolve(taskId, action, approved); })}
               inbox={state.inbox}
             />
           </aside>

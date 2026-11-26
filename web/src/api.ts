@@ -21,9 +21,25 @@ export interface InboxItem {
   decisionKey: string;
   title: string;
   summary: string;
+  action: string | null;
   options: string[];
   createdAt: string;
   updatedAt: string;
+}
+
+export interface Proposal {
+  proposalId: string;
+  taskId: string;
+  status: string;
+  change: {
+    kind: "brief" | "grant";
+    diff: Array<{ field: string; before: string; after: string }>;
+  };
+  expectedBriefVersion: number;
+  expectedGrantVersion: number;
+  reason: string;
+  createdAt: string;
+  decidedAt: string | null;
 }
 
 export interface TaskEvent {
@@ -124,46 +140,31 @@ export class Api {
     });
   }
 
-  taskEvents(taskId: string, afterSeq: number): Promise<TaskEvent[]> {
-    return streamOnce(`/api/tasks/${encodeURIComponent(taskId)}/events?afterSeq=${afterSeq}`, this.token);
+  listProposals(taskId: string): Promise<{ proposals: Proposal[] }> {
+    return this.call(`/api/tasks/${encodeURIComponent(taskId)}/proposals`);
   }
-}
 
-/** Reads one finite slice of an SSE stream (the server closes after replay). */
-async function streamOnce(path: string, token: string | null): Promise<TaskEvent[]> {
-  const headers: Record<string, string> = { accept: "text/event-stream" };
-  if (token) headers.authorization = `Bearer ${token}`;
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 1500);
-  const events: TaskEvent[] = [];
-  try {
-    const response = await fetch(path, { headers, signal: controller.signal });
-    const reader = response.body?.getReader();
-    if (!reader) return events;
-    const decoder = new TextDecoder();
-    let buffer = "";
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-      const frames = buffer.split("\n\n");
-      buffer = frames.pop() ?? "";
-      for (const frame of frames) {
-        const data = frame
-          .split("\n")
-          .filter((line) => line.startsWith("data: "))
-          .map((line) => line.slice(6))
-          .join("");
-        if (data) events.push(JSON.parse(data) as TaskEvent);
-      }
-    }
-  } catch {
-    // The abort is how a finite slice ends when the stream stays open.
-  } finally {
-    clearTimeout(timer);
-    controller.abort();
+  proposeGoal(taskId: string, goal: string, reason = "Web 界面起草约定变更"): Promise<Proposal> {
+    return this.call(`/api/tasks/${encodeURIComponent(taskId)}/proposals`, {
+      method: "POST",
+      body: JSON.stringify({ kind: "brief", goal, reason }),
+    });
   }
-  return events;
+
+  confirmProposal(proposalId: string): Promise<{ applied: boolean; briefVersion: number }> {
+    return this.call(`/api/proposals/${encodeURIComponent(proposalId)}/confirm`, { method: "POST" });
+  }
+
+  cancelProposal(proposalId: string): Promise<{ status: string }> {
+    return this.call(`/api/proposals/${encodeURIComponent(proposalId)}/cancel`, { method: "POST" });
+  }
+
+  async taskEvents(taskId: string, afterSeq: number): Promise<TaskEvent[]> {
+    const res = await this.call<{ events: TaskEvent[] }>(
+      `/api/tasks/${encodeURIComponent(taskId)}/events?afterSeq=${afterSeq}&format=json`,
+    );
+    return res.events;
+  }
 }
 
 /**
