@@ -11,6 +11,7 @@ import { JOB_DISPATCH, JOB_STOP } from "../events/writer.js";
 import type { TypedEventBus } from "../events/bus.js";
 import { toIso, newId } from "../util.js";
 import { SSE_CANDIDATE_SCHEMA } from "../sse/contract.js";
+import { WatchdogMonitor, type WatchdogThresholds } from "../watchdog/monitor.js";
 
 export interface RunnerOptions {
   store: TaskStore;
@@ -29,6 +30,8 @@ export interface RunnerOptions {
   concurrency?: number;
   /** Bounded recovery; tests shorten the delays. */
   retryPolicy?: RetryPolicy;
+  /** Watchdog thresholds; `null` disables the first-level scan. */
+  watchdog?: Partial<WatchdogThresholds> | null;
   log: (line: string) => void;
 }
 
@@ -51,9 +54,12 @@ export class TaskRunner {
   private readonly owner = `runner-${process.pid}-${newId().slice(0, 8)}`;
   private readonly leaseMs: number;
   private claimedJobs: Array<{ jobId: string; taskId: string; kind: string }> = [];
+  /** First-level watchdog: deterministic, injectable clock, zero model calls. */
+  private readonly watchdog: WatchdogMonitor | null;
 
   constructor(private readonly options: RunnerOptions) {
     this.leaseMs = Math.max(options.pollIntervalMs * 10, 30_000);
+    this.watchdog = options.watchdog === null ? null : new WatchdogMonitor(options.watchdog ?? {});
   }
 
   private get concurrency(): number {
@@ -114,6 +120,8 @@ export class TaskRunner {
     if (this.running) return;
     this.running = true;
     try {
+      // First-level watchdog: deterministic, zero model calls, before any work.
+      this.scanWatchdog();
       const work = new Map<string, "dispatch" | "reconcile" | "stop">();
       const claimed = this.options.writer.outbox.claim({
         owner: this.owner,
@@ -181,6 +189,50 @@ export class TaskRunner {
   /** Only these states may still be dispatched or reconciled. */
   private isRunnable(status: TaskStatus): boolean {
     return status === "accepted" || status === "running" || status === "waiting";
+  }
+
+  /**
+   * First-level watchdog scan: deterministic, zero model calls. It reads the
+   * task rows, produces signals, commits them to the ledger as `watchdog_signal`
+   * and refreshes the inspector summary. A legitimate wait is never a stall.
+   */
+  private scanWatchdog(): void {
+    if (!this.watchdog) return;
+    const { store } = this.options;
+    const now = new Date();
+    const observations = store.listInflightTasks().map((item) => {
+      const lastActivity = store.getEvidence<string>(item.taskId, "lastActivityAt") ?? item.updatedAt;
+      const failures = store.getEvidence<string[]>(item.taskId, "recentFailures") ?? [];
+      return {
+        taskId: item.taskId,
+        status: item.status,
+        waitingReason: item.waitingReason,
+        lastActivityAt: lastActivity,
+        runStartedAt: item.updatedAt,
+        hasProgress: store.getEvidence<boolean>(item.taskId, "hasProgress") === true,
+        failureFingerprints: failures,
+        changedFiles: store.getEvidence<string[]>(item.taskId, "changedFiles") ?? [],
+      };
+    });
+    const report = this.watchdog.scan(observations, now);
+    for (const summary of report.summaries) {
+      store.setEvidence(summary.taskId, "watchdogStatus", summary.status, now.toISOString());
+      store.setEvidence(summary.taskId, "lastHeartbeatAt", summary.lastHeartbeatAt, now.toISOString());
+    }
+    for (const signal of report.signals) {
+      // Only the signal is committed here; triage/steering is Step 5.2's job.
+      this.options.writer.commit({
+        taskId: signal.taskId,
+        type: "watchdog_signal",
+        payload: { kind: signal.kind, detail: signal.detail },
+        options: {
+          idempotencyKey: `watchdog:${signal.kind}:${signal.observedAt}`,
+          now: signal.observedAt,
+          enqueue: [{ kind: JOB_DISPATCH, dedupeKey: `watchdog:${signal.kind}:${signal.observedAt}`, runAfter: signal.observedAt }],
+        },
+      });
+      this.options.log(`watchdog ${signal.kind} on ${signal.taskId}: ${signal.detail}`);
+    }
   }
 
   /**
@@ -443,6 +495,9 @@ export class TaskRunner {
       });
       store.setOperationStatus(operation.operationId, "done", { threadId, runId: resolveRunId }, now());
       store.recordAttempt(attemptId, operation.operationId, null, { runId: resolveRunId }, now());
+      // Activity stamp for the first-level watchdog: the run exists and has just
+      // produced output from the executor's point of view.
+      store.setEvidence(taskId, "lastActivityAt", now(), now());
 
       // 3. Bounded wait on the fixed runId. Each re-issued wait is a fresh
       //    server-side timeout, so the local deadline bounds the loop.

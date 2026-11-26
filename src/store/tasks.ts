@@ -442,18 +442,32 @@ export class TaskStore {
   }
 
   /** Tasks whose external run exists but whose local state is not terminal yet. */
-  listInflightTasks(): Array<{ taskId: string; threadId: string; runId: string; status: TaskStatus }> {
+  listInflightTasks(): Array<{ taskId: string; threadId: string; runId: string; status: TaskStatus; waitingReason: WaitingReason | null; updatedAt: string }> {
     const rows = this.db
       .prepare(
-        `SELECT task_id, thread_id, run_id, status FROM tasks
+        `SELECT task_id, thread_id, run_id, status, waiting_reason, updated_at FROM tasks
          WHERE status IN ('running', 'waiting', 'verifying')
            AND thread_id IS NOT NULL AND run_id IS NOT NULL
            AND run_id NOT LIKE '%:local:%'
            AND run_id != 'none'
          ORDER BY updated_at`,
       )
-      .all() as Array<{ task_id: string; thread_id: string; run_id: string; status: TaskStatus }>;
-    return rows.map((row) => ({ taskId: row.task_id, threadId: row.thread_id, runId: row.run_id, status: row.status }));
+      .all() as Array<{
+      task_id: string;
+      thread_id: string;
+      run_id: string;
+      status: TaskStatus;
+      waiting_reason: WaitingReason | null;
+      updated_at: string;
+    }>;
+    return rows.map((row) => ({
+      taskId: row.task_id,
+      threadId: row.thread_id,
+      runId: row.run_id,
+      status: row.status,
+      waitingReason: row.waiting_reason,
+      updatedAt: row.updated_at,
+    }));
   }
 
   /**
