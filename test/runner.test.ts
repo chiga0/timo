@@ -47,13 +47,14 @@ function withCandidates(h: Harness, candidate: unknown): void {
 function harness(options: { t3?: boolean } = {}): Harness {
   const home = mkdtempSync(join(tmpdir(), "timo-runner-"));
   const config = defaultConfig({}, home);
-  const { service, db } = TaskService.open(config);
+  const { service, db, writer } = TaskService.open(config);
   const fake = new FakeT3();
   const logs: string[] = [];
   const runner = new TaskRunner({
     store: new TaskStore(db),
     service,
     artifacts: ArtifactStore.create(home),
+    writer,
     t3: options.t3 === false ? null : t3Config,
     clientFactory: FakeT3.factory(fake),
     pollIntervalMs: 10,
@@ -228,7 +229,7 @@ test("auth failure waits as t3_auth instead of retrying with another identity", 
 test("a run that never finishes is reported as effect_unknown, not failed", async () => {
   const home = mkdtempSync(join(tmpdir(), "timo-runner-"));
   const config = defaultConfig({}, home);
-  const { service, db } = TaskService.open(config);
+  const { service, db, writer } = TaskService.open(config);
   const fake = new FakeT3();
   fake.launch = async () => {
     const threadId = "thread-slow";
@@ -240,6 +241,7 @@ test("a run that never finishes is reported as effect_unknown, not failed", asyn
     store: new TaskStore(db),
     service,
     artifacts: ArtifactStore.create(home),
+    writer,
     t3: t3Config,
     clientFactory: FakeT3.factory(fake),
     pollIntervalMs: 10,
@@ -312,6 +314,7 @@ test("restart after a completed result reads the same result back", async () => 
       store: new TaskStore(first.db),
       service: first.service,
       artifacts: ArtifactStore.create(home),
+      writer: first.writer,
       t3: t3Config,
       clientFactory: FakeT3.factory(fake),
       pollIntervalMs: 10,

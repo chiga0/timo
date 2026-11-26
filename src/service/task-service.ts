@@ -6,6 +6,8 @@ import { ArtifactStore } from "../store/artifacts.js";
 import { analyzeLog, verifyCandidate, SSE_VERIFIER_VERSION, type Finding } from "../sse/contract.js";
 import { sha256Hex, newId, toIso, stableJson } from "../util.js";
 import { ensureHome } from "../home.js";
+import { TypedEventBus } from "../events/bus.js";
+import { TransitionWriter, JOB_DISPATCH } from "../events/writer.js";
 import type { ServiceConfig, CreateTaskRequest, CreateTaskResponse, GetTaskResponse } from "../config.js";
 
 export class TaskNotFoundError extends Error {
@@ -22,35 +24,54 @@ export interface TaskServiceDeps {
   store: TaskStore;
   artifacts: ArtifactStore;
   config: ServiceConfig;
+  writer: TransitionWriter;
   now?: () => Date;
 }
 
 /**
  * Business entry point shared by the CLI server and any future assistant
  * entry. It never talks to T3; the background runner does, under the same
- * store so that state transitions stay single-writer.
+ * store so that state transitions stay single-writer. Every transition goes
+ * through `TransitionWriter`, so the event ledger, the projection and the
+ * follow-up jobs commit together and broadcast only after commit.
  */
 export class TaskService {
   private readonly db: Database;
   private readonly store: TaskStore;
   private readonly artifacts: ArtifactStore;
+  private readonly writer: TransitionWriter;
   private readonly now: () => Date;
 
   constructor(private readonly deps: TaskServiceDeps) {
     this.db = deps.db;
     this.store = deps.store;
     this.artifacts = deps.artifacts;
+    this.writer = deps.writer;
     this.now = deps.now ?? (() => new Date());
   }
 
-  static open(config: ServiceConfig, options: { now?: () => Date; dbPath?: string } = {}): { service: TaskService; db: Database } {
+  static open(
+    config: ServiceConfig,
+    options: { now?: () => Date; dbPath?: string; bus?: TypedEventBus; onEventError?: (error: unknown) => void } = {},
+  ): { service: TaskService; db: Database; bus: TypedEventBus; writer: TransitionWriter } {
     ensureHome(config.home);
     const dbPath = options.dbPath ?? config.databasePath;
     const db = new DatabaseClass(dbPath);
     migrate(db);
     const store = new TaskStore(db);
     const artifacts = ArtifactStore.create(config.home);
-    return { service: new TaskService({ db, store, artifacts, config, now: options.now }), db };
+    const bus = options.bus ?? new TypedEventBus();
+    const writer = new TransitionWriter(db, bus, options.onEventError);
+    return { service: new TaskService({ db, store, artifacts, config, writer, now: options.now }), db, bus, writer };
+  }
+
+  /** Read access to the ledger for SSE replay and tests. */
+  get ledger() {
+    return this.writer.ledger;
+  }
+
+  get outbox() {
+    return this.writer.outbox;
   }
 
   close(): void {
@@ -111,21 +132,40 @@ export class TaskService {
       now,
     });
 
+    // TASK_CREATED carries the dispatch job, so a crash right here still leaves
+    // the intent durable and a new process resumes from the outbox.
+    this.writer.commit({
+      taskId,
+      type: "task_created",
+      payload: { inputDigest, requestId, artifactPath: artifact.path },
+      options: {
+        idempotencyKey: "created",
+        now,
+        enqueue: input.byteLength === 0 || analysis.ok === false ? [] : [{ kind: JOB_DISPATCH, dedupeKey: "initial" }],
+      },
+    });
+
     if (!analysis.ok) {
       // Incomplete input is never dispatched: only `unknown` is accepted.
-      this.db.transaction(() => {
-        this.store.recordCandidate({
-          taskId,
-          taskRunId: "none",
-          briefVersion: 1,
-          candidate: { inputDigest, verdict: "unknown", incidents: [] },
-          candidateDigest: sha256Hex(Buffer.from(stableJson({ inputDigest, verdict: "unknown", incidents: [] }), "utf8")),
-          verification: { result: "incomplete", verifierVersion: SSE_VERIFIER_VERSION, findings: [{ code: "input_incomplete", detail: `${analysis.reason}${analysis.line === null ? "" : ` (line ${analysis.line})`}` }], environment: "local" },
-          now,
-        });
-        this.store.setStatus(taskId, "waiting", "input_incomplete", now);
-        this.store.setOperationStatus(`${taskId}:dispatch`, "done", { skipped: "input_incomplete" }, now);
-        this.store.enqueueNotification(taskId, "task_waiting", { waitingReason: "input_incomplete" }, now);
+      this.writer.commit({
+        taskId,
+        type: "task_waiting",
+        payload: { waitingReason: "input_incomplete", reason: analysis.reason, line: analysis.line },
+        options: { idempotencyKey: "waiting:input_incomplete:1", now },
+        project: () => {
+          this.store.recordCandidate({
+            taskId,
+            taskRunId: "none",
+            briefVersion: 1,
+            candidate: { inputDigest, verdict: "unknown", incidents: [] },
+            candidateDigest: sha256Hex(Buffer.from(stableJson({ inputDigest, verdict: "unknown", incidents: [] }), "utf8")),
+            verification: { result: "incomplete", verifierVersion: SSE_VERIFIER_VERSION, findings: [{ code: "input_incomplete", detail: `${analysis.reason}${analysis.line === null ? "" : ` (line ${analysis.line})`}` }], environment: "local" },
+            now,
+          });
+          this.store.setStatus(taskId, "waiting", "input_incomplete", now);
+          this.store.setOperationStatus(`${taskId}:dispatch`, "done", { skipped: "input_incomplete" }, now);
+          this.store.enqueueNotification(taskId, "task_waiting", { waitingReason: "input_incomplete" }, now);
+        },
       });
     }
     void task;
@@ -169,47 +209,80 @@ export class TaskService {
     const outcome = verifyCandidate(input, view.task.inputDigest, candidate);
     const candidateDigest = sha256Hex(Buffer.from(stableJson(candidate), "utf8"));
 
-    this.db.transaction(() => {
-      this.store.recordCandidate({
-        taskId,
-        taskRunId,
-        briefVersion: view.briefVersion,
-        candidate,
-        candidateDigest,
-        verification: {
-          result: outcome.status,
-          verifierVersion: outcome.verifierVersion,
-          findings: outcome.status === "accepted" ? [] : outcome.findings,
-          environment: "local",
-        },
-        now,
-      });
-      if (outcome.status === "accepted") {
-        const seal: TaskResult = {
-          verdict: outcome.expected.verdict,
-          incidents: outcome.expected.incidents,
-          inputDigest: outcome.digest,
-          verifierVersion: outcome.verifierVersion,
-        };
-        this.store.setResult(taskId, seal, now);
-        this.store.setStatus(taskId, "completed", null, now);
-        this.store.setOperationStatus(`${taskId}:dispatch`, "done", { result: "completed" }, now);
-        this.store.enqueueNotification(taskId, "task_completed", seal, now);
-      } else if (outcome.status === "incomplete") {
-        this.store.setStatus(taskId, "waiting", "input_incomplete", now);
-        this.store.enqueueNotification(taskId, "task_waiting", { waitingReason: "input_incomplete", findings: outcome.findings }, now);
-      } else {
-        this.store.setStatus(taskId, "failed", null, now);
-        this.store.setFailure(taskId, "candidate rejected by sse-v1 verifier", now);
-        this.store.setOperationStatus(`${taskId}:dispatch`, "done", { result: "failed" }, now);
-        this.store.enqueueNotification(taskId, "task_failed", { findings: outcome.findings }, now);
-      }
+    const verification = {
+      result: outcome.status,
+      verifierVersion: outcome.verifierVersion,
+      findings: outcome.status === "accepted" ? [] : outcome.findings,
+      environment: "local",
+    };
+    const seal: TaskResult | null =
+      outcome.status === "accepted"
+        ? {
+            verdict: outcome.expected.verdict,
+            incidents: outcome.expected.incidents,
+            inputDigest: outcome.digest,
+            verifierVersion: outcome.verifierVersion,
+          }
+        : null;
+    const rejectedFindings: Finding[] = outcome.status === "accepted" ? [] : outcome.findings;
+
+    // Verification evidence and the resulting task event commit together, so a
+    // completed task can never exist without the evidence that justified it.
+    this.writer.commit({
+      taskId,
+      type: outcome.status === "accepted" ? "task_completed" : outcome.status === "incomplete" ? "task_waiting" : "task_failed",
+      payload:
+        outcome.status === "accepted"
+          ? { result: seal }
+          : outcome.status === "incomplete"
+            ? { waitingReason: "input_incomplete", findings: rejectedFindings }
+            : { reason: "candidate rejected by sse-v1 verifier", findings: rejectedFindings },
+      options: { idempotencyKey: `verification:${outcome.status}:${candidateDigest.slice(0, 16)}`, now },
+      project: () => {
+        this.store.recordCandidate({
+          taskId,
+          taskRunId,
+          briefVersion: view.briefVersion,
+          candidate,
+          candidateDigest,
+          verification,
+          now,
+        });
+        this.store.setEvidence(
+          taskId,
+          "lastVerification",
+          { result: outcome.status, verifierVersion: outcome.verifierVersion, at: now },
+          now,
+        );
+        if (outcome.status === "accepted" && seal) {
+          this.store.setResult(taskId, seal, now);
+          this.store.setStatus(taskId, "completed", null, now);
+          this.store.setOperationStatus(`${taskId}:dispatch`, "done", { result: "completed" }, now);
+          this.store.enqueueNotification(taskId, "task_completed", seal, now);
+        } else if (outcome.status === "incomplete") {
+          this.store.setStatus(taskId, "waiting", "input_incomplete", now);
+          this.store.enqueueNotification(taskId, "task_waiting", { waitingReason: "input_incomplete", findings: rejectedFindings }, now);
+        } else {
+          this.store.setStatus(taskId, "failed", null, now);
+          this.store.setFailure(taskId, "candidate rejected by sse-v1 verifier", now);
+          this.store.setOperationStatus(`${taskId}:dispatch`, "done", { result: "failed" }, now);
+          this.store.enqueueNotification(taskId, "task_failed", { findings: rejectedFindings }, now);
+        }
+      },
     });
-    return { status: outcome.status, findings: outcome.status === "accepted" ? [] : outcome.findings };
+    return { status: outcome.status, findings: rejectedFindings };
   }
 
   markWaiting(taskId: string, reason: WaitingReason, now = toIso(this.now())): void {
-    this.store.setStatus(taskId, "waiting", reason, now);
+    this.writer.commit({
+      taskId,
+      type: "task_waiting",
+      payload: { waitingReason: reason },
+      options: { idempotencyKey: `waiting:${reason}:${now}`, now },
+      project: () => {
+        this.store.setStatus(taskId, "waiting", reason, now);
+      },
+    });
   }
 }
 

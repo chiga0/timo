@@ -155,6 +155,47 @@ const MIGRATIONS: ReadonlyArray<{ id: string; sql: string }> = [
       CREATE INDEX notifications_task_idx ON notifications (task_id, created_at);
     `,
   },
+  {
+    // Append-only business fact stream plus the durable job queue. `task_events`
+    // is the source of truth a reader replays with `afterSeq`; `outbox_jobs`
+    // carries dispatch, reconciliation and (later) 0-Token polling so that a
+    // crash or a sleeping laptop resumes from the database, not from memory.
+    id: "0003-event-ledger",
+    sql: `
+      CREATE TABLE task_events (
+        seq INTEGER PRIMARY KEY,
+        event_id TEXT NOT NULL UNIQUE,
+        task_id TEXT NOT NULL REFERENCES tasks(task_id),
+        type TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        idempotency_key TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        UNIQUE (task_id, idempotency_key)
+      );
+      CREATE INDEX task_events_task_seq ON task_events (task_id, seq);
+      CREATE INDEX task_events_type_seq ON task_events (type, seq);
+
+      CREATE TABLE outbox_jobs (
+        job_id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL REFERENCES tasks(task_id),
+        kind TEXT NOT NULL,
+        status TEXT NOT NULL,
+        run_after TEXT NOT NULL,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        max_attempts INTEGER NOT NULL DEFAULT 5,
+        lease_until TEXT,
+        lease_owner TEXT,
+        last_error TEXT,
+        payload_json TEXT NOT NULL,
+        dedupe_key TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE (task_id, kind, dedupe_key)
+      );
+      CREATE INDEX outbox_jobs_claim ON outbox_jobs (status, run_after);
+      CREATE INDEX outbox_jobs_task ON outbox_jobs (task_id, kind);
+    `,
+  },
 ];
 
 export interface MigrationResult {

@@ -147,12 +147,13 @@ test("CLI rejects a missing log file with exit code 2", async () => {
 test("a task survives while T3 is unreachable and keeps its pending dispatch", async () => {
   const home = mkdtempSync(join(tmpdir(), "timo-cli-"));
   const config = defaultConfig({}, home);
-  const { service, db } = TaskService.open(config);
+  const { service, db, writer } = TaskService.open(config);
   const artifacts = ArtifactStore.create(home);
   const runner = new TaskRunner({
     store: new TaskStore(db),
     service,
     artifacts,
+    writer,
     t3: { url: "https://t3.invalid/mcp", token: "x", projectId: "p", providerId: "c", model: "m" },
     clientFactory: () => {
       throw new Error("connect ECONNREFUSED");

@@ -22,7 +22,7 @@ export async function serve(): Promise<void> {
   const config: ServiceConfig = defaultConfig(env, home);
   const t3: T3RuntimeConfig | null = resolveT3Config(env, home);
 
-  const { service, db } = TaskService.open(config);
+  const { service, db, bus, writer } = TaskService.open(config);
   const logFd = openSync(`${home}/service.log`, constants.O_WRONLY | constants.O_CREAT | constants.O_APPEND, 0o600);
   const log = (line: string) => {
     const text = `${new Date().toISOString()} ${line}\n`;
@@ -37,6 +37,7 @@ export async function serve(): Promise<void> {
     store,
     service,
     artifacts,
+    writer,
     t3,
     clientFactory: (clientConfig) => Promise.resolve(createMcpT3Client(clientConfig)),
     pollIntervalMs: config.pollIntervalMs,

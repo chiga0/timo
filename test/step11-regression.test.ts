@@ -27,12 +27,13 @@ const candidate = {
 function harness(concurrency = 4) {
   const home = mkdtempSync(join(tmpdir(), "timo-concurrency-"));
   const config = defaultConfig({}, home);
-  const { service, db } = TaskService.open(config);
+  const { service, db, writer } = TaskService.open(config);
   const fake = new FakeT3();
   const runner = new TaskRunner({
     store: new TaskStore(db),
     service,
     artifacts: ArtifactStore.create(home),
+    writer,
     t3: t3Config,
     clientFactory: FakeT3.factory(fake),
     pollIntervalMs: 10,
@@ -102,6 +103,7 @@ test("a completed remote run is reconciled after a restart and the task complete
       store: new TaskStore(first.db),
       service: first.service,
       artifacts: ArtifactStore.create(home),
+      writer: first.writer,
       t3: t3Config,
       clientFactory: FakeT3.factory(fake),
       pollIntervalMs: 10,
@@ -142,6 +144,7 @@ test("a completed remote run is reconciled after a restart and the task complete
       store: new TaskStore(second.db),
       service: second.service,
       artifacts: ArtifactStore.create(home),
+      writer: second.writer,
       t3: t3Config,
       clientFactory: FakeT3.factory(fake),
       pollIntervalMs: 10,

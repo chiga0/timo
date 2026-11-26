@@ -5,6 +5,8 @@ import type { T3RuntimeConfig } from "../config.js";
 import type { TaskStore, WaitingReason } from "../store/tasks.js";
 import type { ArtifactStore } from "../store/artifacts.js";
 import type { TaskService } from "../service/task-service.js";
+import type { TransitionWriter } from "../events/writer.js";
+import { JOB_DISPATCH } from "../events/writer.js";
 import { toIso, newId } from "../util.js";
 import { SSE_CANDIDATE_SCHEMA } from "../sse/contract.js";
 
@@ -12,6 +14,8 @@ export interface RunnerOptions {
   store: TaskStore;
   service: TaskService;
   artifacts: ArtifactStore;
+  /** Commits every transition atomically with its event and follow-up jobs. */
+  writer: TransitionWriter;
   t3: T3RuntimeConfig | null;
   clientFactory: T3ClientFactory;
   pollIntervalMs: number;
@@ -37,8 +41,14 @@ export class TaskRunner {
   private closed = false;
   private readonly active = new Set<string>();
   private readonly inflight = new Set<Promise<void>>();
+  /** Identifies this process's outbox leases; a restarted process steals expired ones. */
+  private readonly owner = `runner-${process.pid}-${newId().slice(0, 8)}`;
+  private readonly leaseMs: number;
+  private claimedJobs: Array<{ jobId: string; taskId: string }> = [];
 
-  constructor(private readonly options: RunnerOptions) {}
+  constructor(private readonly options: RunnerOptions) {
+    this.leaseMs = Math.max(options.pollIntervalMs * 10, 30_000);
+  }
 
   private get concurrency(): number {
     return Math.max(1, this.options.concurrency ?? 4);
@@ -72,17 +82,32 @@ export class TaskRunner {
   /**
    * One pass. Dispatch work and in-flight reconciliation are separate queues: a
    * task whose external run is still going is reconciled in later passes without
-   * consuming a dispatch slot.
+   * consuming a dispatch slot. Dispatch is driven by durable outbox leases, so a
+   * restart resumes from the database rather than from memory.
    */
   async runOnce(): Promise<void> {
     if (this.running) return;
     this.running = true;
     try {
       const work = new Map<string, "dispatch" | "reconcile">();
+      this.claimedJobs = this.options.writer.outbox
+        .claim({
+          owner: this.owner,
+          now: toIso(new Date()),
+          limit: this.concurrency * 4,
+          leaseMs: this.leaseMs,
+          kinds: [JOB_DISPATCH],
+        })
+        .map((job) => ({ jobId: job.jobId, taskId: job.taskId }));
+      for (const job of this.claimedJobs) {
+        const task = this.options.store.get(job.taskId);
+        if (!task || task.status === "completed" || task.status === "failed") continue;
+        if (!work.has(job.taskId)) work.set(job.taskId, "dispatch");
+      }
       for (const item of this.options.store.listPendingDispatches()) {
         const task = this.options.store.get(item.taskId);
         if (!task || task.status === "completed" || task.status === "failed") continue;
-        work.set(item.taskId, "dispatch");
+        if (!work.has(item.taskId)) work.set(item.taskId, "dispatch");
       }
       for (const item of this.options.store.listInflightTasks()) {
         if (!work.has(item.taskId)) work.set(item.taskId, "reconcile");
@@ -102,6 +127,7 @@ export class TaskRunner {
               this.options.log(`runner ${taskId}: ${error instanceof Error ? error.message : String(error)}`);
             })
             .finally(() => {
+              this.finishClaimedJobs(taskId);
               this.active.delete(taskId);
               this.inflight.delete(promise);
             });
@@ -450,6 +476,20 @@ export class TaskRunner {
       store.setEvidence(taskId, "dispatchNotBefore", toIso(new Date(Date.now() + delay)), now);
     }
     this.options.log(`task ${reason}: ${detail}`);
+  }
+
+  /**
+   * Marks this pass's claimed jobs done once the task has been advanced. Liveness
+   * for a still-running task comes from `listInflightTasks`, not from repeatedly
+   * re-claiming the dispatch job.
+   */
+  private finishClaimedJobs(taskId: string): void {
+    const now = toIso(new Date());
+    for (const job of this.claimedJobs) {
+      if (job.taskId !== taskId) continue;
+      this.options.writer.outbox.complete(job.jobId, now);
+    }
+    this.claimedJobs = this.claimedJobs.filter((job) => job.taskId !== taskId);
   }
 
   private backoffFor(taskId: string): number {
