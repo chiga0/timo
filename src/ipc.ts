@@ -31,42 +31,66 @@ export class ServiceUnavailableError extends Error {
 
 interface LockContent {
   pid: number;
+  startedAt: string;
 }
 
 /**
- * Single-instance guard: an exclusive `timo.sock.lock` holding the pid of the
- * live service. A second `timo serve` reports a conflict instead of stealing
- * the socket.
+ * Single-instance guard. The lockfile is created with `O_CREAT | O_EXCL`, so two
+ * racing processes cannot both win. A lock whose pid is dead is stale: it is
+ * removed together with any leftover socket, which is what a SIGKILLed service
+ * leaves behind. A live lock is never taken over.
  */
 export function acquireServiceLock(socketPath: string): { release: () => void } {
   const lockPath = `${socketPath}.lock`;
-  if (existsSync(lockPath)) {
+  const content = JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() } satisfies LockContent);
+  for (let attempt = 0; attempt < 2; attempt++) {
     try {
-      const content = JSON.parse(readFileSync(lockPath, "utf8")) as LockContent;
-      if (typeof content.pid === "number" && isAlive(content.pid)) {
-        throw new ServiceUnavailableError(`timo service already running (pid ${content.pid}) at ${socketPath}`);
-      }
+      writeFileSync(lockPath, content, { mode: 0o600, flag: "wx" });
+      chmodSync(lockPath, 0o600);
+      return {
+        release: () => {
+          // Only the owner removes its own lock and socket.
+          if (lockOwnerPid(lockPath) !== process.pid) return;
+          try {
+            unlinkSync(lockPath);
+          } catch {
+            // already gone
+          }
+          try {
+            if (existsSync(socketPath)) unlinkSync(socketPath);
+          } catch {
+            // ignore
+          }
+        },
+      };
     } catch (error) {
-      if (error instanceof ServiceUnavailableError) throw error;
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
     }
-    unlinkSync(lockPath);
+    const owner = lockOwnerPid(lockPath);
+    if (owner !== null && isAlive(owner)) {
+      throw new ServiceUnavailableError(`timo service already running (pid ${owner}) at ${socketPath}`);
+    }
+    // Stale lock from a dead process: clear it and the socket it left behind.
+    try {
+      unlinkSync(lockPath);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      // Another process cleaned it between our check and unlink; loop once more.
+      continue;
+    }
+    if (existsSync(socketPath)) unlinkSync(socketPath);
   }
-  writeFileSync(lockPath, JSON.stringify({ pid: process.pid } satisfies LockContent), { mode: 0o600 });
-  chmodSync(lockPath, 0o600);
-  return {
-    release: () => {
-      try {
-        unlinkSync(lockPath);
-      } catch {
-        // already gone
-      }
-      try {
-        if (existsSync(socketPath)) unlinkSync(socketPath);
-      } catch {
-        // ignore
-      }
-    },
-  };
+  throw new ServiceUnavailableError(`cannot acquire ${lockPath}; it is being contended`);
+}
+
+function lockOwnerPid(lockPath: string): number | null {
+  try {
+    const content = JSON.parse(readFileSync(lockPath, "utf8")) as Partial<LockContent>;
+    return typeof content.pid === "number" ? content.pid : null;
+  } catch {
+    // Unreadable or truncated (a process died mid-write) counts as stale.
+    return null;
+  }
 }
 
 function isAlive(pid: number): boolean {
@@ -85,7 +109,8 @@ export interface StartedServer {
 
 export async function startServiceServer(config: ServiceConfig, handler: (request: WireRequest) => Promise<WireResponse>): Promise<StartedServer> {
   const net = await import("node:net");
-  ensureNoStaleSocket(config.socketPath);
+  // The lock decides ownership first: a stale lock (dead pid) is replaced and its
+  // leftover socket removed before we try to listen on the same path.
   const lock = acquireServiceLock(config.socketPath);
   const server = net.createServer({ allowHalfOpen: true }, (socket) => {
     let buffer = "";
@@ -148,13 +173,6 @@ export async function startServiceServer(config: ServiceConfig, handler: (reques
       lock.release();
     },
   };
-}
-
-function ensureNoStaleSocket(socketPath: string): void {
-  if (!existsSync(socketPath)) return;
-  // A socket without a live lock owner is left over from a killed service.
-  const lockPath = `${socketPath}.lock`;
-  if (!existsSync(lockPath)) unlinkSync(socketPath);
 }
 
 export async function callService(socketPath: string, request: WireRequest, timeoutMs = 15_000): Promise<WireResponse> {

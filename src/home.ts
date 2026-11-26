@@ -29,7 +29,12 @@ export function ensureSubdir(home: string, name: string): string {
   return path;
 }
 
-export function writePrivateFile(path: string, content: string): void {
+/**
+ * Writes exact bytes. Text callers pass a string, which is encoded as UTF-8 once
+ * here; binary callers pass a `Uint8Array` that is written verbatim so no
+ * string transcoding can corrupt multi-byte sequences.
+ */
+export function writePrivateFile(path: string, content: string | Uint8Array): void {
   writeFileSync(path, content, { mode: 0o600 });
   try {
     chmodSync(path, 0o600);
@@ -39,5 +44,5 @@ export function writePrivateFile(path: string, content: string): void {
 }
 
 export function readPrivateFile(path: string): Uint8Array | null {
-  return existsSync(path) ? readFileSync(path) : null;
+  return existsSync(path) ? new Uint8Array(readFileSync(path)) : null;
 }

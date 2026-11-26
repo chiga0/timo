@@ -124,6 +124,37 @@ const MIGRATIONS: ReadonlyArray<{ id: string; sql: string }> = [
       );
     `,
   },
+  {
+    // A task may legitimately enter the same waiting kind more than once (e.g.
+    // auth fails twice). The UNIQUE (task_id, kind) from 0001 silently dropped
+    // the second notification. The rule becomes "at most one *undelivered*
+    // notification per (task_id, kind, dedupe_key)" via a partial unique index,
+    // so delivered history never blocks a new entry.
+    id: "0002-notification-dedupe",
+    sql: `
+      CREATE TABLE notifications_v2 (
+        notification_id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL REFERENCES tasks(task_id),
+        kind TEXT NOT NULL,
+        body_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        delivered_at TEXT,
+        dedupe_key TEXT NOT NULL
+      );
+
+      INSERT INTO notifications_v2 (notification_id, task_id, kind, body_json, created_at, delivered_at, dedupe_key)
+        SELECT notification_id, task_id, kind, body_json, created_at, delivered_at, kind
+        FROM notifications;
+
+      DROP TABLE notifications;
+      ALTER TABLE notifications_v2 RENAME TO notifications;
+
+      CREATE UNIQUE INDEX notifications_undelivered_uniq
+        ON notifications (task_id, kind, dedupe_key)
+        WHERE delivered_at IS NULL;
+      CREATE INDEX notifications_task_idx ON notifications (task_id, created_at);
+    `,
+  },
 ];
 
 export interface MigrationResult {

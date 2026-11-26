@@ -1,7 +1,7 @@
 import type { Database } from "../store/database.js";
 import { Database as DatabaseClass } from "../store/database.js";
 import { migrate } from "../store/migrations.js";
-import { TaskStore, RequestConflictError, type TaskResult, type TaskRow } from "../store/tasks.js";
+import { TaskStore, RequestConflictError, type TaskResult, type TaskRow, type WaitingReason } from "../store/tasks.js";
 import { ArtifactStore } from "../store/artifacts.js";
 import { analyzeLog, verifyCandidate, SSE_VERIFIER_VERSION, type Finding } from "../sse/contract.js";
 import { sha256Hex, newId, toIso, stableJson } from "../util.js";
@@ -208,8 +208,8 @@ export class TaskService {
     return { status: outcome.status, findings: outcome.status === "accepted" ? [] : outcome.findings };
   }
 
-  markWaiting(taskId: string, reason: string, now = toIso(this.now())): void {
-    this.store.setStatus(taskId, "waiting", reason as never, now);
+  markWaiting(taskId: string, reason: WaitingReason, now = toIso(this.now())): void {
+    this.store.setStatus(taskId, "waiting", reason, now);
   }
 }
 

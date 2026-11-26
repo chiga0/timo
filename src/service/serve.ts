@@ -38,7 +38,7 @@ export async function serve(): Promise<void> {
     service,
     artifacts,
     t3,
-    clientFactory: (clientConfig) => createMcpT3Client(clientConfig) as never,
+    clientFactory: (clientConfig) => Promise.resolve(createMcpT3Client(clientConfig)),
     pollIntervalMs: config.pollIntervalMs,
     waitTimeoutMs: config.waitTimeoutMs,
     runDeadlineMs: config.runDeadlineMs,

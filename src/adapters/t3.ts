@@ -70,7 +70,12 @@ export interface ThreadReading {
 }
 
 /** Creates a client bound to one OAuth token. A new token means a new scope. */
-export type T3ClientFactory = (config: T3Config) => T3Client;
+/**
+ * Short-lived MCP connections are created per use, so the factory is async:
+ * callers `await` it and failures surface as a rejected promise the runner
+ * classifies as transient.
+ */
+export type T3ClientFactory = (config: T3Config) => Promise<T3Client>;
 
 export interface T3Config {
   url: string;

@@ -1,4 +1,5 @@
 import { join } from "node:path";
+import type { T3Config } from "./adapters/t3.js";
 
 export interface ServiceConfig {
   home: string;
@@ -13,13 +14,8 @@ export interface ServiceConfig {
   runDeadlineMs: number;
 }
 
-export interface T3RuntimeConfig {
-  url: string;
-  token: string;
-  projectId: string;
-  providerId: string;
-  model: string;
-}
+/** Re-exported so the service config and the adapter share one config type. */
+export type T3RuntimeConfig = T3Config;
 
 export interface CreateTaskRequest {
   requestId: string;

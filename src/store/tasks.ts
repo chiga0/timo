@@ -374,21 +374,81 @@ export class TaskStore {
     return row ? (JSON.parse(row.value_json) as T) : undefined;
   }
 
-  enqueueNotification(taskId: string, kind: string, body: unknown, now: string): void {
+  /**
+   * Queues a notification. A task may enter the same waiting kind repeatedly, so
+   * each attempt gets a unique `dedupe_key` derived from the occurrence counter;
+   * `addressed` marks the entry as handled (the partial unique index only covers
+   * unaddressed rows, so history never blocks a new entry).
+   */
+  enqueueNotification(taskId: string, kind: string, body: unknown, now: string, dedupeKey?: string): void {
+    const seq = (this.db.prepare("SELECT COUNT(*) AS n FROM notifications WHERE task_id = ? AND kind = ?").get(taskId, kind) as { n: number }).n;
+    const key = dedupeKey ?? String(Number(seq) + 1);
     this.db
       .prepare(
-        `INSERT OR IGNORE INTO notifications (notification_id, task_id, kind, body_json, created_at, delivered_at)
-         VALUES (?, ?, ?, ?, ?, NULL)`,
+        `INSERT INTO notifications (notification_id, task_id, kind, body_json, created_at, delivered_at, dedupe_key)
+         VALUES (?, ?, ?, ?, ?, NULL, ?)`,
       )
-      .run(`${taskId}:${kind}`, taskId, kind, JSON.stringify(body), now);
+      .run(`${taskId}:${kind}:${key}:${now}`, taskId, kind, JSON.stringify(body), now, key);
   }
 
-  undeliveredNotifications(taskId: string): Array<{ kind: string; body: unknown }> {
-    const rows = this.db.prepare("SELECT kind, body_json FROM notifications WHERE task_id = ? AND delivered_at IS NULL ORDER BY created_at").all(taskId) as Array<{
-      kind: string;
-      body_json: string;
-    }>;
-    return rows.map((row) => ({ kind: row.kind, body: JSON.parse(row.body_json) }));
+  undeliveredNotifications(taskId: string): Array<{ kind: string; body: unknown; dedupeKey: string }> {
+    const rows = this.db
+      .prepare("SELECT kind, body_json, dedupe_key FROM notifications WHERE task_id = ? AND delivered_at IS NULL ORDER BY created_at")
+      .all(taskId) as Array<{ kind: string; body_json: string; dedupe_key: string }>;
+    return rows.map((row) => ({ kind: row.kind, body: JSON.parse(row.body_json), dedupeKey: row.dedupe_key }));
+  }
+
+  /** Marks every undelivered notification of a task as delivered. */
+  markNotificationsDelivered(taskId: string, now: string): number {
+    const result = this.db
+      .prepare("UPDATE notifications SET delivered_at = ? WHERE task_id = ? AND delivered_at IS NULL")
+      .run(now, taskId);
+    return Number(result.changes);
+  }
+
+  /**
+   * Writes back the executor identity actually used by a dispatch. The execution
+   * row starts as `pending`; the first successful launch binds it to the
+   * provider instance and model the client really ran.
+   */
+  bindExecution(taskId: string, providerInstanceId: string, model: string, now: string): void {
+    this.db
+      .prepare(
+        `UPDATE executions SET provider_instance_id = ?, model = ?
+         WHERE task_id = ? AND generation = (SELECT MAX(generation) FROM executions WHERE task_id = ?)`,
+      )
+      .run(providerInstanceId, model, taskId, taskId);
+    this.db.prepare("UPDATE tasks SET updated_at = ? WHERE task_id = ?").run(now, taskId);
+  }
+
+  /** Tasks whose external run exists but whose local state is not terminal yet. */
+  listInflightTasks(): Array<{ taskId: string; threadId: string; runId: string; status: TaskStatus }> {
+    const rows = this.db
+      .prepare(
+        `SELECT task_id, thread_id, run_id, status FROM tasks
+         WHERE status IN ('running', 'waiting', 'verifying')
+           AND thread_id IS NOT NULL AND run_id IS NOT NULL
+           AND run_id NOT LIKE '%:local:%'
+           AND run_id != 'none'
+         ORDER BY updated_at`,
+      )
+      .all() as Array<{ task_id: string; thread_id: string; run_id: string; status: TaskStatus }>;
+    return rows.map((row) => ({ taskId: row.task_id, threadId: row.thread_id, runId: row.run_id, status: row.status }));
+  }
+
+  /** Records a completed brief amendment as a new immutable revision. */
+  appendBriefRevision(taskId: string, requestText: string, brief: BriefRequirements, now: string): number {
+    return this.db.transaction(() => {
+      const row = this.db
+        .prepare("SELECT COALESCE(MAX(version), 0) AS version FROM brief_revisions WHERE task_id = ?")
+        .get(taskId) as { version: number };
+      const version = Number(row.version) + 1;
+      this.db
+        .prepare("INSERT INTO brief_revisions (task_id, version, request_text, requirements_json, created_at) VALUES (?, ?, ?, ?, ?)")
+        .run(taskId, version, requestText, JSON.stringify(brief), now);
+      this.db.prepare("UPDATE tasks SET updated_at = ? WHERE task_id = ?").run(now, taskId);
+      return version;
+    });
   }
 }
 
