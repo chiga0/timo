@@ -1,0 +1,1551 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Timo 提莫 · 产品设计与极简黑白工作台原型</title>
+<style>
+/* ==================== shadcn/ui Zinc 极简黑白设计 Token（零外部依赖，离线可运行） ==================== */
+:root, .theme-light {
+  color-scheme: light;
+  --bg: #ffffff;
+  --sidebar: #fafafa;
+  --card: #ffffff;
+  --muted-bg: #f4f4f5;
+  --border: #e4e4e7;
+  --ink: #09090b;
+  --muted: #71717a;
+  --primary: #18181b;
+  --primary-ink: #fafafa;
+  --success: #16a34a;
+  --warning: #d97706;
+  --error: #dc2626;
+  --shadow-sm: 0 1px 2px rgba(9,9,11,0.05);
+  --shadow-lg: 0 12px 32px rgba(9,9,11,0.14);
+}
+.theme-dark {
+  color-scheme: dark;
+  --bg: #09090b;
+  --sidebar: #0c0c0e;
+  --card: #09090b;
+  --muted-bg: #18181b;
+  --border: #27272a;
+  --ink: #fafafa;
+  --muted: #a1a1aa;
+  --primary: #fafafa;
+  --primary-ink: #09090b;
+  --success: #22c55e;
+  --warning: #f59e0b;
+  --error: #ef4444;
+  --shadow-sm: 0 1px 2px rgba(0,0,0,0.4);
+  --shadow-lg: 0 16px 40px rgba(0,0,0,0.65);
+}
+
+* { box-sizing: border-box; }
+html, body {
+  height: 100%;
+  margin: 0;
+  overflow: hidden;
+  background: var(--bg);
+  color: var(--ink);
+  font-family: "Inter", -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+  font-size: 14px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+}
+button, input, textarea { font: inherit; color: inherit; }
+button { cursor: pointer; background: transparent; border: 0; padding: 0; }
+button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 2px solid var(--ink); outline-offset: 2px; }
+h1, h2, h3, p, pre { margin: 0; }
+a { color: var(--ink); text-underline-offset: 3px; }
+[hidden] { display: none !important; }
+.mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-variant-numeric: tabular-nums; }
+.truncate { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 999px; }
+
+/* 整页全视口外壳：永不出现外层纵向滚动条，底部输入框死死固定 */
+.shell {
+  height: 100dvh;
+  max-height: 100dvh;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg);
+  color: var(--ink);
+}
+
+/* 顶栏 48px */
+.topbar {
+  height: 48px;
+  padding: 0 12px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-shrink: 0;
+  z-index: 20;
+}
+.top-left, .top-right { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.brand { display: flex; align-items: center; gap: 8px; font-weight: 600; font-size: 14px; letter-spacing: -0.02em; }
+.brand-mark {
+  width: 24px; height: 24px; border-radius: 6px;
+  background: var(--primary); color: var(--primary-ink);
+  display: inline-flex; align-items: center; justify-content: center;
+  font-size: 12px; font-weight: 700;
+}
+.brand-ver { font-size: 12px; color: var(--muted); font-weight: 400; }
+.vsep { width: 1px; height: 16px; background: var(--border); }
+
+.icon-btn {
+  width: 28px; height: 28px; border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--bg); color: var(--muted);
+  display: inline-flex; align-items: center; justify-content: center;
+  transition: background 120ms, color 120ms;
+}
+.icon-btn:hover { background: var(--muted-bg); color: var(--ink); }
+.icon-btn.active { background: var(--muted-bg); color: var(--ink); }
+
+.seg {
+  display: inline-flex; padding: 2px; gap: 2px;
+  border-radius: 6px; border: 1px solid var(--border); background: var(--muted-bg);
+}
+.seg button {
+  padding: 3px 10px; border-radius: 4px; font-size: 12px; font-weight: 500;
+  color: var(--muted); transition: background 120ms, color 120ms;
+}
+.seg button.active { background: var(--bg); color: var(--ink); box-shadow: var(--shadow-sm); }
+
+.cmd-trigger {
+  height: 28px; padding: 0 10px; border-radius: 6px;
+  border: 1px solid var(--border); background: var(--bg);
+  color: var(--muted); font-size: 12px;
+  display: inline-flex; align-items: center; gap: 8px;
+}
+.cmd-trigger:hover { background: var(--muted-bg); color: var(--ink); }
+.kbd {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 11px; line-height: 1; padding: 2px 5px;
+  border-radius: 4px; border: 1px solid var(--border);
+  background: var(--muted-bg); color: var(--muted);
+}
+
+/* 主三栏区域 */
+.workspace { flex: 1; min-height: 0; display: flex; overflow: hidden; }
+
+/* 左栏 */
+.sidebar {
+  width: 244px; flex-shrink: 0; height: 100%;
+  border-right: 1px solid var(--border); background: var(--sidebar);
+  display: flex; flex-direction: column; overflow: hidden;
+}
+.sidebar-scroll { flex: 1; min-height: 0; overflow-y: auto; padding: 12px; display: flex; flex-direction: column; gap: 18px; }
+.nav-list { display: flex; flex-direction: column; gap: 2px; }
+.nav-btn {
+  width: 100%; display: flex; align-items: center; justify-content: space-between;
+  padding: 6px 10px; border-radius: 6px; font-size: 12px; font-weight: 500;
+  color: var(--muted); transition: background 120ms, color 120ms;
+}
+.nav-btn:hover { background: var(--muted-bg); color: var(--ink); }
+.nav-btn.active { background: var(--muted-bg); color: var(--ink); font-weight: 600; }
+.nav-btn-l { display: inline-flex; align-items: center; gap: 8px; }
+.badge-count {
+  padding: 1px 6px; border-radius: 4px; font-size: 11px; font-weight: 600;
+  background: var(--primary); color: var(--primary-ink);
+}
+.group-label {
+  padding: 0 10px 6px; font-size: 11px; font-weight: 500;
+  color: var(--muted); letter-spacing: 0.04em; text-transform: uppercase;
+}
+.side-task {
+  width: 100%; text-align: left; padding: 6px 10px; border-radius: 6px;
+  display: flex; align-items: flex-start; gap: 8px; color: var(--muted);
+  transition: background 120ms, color 120ms;
+}
+.side-task:hover { background: var(--muted-bg); color: var(--ink); }
+.side-task.active { background: var(--muted-bg); color: var(--ink); }
+.side-task-body { min-width: 0; flex: 1; }
+.side-task-title { display: block; font-size: 12px; font-weight: 500; color: inherit; }
+.side-task-sub { display: block; font-size: 11px; color: var(--muted); }
+.side-empty { padding: 4px 10px; font-size: 11px; color: var(--muted); }
+
+.health-foot {
+  padding: 11px 12px; border-top: 1px solid var(--border); text-align: left;
+  transition: background 120ms; flex-shrink: 0;
+}
+.health-foot:hover { background: var(--muted-bg); }
+.health-top { display: flex; align-items: center; justify-content: space-between; font-size: 12px; font-weight: 500; }
+.health-sub { margin-top: 3px; font-size: 11px; color: var(--muted); }
+
+/* 极简 6px 语义状态点 */
+.dot { width: 6px; height: 6px; border-radius: 999px; display: inline-block; flex-shrink: 0; }
+.dot-ink { background: var(--ink); }
+.dot-muted { background: var(--muted); }
+.dot-success { background: var(--success); }
+.dot-warning { background: var(--warning); }
+.dot-error { background: var(--error); }
+
+/* 中栏：严格三段式，只有中间消息区滚动 */
+.center {
+  flex: 1; min-width: 0; min-height: 0; height: 100%;
+  display: flex; flex-direction: column; overflow: hidden;
+  background: var(--bg);
+}
+.strip {
+  padding: 8px 20px; border-bottom: 1px solid var(--border); background: var(--sidebar);
+  display: flex; align-items: center; gap: 8px; overflow-x: auto; flex-shrink: 0;
+}
+.strip-label { font-size: 11px; font-weight: 500; color: var(--muted); flex-shrink: 0; }
+.strip-pills { display: flex; align-items: center; gap: 6px; }
+.pill {
+  flex-shrink: 0; display: inline-flex; align-items: center; gap: 6px;
+  padding: 3px 10px; border-radius: 999px; font-size: 12px;
+  border: 1px solid var(--border); background: var(--bg); color: var(--muted);
+  transition: border-color 120ms, color 120ms;
+}
+.pill:hover { color: var(--ink); }
+.pill.active { border-color: var(--ink); color: var(--ink); font-weight: 500; }
+.pill-sub { font-size: 11px; color: var(--muted); }
+
+.main-scroll { flex: 1; min-height: 0; overflow-y: auto; padding: 24px 20px; }
+.main-inner { max-width: 680px; margin: 0 auto; display: flex; flex-direction: column; gap: 22px; }
+
+/* 消息与卡片 */
+.msg-user-wrap { display: flex; justify-content: flex-end; }
+.msg-user {
+  max-width: 85%; padding: 10px 14px; border-radius: 8px;
+  background: var(--muted-bg); border: 1px solid var(--border);
+  font-size: 14px; line-height: 1.55;
+}
+.msg-timo-head { display: flex; align-items: center; gap: 8px; font-size: 12px; margin-bottom: 4px; }
+.msg-avatar {
+  width: 20px; height: 20px; border-radius: 4px;
+  background: var(--primary); color: var(--primary-ink);
+  display: inline-flex; align-items: center; justify-content: center;
+  font-size: 10px; font-weight: 700;
+}
+.msg-timo-body { padding-left: 28px; }
+.msg-timo-text { font-size: 14px; line-height: 1.6; }
+
+.card {
+  margin-top: 10px; border-radius: 8px;
+  border: 1px solid var(--border); background: var(--card); overflow: hidden;
+}
+.card-head {
+  padding: 8px 14px; border-bottom: 1px solid var(--border);
+  background: var(--muted-bg); display: flex; align-items: center; justify-content: space-between;
+  gap: 8px; font-size: 12px;
+}
+.card-head-plain {
+  padding: 8px 14px; border-bottom: 1px solid var(--border);
+  display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 12px;
+}
+.card-body { padding: 12px 14px; display: flex; flex-direction: column; gap: 10px; font-size: 12px; }
+.card-box {
+  padding: 10px; border-radius: 6px; background: var(--muted-bg);
+  font-size: 11px; display: flex; flex-direction: column; gap: 4px;
+}
+.card-grid2 { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+.card-foot { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap; padding-top: 2px; }
+.card-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.card-compact {
+  margin-top: 10px; border-radius: 8px; border: 1px solid var(--border);
+  padding: 10px 14px; display: flex; align-items: center; justify-content: space-between; gap: 12px;
+}
+
+.btn {
+  height: 28px; padding: 0 12px; border-radius: 6px; font-size: 12px; font-weight: 500;
+  display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+  transition: opacity 120ms, background 120ms, border-color 120ms, color 120ms;
+}
+.btn-primary { background: var(--primary); color: var(--primary-ink); }
+.btn-primary:hover { opacity: 0.9; }
+.btn-outline { border: 1px solid var(--border); background: var(--bg); color: var(--ink); }
+.btn-outline:hover { background: var(--muted-bg); }
+.btn-outline-muted { border: 1px solid var(--border); background: var(--bg); color: var(--muted); }
+.btn-outline-muted:hover { background: var(--muted-bg); color: var(--ink); }
+.btn-danger { background: var(--error); color: #ffffff; }
+.btn-sm { height: 24px; padding: 0 8px; font-size: 11px; }
+.btn-link { font-size: 12px; color: var(--muted); }
+.btn-link:hover { color: var(--ink); text-decoration: underline; text-underline-offset: 3px; }
+
+/* 底部固定 Composer */
+.composer-wrap {
+  border-top: 1px solid var(--border); background: var(--bg);
+  padding: 10px 20px 12px; flex-shrink: 0;
+}
+.composer-inner { max-width: 680px; margin: 0 auto; }
+.quick-row { display: flex; align-items: center; gap: 6px; margin-bottom: 8px; overflow-x: auto; padding-bottom: 2px; }
+.quick-btn {
+  flex-shrink: 0; font-size: 11px; padding: 2px 8px; border-radius: 4px;
+  border: 1px solid var(--border); color: var(--muted);
+}
+.quick-btn:hover { background: var(--muted-bg); color: var(--ink); }
+
+.compose-box {
+  position: relative; border-radius: 8px;
+  border: 1px solid var(--border); background: var(--card);
+  transition: border-color 120ms;
+}
+.compose-box:focus-within { border-color: var(--ink); }
+.ctx-bar { padding: 8px 12px 0; display: flex; align-items: center; }
+.ctx-chip {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 2px 8px; border-radius: 4px; font-size: 12px; font-weight: 500;
+  background: var(--muted-bg); border: 1px solid var(--border);
+}
+.compose-row { display: flex; align-items: flex-end; gap: 8px; padding: 10px; }
+.compose-row textarea {
+  flex: 1; min-width: 0; resize: none; border: 0; outline: 0; background: transparent;
+  font-size: 14px; line-height: 1.5; min-height: 24px; max-height: 110px;
+}
+.compose-row textarea::placeholder { color: var(--muted); }
+.compose-foot {
+  padding: 0 12px 8px; display: flex; align-items: center; justify-content: space-between;
+  font-size: 11px; color: var(--muted); gap: 8px;
+}
+.mention-menu {
+  position: absolute; bottom: calc(100% + 6px); left: 0; width: 290px; z-index: 30;
+  border-radius: 8px; border: 1px solid var(--border); background: var(--card);
+  box-shadow: var(--shadow-lg); padding: 4px;
+}
+.mention-title { padding: 4px 8px; font-size: 11px; font-weight: 500; color: var(--muted); }
+.mention-item {
+  width: 100%; text-align: left; padding: 6px 8px; border-radius: 5px; font-size: 12px;
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+}
+.mention-item:hover { background: var(--muted-bg); }
+
+/* 右栏检查器 Inspector */
+.inspector {
+  width: 392px; flex-shrink: 0; height: 100%;
+  border-left: 1px solid var(--border); background: var(--bg);
+  overflow-y: auto;
+}
+.ins-inner { padding: 16px; display: flex; flex-direction: column; gap: 18px; }
+.ins-head-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.ins-title { font-size: 16px; font-weight: 600; letter-spacing: -0.02em; line-height: 1.35; }
+.ins-status-row { display: flex; align-items: center; gap: 8px; font-size: 12px; }
+.status-pill {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 2px 9px; border-radius: 999px;
+  border: 1px solid var(--border); background: var(--muted-bg); font-weight: 500;
+}
+.ins-summary { font-size: 12px; color: var(--muted); line-height: 1.6; }
+.ins-panel {
+  border-radius: 8px; border: 1px solid var(--border); background: var(--sidebar);
+  padding: 12px; display: flex; flex-direction: column; gap: 10px; font-size: 12px;
+}
+.ins-divider { border-top: 1px solid var(--border); padding-top: 14px; display: flex; flex-direction: column; gap: 8px; }
+.ins-section-label { font-size: 11px; font-weight: 500; color: var(--muted); letter-spacing: 0.04em; text-transform: uppercase; }
+.bar-track { height: 6px; width: 100%; border-radius: 999px; background: var(--border); overflow: hidden; }
+.bar-fill { height: 100%; border-radius: 999px; background: var(--ink); }
+
+.tags { display: flex; flex-wrap: wrap; gap: 6px; }
+.tag-allow {
+  padding: 2px 8px; border-radius: 4px; font-size: 11px;
+  border: 1px solid var(--border); background: var(--muted-bg); color: var(--ink);
+}
+.tag-forbid {
+  padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 500;
+  border: 1px solid rgba(220,38,38,0.42); color: var(--error);
+}
+
+.matrix-box { border-radius: 6px; border: 1px solid var(--border); overflow: hidden; }
+.matrix-row {
+  padding: 8px 12px; display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  font-size: 12px; border-top: 1px solid var(--border);
+}
+.matrix-row:first-child { border-top: 0; }
+.matrix-combo { background: var(--muted-bg); font-size: 11px; }
+
+.proof-item { border-radius: 6px; border: 1px solid var(--border); overflow: hidden; }
+.proof-btn {
+  width: 100%; padding: 8px 12px; text-align: left;
+  display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 12px;
+}
+.proof-btn:hover { background: var(--muted-bg); }
+.proof-body { border-top: 1px solid var(--border); background: var(--sidebar); padding: 10px; display: flex; flex-direction: column; gap: 6px; }
+.proof-pre {
+  font-size: 11px; line-height: 1.55; overflow-x: auto;
+  padding: 8px; border-radius: 5px; border: 1px solid var(--border); background: var(--bg);
+}
+
+.live-log {
+  border-radius: 6px; border: 1px solid var(--border); background: var(--card);
+  padding: 10px; display: flex; flex-direction: column; gap: 4px; font-size: 11px;
+}
+.steer-row { display: flex; align-items: center; gap: 6px; }
+.steer-input {
+  flex: 1; height: 28px; padding: 0 10px; border-radius: 6px;
+  border: 1px solid var(--border); background: var(--card); font-size: 12px; outline: 0;
+}
+.steer-input:focus { border-color: var(--ink); }
+
+/* 列表与环境健康视图 */
+.page-head { border-bottom: 1px solid var(--border); padding-bottom: 14px; display: flex; align-items: flex-end; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.page-head h1 { font-size: 18px; font-weight: 600; letter-spacing: -0.02em; }
+.page-head p { margin-top: 4px; font-size: 12px; color: var(--muted); }
+.list-box { border-radius: 8px; border: 1px solid var(--border); overflow: hidden; }
+.list-row {
+  width: 100%; text-align: left; padding: 12px 16px; border-top: 1px solid var(--border);
+  display: flex; align-items: center; justify-content: space-between; gap: 16px;
+  transition: background 120ms;
+}
+.list-row:first-child { border-top: 0; }
+button.list-row:hover { background: var(--muted-bg); }
+.empty-box {
+  padding: 40px 20px; text-align: center; font-size: 12px; color: var(--muted);
+  border-radius: 8px; border: 1px dashed var(--border);
+}
+
+/* PRD & 规范文档视图 */
+.prd-scroll { flex: 1; min-height: 0; overflow-y: auto; padding: 36px 24px 64px; }
+.prd { max-width: 900px; margin: 0 auto; display: flex; flex-direction: column; gap: 36px; }
+.prd-hero { border-bottom: 1px solid var(--border); padding-bottom: 24px; display: flex; flex-direction: column; gap: 8px; }
+.prd-hero h1 { font-size: 24px; font-weight: 600; letter-spacing: -0.03em; }
+.prd-hero p { font-size: 14px; color: var(--muted); max-width: 720px; }
+.prd-sec { display: flex; flex-direction: column; gap: 14px; }
+.prd-sec h2 { font-size: 16px; font-weight: 600; letter-spacing: -0.02em; }
+.prd-grid3 { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
+.prd-grid4 { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }
+.prd-card { padding: 16px; border-radius: 8px; border: 1px solid var(--border); background: var(--card); display: flex; flex-direction: column; gap: 6px; font-size: 12px; }
+.prd-card strong { font-size: 13px; }
+.prd-card p { color: var(--muted); line-height: 1.6; }
+.prd-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.prd-table th, .prd-table td { text-align: left; padding: 10px 14px; border-top: 1px solid var(--border); vertical-align: top; }
+.prd-table th { border-top: 0; background: var(--muted-bg); color: var(--muted); font-weight: 500; }
+.prd-table td:first-child { font-weight: 500; white-space: nowrap; }
+
+/* ⌘K 弹窗 */
+.modal-mask {
+  position: fixed; inset: 0; z-index: 50; background: rgba(0,0,0,0.42);
+  display: flex; align-items: flex-start; justify-content: center; padding: 14vh 16px 0;
+}
+.modal {
+  width: 100%; max-width: 520px; border-radius: 8px;
+  border: 1px solid var(--border); background: var(--card); color: var(--ink);
+  box-shadow: var(--shadow-lg); overflow: hidden;
+}
+.modal-head { display: flex; align-items: center; gap: 8px; padding: 10px 14px; border-bottom: 1px solid var(--border); }
+.modal-head input { flex: 1; border: 0; outline: 0; background: transparent; font-size: 14px; }
+.modal-body { max-height: 290px; overflow-y: auto; padding: 6px; display: flex; flex-direction: column; gap: 2px; }
+.cmd-item {
+  width: 100%; text-align: left; padding: 8px 12px; border-radius: 6px; font-size: 12px;
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+}
+.cmd-item:hover { background: var(--muted-bg); }
+
+@media (max-width: 960px) {
+  .prd-grid3 { grid-template-columns: 1fr; }
+  .prd-grid4 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .card-grid2 { grid-template-columns: 1fr; }
+  .brand-ver, .cmd-trigger { display: none; }
+}
+@media (max-width: 720px) {
+  .sidebar { position: fixed; inset: 48px auto 0 0; z-index: 30; box-shadow: var(--shadow-lg); }
+  .inspector { position: fixed; inset: 48px 0 0 auto; width: min(392px, 94vw); z-index: 30; box-shadow: var(--shadow-lg); }
+}
+</style>
+</head>
+<body>
+<div id="shell" class="shell theme-light">
+  <!-- 顶部极简导航栏 -->
+  <header class="topbar">
+    <div class="top-left">
+      <button type="button" id="toggle-left" class="icon-btn active" title="展开/收起左侧栏 ([)" aria-label="展开或收起左侧栏">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect width="18" height="18" x="3" y="3" rx="2"/><path d="M9 3v18"/></svg>
+      </button>
+      <div class="brand">
+        <span class="brand-mark">T</span>
+        <span>Timo</span>
+        <span class="brand-ver mono">v0.2</span>
+      </div>
+      <span class="vsep"></span>
+      <div class="seg" role="tablist">
+        <button type="button" id="tab-demo" class="active">工作台原型</button>
+        <button type="button" id="tab-prd">PRD 与 UI 规范</button>
+      </div>
+    </div>
+
+    <div class="top-right">
+      <button type="button" id="open-cmd" class="cmd-trigger">
+        <span>搜索或切换任务...</span>
+        <span class="kbd">⌘K</span>
+      </button>
+      <div class="seg" aria-label="黑白主题切换">
+        <button type="button" id="theme-light" class="active">浅色</button>
+        <button type="button" id="theme-dark">深色</button>
+      </div>
+      <button type="button" id="toggle-right" class="icon-btn active" title="展开/收起右侧检查器 (])" aria-label="展开或收起右侧检查器">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect width="18" height="18" x="3" y="3" rx="2"/><path d="M15 3v18"/></svg>
+      </button>
+    </div>
+  </header>
+
+  <!-- ==================== 视图一：极简黑白三栏工作台 ==================== -->
+  <div id="view-demo" class="workspace">
+    <!-- 左栏：导航与任务列表 -->
+    <aside id="left-sidebar" class="sidebar">
+      <div class="sidebar-scroll">
+        <nav class="nav-list" aria-label="主导航">
+          <button type="button" data-nav="chat" class="nav-btn active">
+            <span class="nav-btn-l">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+              主对话
+            </span>
+            <span class="kbd">G C</span>
+          </button>
+          <button type="button" data-nav="inbox" class="nav-btn">
+            <span class="nav-btn-l">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 8v4"/><path d="M12 16h.01"/></svg>
+              待你决定
+            </span>
+            <span id="inbox-badge" class="badge-count mono">2</span>
+          </button>
+          <button type="button" data-nav="tasks" class="nav-btn">
+            <span class="nav-btn-l">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M8 6h13"/><path d="M8 12h13"/><path d="M8 18h13"/><path d="M3 6h.01"/><path d="M3 12h.01"/><path d="M3 18h.01"/></svg>
+              全部任务
+            </span>
+            <span id="total-count" class="mono" style="font-size:11px;color:var(--muted)">4</span>
+          </button>
+          <button type="button" data-nav="env" class="nav-btn">
+            <span class="nav-btn-l">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+              环境与授权
+            </span>
+            <span class="dot dot-warning" title="1 项只读凭据即将过期"></span>
+          </button>
+        </nav>
+
+        <div>
+          <div class="group-label">需要关注</div>
+          <div id="side-attention"></div>
+        </div>
+        <div>
+          <div class="group-label">进行中</div>
+          <div id="side-active"></div>
+        </div>
+        <div>
+          <div class="group-label">最近完成</div>
+          <div id="side-done"></div>
+        </div>
+      </div>
+
+      <button type="button" id="health-footer" class="health-foot">
+        <div class="health-top">
+          <span style="display:inline-flex;align-items:center;gap:6px"><span class="dot dot-success"></span>本地控制面在线</span>
+          <span class="mono" style="font-size:11px;color:var(--muted)">SSE</span>
+        </div>
+        <div class="health-sub truncate">Codex / Pi 就绪 · 1 项 Token 临期</div>
+      </button>
+    </aside>
+
+    <!-- 中栏：吸顶实时条 + 独立滚动内容 + 固定底部输入框 -->
+    <main class="center">
+      <div id="sticky-strip" class="strip">
+        <span class="strip-label">实时状态</span>
+        <div id="strip-pills" class="strip-pills"></div>
+      </div>
+
+      <div id="main-scroll" class="main-scroll">
+        <div id="main-content" class="main-inner"></div>
+      </div>
+
+      <div id="composer-wrap" class="composer-wrap">
+        <div class="composer-inner">
+          <div class="quick-row">
+            <span style="font-size:11px;color:var(--muted);flex-shrink:0">快捷试玩：</span>
+            <button type="button" data-quick="SSE 修复现在卡在哪一步？" class="quick-btn">查进度</button>
+            <button type="button" data-quick="@SSE 断连修复 停止修改前端，仅保留已经创建的后端 PR" class="quick-btn">改口触发 Diff 确认卡</button>
+            <button type="button" data-quick="帮我排查测试环境订单超时日志，只读不修改" class="quick-btn">交办新任务</button>
+          </div>
+          <div class="compose-box">
+            <div id="mention-menu" class="mention-menu" hidden>
+              <div class="mention-title">绑定任务上下文</div>
+              <div id="mention-list"></div>
+            </div>
+            <div id="ctx-bar" class="ctx-bar" hidden>
+              <span class="ctx-chip">
+                <span id="ctx-id" class="mono" style="font-size:11px;color:var(--muted)"></span>
+                <span id="ctx-title"></span>
+                <button type="button" id="ctx-clear" aria-label="清除上下文" style="color:var(--muted);margin-left:2px">×</button>
+              </span>
+            </div>
+            <div class="compose-row">
+              <textarea id="composer-input" rows="1" placeholder="交办新任务，查进度，或输入 @ 精准指定某个任务..."></textarea>
+              <button type="button" id="send-btn" class="btn btn-primary">发送</button>
+            </div>
+            <div class="compose-foot">
+              <span><span class="kbd">Enter</span> 发送 · <span class="kbd">Shift+Enter</span> 换行 · <span class="kbd">@</span> 指定任务 · <span class="kbd">[</span> <span class="kbd">]</span> 折侧栏</span>
+              <span>高危变更先出 Diff 确认卡</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </main>
+
+    <!-- 右栏：任务检查器 Inspector（交付概览 / 实时运行流） -->
+    <aside id="inspector" class="inspector"></aside>
+  </div>
+
+  <!-- ==================== 视图二：面向用户的 PRD 与极简黑白 UI 规范 ==================== -->
+  <section id="view-prd" class="prd-scroll" hidden>
+    <article class="prd">
+      <header class="prd-hero">
+        <div class="mono" style="font-size:11px;color:var(--muted)">TIMO PRD &amp; DESIGN SYSTEM · v0.2 MONOCHROME</div>
+        <h1>首版产品设计与极简黑白交互规范</h1>
+        <p>Timo 是本地优先的个人研发与运维交付控制面。独立 Web 工作台采用 Tailwind CSS + shadcn/ui Zinc 极简黑白体系，把注意力留给业务承诺、跨仓交付、红线审批与独立核验结果；底层绝不自研 Agent Loop，直接复用成熟外部执行器。</p>
+      </header>
+
+      <section class="prd-sec">
+        <h2>1. 核心产品机制</h2>
+        <div class="prd-grid3">
+          <div class="prd-card">
+            <strong>注意力防火墙（4 条硬约束）</strong>
+            <p>执行过程物理隔离在右侧检查器；只有「红线待决 / 已核验交付 / 不可收敛阻塞」3 类事件穿透进主对话与收件箱；收件箱按任务原地 Upsert，禁止子任务刷屏。</p>
+          </div>
+          <div class="prd-card">
+            <strong>总助理分级委派授权</strong>
+            <p>用户配置常设委派策略（Standing Policy）与红线清单。开发/预发只读与开发仓 PR 由总助理静默放行并记审计流；仅生产发布、合并主干、生产敏感查询等红线弹审批卡。</p>
+          </div>
+          <div class="prd-card">
+            <strong>两级 Watchdog + 实时透视</strong>
+            <p>一级 0-Token 看门狗盯心跳停滞、死循环与范围漂移；异常时唤醒总助理自动纠偏或换执行器。用户随时可在检查器切至「实时运行流」透视原生执行并人工纠偏。</p>
+          </div>
+        </div>
+      </section>
+
+      <section class="prd-sec">
+        <h2>2. 极简黑白设计系统（95% 黑白灰 + 5% 语义微信号）</h2>
+        <div class="prd-grid4">
+          <div class="prd-card">
+            <div style="display:flex;align-items:center;gap:8px"><span class="dot dot-ink"></span><strong>进行中 / 等待 CI</strong></div>
+            <p>纯黑/纯白中性语义，安静后台推进，不打扰用户。</p>
+          </div>
+          <div class="prd-card">
+            <div style="display:flex;align-items:center;gap:8px"><span class="dot dot-warning"></span><strong>红线待决 / 临期</strong></div>
+            <p>6px 琥珀微点，置顶关注，明确展示范围与有效期。</p>
+          </div>
+          <div class="prd-card">
+            <div style="display:flex;align-items:center;gap:8px"><span class="dot dot-error"></span><strong>未知 / 失败 / 禁止</strong></div>
+            <p>6px 红点或细红边框警示，禁止盲重试，引导核对。</p>
+          </div>
+          <div class="prd-card">
+            <div style="display:flex;align-items:center;gap:8px"><span class="dot dot-success"></span><strong>已独立验收</strong></div>
+            <p>6px 绿点收口，每条证据可点击展开冻结原文与摘要。</p>
+          </div>
+        </div>
+      </section>
+
+      <section class="prd-sec">
+        <h2>3. 信息架构与交互原则</h2>
+        <div class="list-box">
+          <table class="prd-table">
+            <thead>
+              <tr><th>区域 / 交互</th><th>职责与设计原则</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>三栏可折叠 + 固定底栏</td><td>整页锁定 <code>100dvh</code> 消除双滚动条；底部输入框固定不动；左右侧栏支持按钮及 <code>[</code> / <code>]</code> 快捷键一键收起，专注长对话或宽屏核查证据。</td></tr>
+              <tr><td>吸顶条 + 不可变时间线</td><td>主对话保持不可变事件流，避免历史正文与最新状态矛盾；顶部吸顶状态胶囊实时呈现所有活跃任务，点击直达右侧检查器。</td></tr>
+              <tr><td>多任务写操作防串台</td><td>支持 <code>@任务</code> 精准绑定；凡涉及改口、撤权、停止的自然语言指令，先弹出带 <code>Task ID</code> 与前后对比的 Amendment Diff 确认卡，确认后经确定性通道生效。</td></tr>
+              <tr><td>双 Tab 检查器</td><td>「交付概览」聚焦跨仓 Base→Head/MR/CI 矩阵、权限护栏、预算与可展开原文证据；「实时运行流」支持下钻透视真实工具调用、Patch、单测输出与人工纠偏注入。</td></tr>
+              <tr><td>环境与授权健康度</td><td>左下角常驻系统状态条直达「环境与授权」面板，集中监控本地控制面、执行器就绪度与业务身份有效期。</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="prd-sec">
+        <h2>4. 分阶段用户验收矩阵</h2>
+        <div class="list-box">
+          <table class="prd-table">
+            <thead>
+              <tr><th>阶段</th><th>用户可操作交付与通过条件</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>M1.1–M1.3（已通过）</td><td>CLI 跑通合成 SSE 日志诊断与独立重算验收，重启后用原 Task ID 原样读回。</td></tr>
+              <tr><td>Sprint 1 · M1.4</td><td>修复底座 5 项技术债，升级 HTTP + SSE 事件驱动控制面；强杀重启自动补查，多任务并行不阻塞。</td></tr>
+              <tr><td>Sprint 2 · M1.5</td><td>本地极简黑白 Web 工作台上线；验证总助理 Standing Policy 静默批复常规权限、红线审批卡、Diff 确认卡与一级 0-Token Watchdog。</td></tr>
+              <tr><td>Sprint 3 · M1.6</td><td>自主多仓 Worktree + 直连原生 CLI（含实时运行流透视）+ 真实单测验收；从 Web 交办 Timo 自身真实开发需求，开启自用。</td></tr>
+              <tr><td>Sprint 4 · M2–M3</td><td>Capability MCP Gateway（工具裁剪 + Fencing Token）、双仓 MR + 0-Token CI 组合验收、<code>g1→g2</code> 不可变目录交接、<code>effect_unknown</code> 平台对账与二级 Watchdog 自动纠偏。</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p style="font-size:12px;color:var(--muted)">
+          设计稿 v0.2 · 2026-11-26 · 关联文档：<a href="architecture.md">架构与运行机制</a> · <a href="domain-model.md">领域模型</a> · <a href="technical-design.md">技术设计</a> · <a href="milestones.md">实施里程碑</a> · <a href="acceptance.md">验收剧本</a>
+        </p>
+      </section>
+    </article>
+  </section>
+</div>
+
+<!-- 全局 ⌘K 命令面板 -->
+<div id="cmd-modal" class="modal-mask" hidden>
+  <div class="modal">
+    <div class="modal-head">
+      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="color:var(--muted)"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>
+      <input id="cmd-input" type="text" placeholder="输入任务名、编号或快捷动作...">
+      <span class="kbd">ESC</span>
+    </div>
+    <div id="cmd-results" class="modal-body"></div>
+  </div>
+</div>
+
+<script>
+'use strict';
+
+const state = {
+  topTab: 'demo',           // 'demo' | 'prd'
+  nav: 'chat',              // 'chat' | 'inbox' | 'tasks' | 'env'
+  theme: 'light',           // 'light' | 'dark'
+  leftOpen: true,
+  rightOpen: true,
+  inspectorTab: 'overview', // 'overview' | 'live'
+  selectedId: 'T-1042',
+  contextTaskId: null,
+  taskFilter: 'all',
+  expandedProofKey: null,
+  confirmingStop: false,
+  cmdOpen: false,
+};
+
+const tasks = new Map([
+  ['T-1042', {
+    id: 'T-1042', title: 'SSE 断连修复', status: 'active', badge: '等待前端 CI',
+    generation: 'g1', executor: 'Codex · gpt-5.6', threadRef: 'run:codex_9f2a1c',
+    budgetPct: 38, budgetText: '¥1.42 / ¥4.00 · 14m', briefV: 1, grantV: 1,
+    summary: '已定位重连时服务端游标回退与前端去重竞态。后端 PR 已绿，前端 PR CI 排队中；本地组合重连检查已通过。',
+    next: '等待前端 CI 绿灯后，核对两份 CI 对应的精确 head SHA 并封存交付报告。',
+    allows: ['只读预发日志（总助理已自动放行）', '修改双仓 worktree', '提交 PR'],
+    forbids: ['禁止生产发布', '禁止直接改 main'],
+    repos: [
+      { name: 'gateway-api', base: 'a1c90f', head: '8f2d11', pr: '#142', ci: 'pass', ciLabel: 'CI 通过' },
+      { name: 'web-client',  base: '3b01e4', head: 'e41a7c', pr: '#87',  ci: 'running', ciLabel: 'CI 排队中' },
+    ],
+    comboCheck: { status: 'pass', label: '组合重连测试通过（0 漏事件 / 0 重复）' },
+    proofs: [
+      {
+        key: 'p1', label: '组合断连恢复检查', status: '通过', kind: 'pass',
+        verifier: 'combo-sse-v1', digest: 'sha256:9d4a...71c2',
+        snippet: [
+          '  1 | [test] spawn gateway-api@8f2d11 + web-client@e41a7c',
+          '  2 | [inject] drop TCP after event_seq=42',
+          '+ 3 | [assert] client reconnected in 1.2s with Last-Event-ID=42',
+          '+ 4 | [assert] received seq 43..100 (missing=0, duplicate=0)',
+        ],
+      },
+      {
+        key: 'p2', label: '后端 PR #142 · CI', status: '通过', kind: 'pass',
+        verifier: 'github-ci-v1', digest: 'head:8f2d11',
+        snippet: ['PR #142 target=main head=8f2d11', 'checks: unit-test (pass), lint (pass), build (pass)'],
+      },
+      {
+        key: 'p3', label: '前端 PR #87 · CI', status: '排队中', kind: 'pending',
+        verifier: 'github-ci-v1', digest: 'head:e41a7c',
+        snippet: ['PR #87 target=main head=e41a7c', 'checks: build (queued · 2m ago), 0-token polling active'],
+      },
+    ],
+    checkedAt: '10:24:12',
+  }],
+  ['T-1045', {
+    id: 'T-1045', title: '生产网关日志范围确认', status: 'pending', badge: '红线待批准',
+    generation: 'g1', executor: 'Pi · qwen3.7-plus', threadRef: 'run:pi_4b8e20',
+    budgetPct: 16, budgetText: '¥0.31 / ¥2.00 · 3m', briefV: 1, grantV: 1,
+    summary: '预发日志未复现 502 断连特征。需要扩大至生产网关最近 30 分钟只读日志（触及 Standing Policy 生产红线，已原地挂起等待你批准）。',
+    next: '等待你决定是否批准一次性生产只读授权；批准后原地恢复执行。',
+    allows: ['只读预发网关日志'],
+    forbids: ['禁止生产写操作', '禁止交互式 Shell'],
+    decision: { scope: 'prod-gateway 只读日志 · 最近 30 分钟 · 自动脱敏', ttl: '单次有效（15 分钟过期）' },
+    repos: [], comboCheck: null,
+    proofs: [{
+      key: 's1', label: '预发网关日志排查', status: '无异常', kind: 'pass',
+      verifier: 'log-scan-v1', digest: 'sha256:1a8f...09b3',
+      snippet: ['scanned 14,208 lines in staging-gateway (09:30 - 10:25)', '502_upstream_reset count = 0'],
+    }],
+    checkedAt: '10:28:05',
+  }],
+  ['T-1039', {
+    id: 'T-1039', title: '支付回调幂等修复', status: 'unknown', badge: '外部效果未知',
+    generation: 'g1', executor: 'Codex · gpt-5.6', threadRef: 'run:codex_1d0c88',
+    budgetPct: 52, budgetText: '¥2.10 / ¥4.00 · 21m', briefV: 1, grantV: 1,
+    summary: '调用平台创建 MR 时发生网络超时，回执丢失。系统已暂停自动重试以防重复建单，请按原操作 ID 核查平台真实状态。',
+    next: '点击「向平台核查原操作」查证 MR 是否已创建。',
+    allows: ['修改 billing-svc worktree', '提交 MR'],
+    forbids: ['禁止生产发布', '禁止盲目重试写入'],
+    unknownOp: { opId: 'op_mr_create_8841a', target: 'billing-svc -> main (head: c72e90)', lostAt: '10:19:40', risk: '直接重试可能导致平台出现两个重复 MR' },
+    repos: [{ name: 'billing-svc', base: '7f11b2', head: 'c72e90', pr: '待核查', ci: 'unknown', ciLabel: '回执丢失' }],
+    comboCheck: null,
+    proofs: [{
+      key: 'u1', label: '单元测试（隔离环境）', status: '通过', kind: 'pass',
+      verifier: 'cmd-test-v1', digest: 'head:c72e90',
+      snippet: ['npm test -> 48 passed, 0 failed (idempotency_key_replay PASS)'],
+    }],
+    checkedAt: '10:19:40',
+  }],
+  ['T-1031', {
+    id: 'T-1031', title: '昨夜 SSE 告警日志核验', status: 'done', badge: '已验收',
+    generation: 'g1', executor: 'Pi · qwen3.7-plus', threadRef: 'run:pi_0c7a44',
+    budgetPct: 12, budgetText: '¥0.18 / ¥1.50 · 42s', briefV: 1, grantV: 1,
+    summary: '确认 2 起断连事件：alpha 第 2 行断连第 4 行恢复；beta 第 6 行断连且样本末尾前未恢复。独立验证器逐行重算通过。',
+    next: '已闭环，无需处理。',
+    allows: ['只读冻结日志制品'], forbids: ['禁止修改外部系统'],
+    repos: [], comboCheck: null,
+    proofs: [{
+      key: 'd1', label: '断连与恢复证据 · L2→L4 / L6→null', status: '已核验', kind: 'pass',
+      verifier: 'sse-v1', digest: 'sha256:4e9c...f821',
+      snippet: [
+        '  1 | 2026-11-26T01:00:00Z alpha CONNECT',
+        '! 2 | 2026-11-26T01:00:12Z alpha DISCONNECT   <-- incident #1',
+        '  3 | 2026-11-26T01:00:15Z beta  HEARTBEAT',
+        '+ 4 | 2026-11-26T01:00:19Z alpha RECONNECT    <-- recovered',
+        '  5 | ',
+        '! 6 | 2026-11-26T01:00:25Z beta  DISCONNECT   <-- open (null)',
+      ],
+    }],
+    checkedAt: '09:42:18',
+  }],
+]);
+
+const feed = [
+  { id: 'm1', role: 'user', time: '10:10', text: '查一下 SSE 断连，需要改代码就前后端一起修，提两个 PR 等 CI 绿了告诉我。这次不要发布。' },
+  { id: 'm2', role: 'timo', time: '10:10', text: '已接单并锁定两仓基线与「禁止生产发布」护栏；预发只读日志权限已由总助理在 Standing Policy 范围内自动放行。过程细节沉淀在右侧检查器，CI 全部就绪或触及红线时我再叫你。', card: { type: 'accepted', taskId: 'T-1042' } },
+  { id: 'm3', role: 'timo', time: '10:19', text: '「支付回调幂等修复」提交 MR 时出现网络超时，回执丢失。我已暂停自动重试，请核查平台真实状态。', card: { type: 'unknown', taskId: 'T-1039' } },
+  { id: 'm4', role: 'timo', time: '10:28', text: '「生产网关日志范围确认」在预发未复现问题，需要读取生产日志（触及红线）。任务已原地挂起，请决定是否放行。', card: { type: 'decision', taskId: 'T-1045' } },
+];
+
+const pendingAmendments = new Map();
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+function dotClass(status) {
+  if (status === 'pending') return 'dot-warning';
+  if (status === 'unknown' || status === 'stopped') return 'dot-error';
+  if (status === 'done') return 'dot-success';
+  return 'dot-ink';
+}
+function attentionTasks() {
+  return [...tasks.values()].filter((t) => t.status === 'pending' || t.status === 'unknown');
+}
+
+function selectTask(id) {
+  state.selectedId = id;
+  state.rightOpen = true;
+  state.confirmingStop = false;
+  state.expandedProofKey = null;
+  render();
+}
+
+function handleDecision(taskId, allow) {
+  const t = tasks.get(taskId);
+  if (!t || t.status !== 'pending') return;
+  if (allow) {
+    t.status = 'active';
+    t.badge = '原地恢复 · 只读查询';
+    t.grantV += 1;
+    t.allows.push('prod-gateway 只读 30m (临期)');
+    t.summary = '已记录一次性红线授权（v2）并原地恢复执行，正在检索最近 30 分钟生产网关脱敏日志。';
+    t.next = '提取匹配错误行号并交由独立验证器核对。';
+    t.checkedAt = '刚刚';
+    feed.push({ id: 'm' + Date.now(), role: 'timo', time: '刚刚', text: `已生效授权 v${t.grantV}（${t.id}）并原地恢复运行：允许 15 分钟内只读查询生产网关脱敏日志。` });
+  } else {
+    t.status = 'done';
+    t.badge = '维持原范围';
+    t.summary = '未批准生产日志查询。已按预发日志证据归档结论，生产范围保持关闭。';
+    t.next = '已闭环，无需处理。';
+    t.checkedAt = '刚刚';
+    feed.push({ id: 'm' + Date.now(), role: 'timo', time: '刚刚', text: `已拒绝扩大范围（${t.id}），任务按预发证据收口。` });
+  }
+  render();
+  scrollToBottom();
+}
+
+function handleReconcile(taskId) {
+  const t = tasks.get(taskId);
+  if (!t || t.status !== 'unknown') return;
+  t.status = 'active';
+  t.badge = '等待 CI';
+  t.repos[0].pr = '#209';
+  t.repos[0].ci = 'running';
+  t.repos[0].ciLabel = 'CI 运行中';
+  t.summary = '已通过原操作 ID（op_mr_create_8841a）查明平台实际已创建 MR #209，未产生重复单。现已接续 0-Token 跟踪其 CI。';
+  t.next = '等待 MR #209 CI 结果。';
+  t.proofs.push({
+    key: 'u2', label: '平台对账回执 · MR #209', status: '已对齐', kind: 'pass',
+    verifier: 'reconcile-v1', digest: 'op:op_mr_create_8841a',
+    snippet: ['GET /mrs?client_op=op_mr_create_8841a -> FOUND #209 (head=c72e90)', 'duplicate_prevented = true'],
+  });
+  t.checkedAt = '刚刚';
+  feed.push({ id: 'm' + Date.now(), role: 'timo', time: '刚刚', text: `平台对账完成（${t.id}）：原请求实际已创建 MR #209，已自动关联并恢复 CI 跟踪，未发生重复提交。` });
+  render();
+  scrollToBottom();
+}
+
+function handleSimulateCiPass(taskId) {
+  const t = tasks.get(taskId);
+  if (!t || taskId !== 'T-1042' || t.status === 'done') return;
+  t.repos[1].ci = 'pass';
+  t.repos[1].ciLabel = 'CI 通过';
+  t.proofs[2].status = '通过';
+  t.proofs[2].kind = 'pass';
+  t.proofs[2].snippet = ['PR #87 target=main head=e41a7c', 'checks: build (pass), e2e-sse (pass)'];
+  t.status = 'done';
+  t.badge = '已验收';
+  t.summary = '前后端两份 PR（#142、#87）的 CI 均已通过且与候选 head 一致，组合重连检查通过，生产未发布。';
+  t.next = '全部必须项已独立核验，可由你按仓库流程合并。';
+  t.checkedAt = '刚刚';
+  feed.push({
+    id: 'm' + Date.now(), role: 'timo', time: '刚刚',
+    text: '「SSE 断连修复」已完成独立验收：后端 PR #142 与前端 PR #87 的 CI 均通过，组合重连测试 0 漏事件，生产环境未发布。',
+    card: { type: 'verified', taskId: 'T-1042' },
+  });
+  render();
+  scrollToBottom();
+}
+
+function handleHandoff(taskId) {
+  const t = tasks.get(taskId);
+  if (!t) return;
+  const nextGen = t.generation === 'g1' ? 'g2' : 'g3';
+  t.generation = nextGen;
+  t.executor = t.executor.startsWith('Codex') ? 'Pi · qwen3.7-plus' : 'Codex · gpt-5.6';
+  t.checkedAt = '刚刚';
+  feed.push({
+    id: 'm' + Date.now(), role: 'timo', time: '刚刚',
+    text: `已完成不可变目录交接（${t.id}）：旧代次 Fencing Token 已作废，快照已迁至新 worktree（${nextGen}），由 ${t.executor} 读取交接胶囊接续。`,
+  });
+  render();
+  scrollToBottom();
+}
+
+function handleStopTask(taskId) {
+  const t = tasks.get(taskId);
+  if (!t) return;
+  t.status = 'stopped';
+  t.badge = '已停止';
+  t.next = '已撤销当前代次 Fencing Token 并拒绝新派发；已有外部产物原样保留。';
+  t.checkedAt = '刚刚';
+  state.confirmingStop = false;
+  feed.push({ id: 'm' + Date.now(), role: 'timo', time: '刚刚', text: `已停止任务 ${t.id}（${t.title}）：旧执行代次已撤权，未发出的后续写动作已阻止。` });
+  render();
+  scrollToBottom();
+}
+
+function applyAmendment(amendId, confirm) {
+  const amend = pendingAmendments.get(amendId);
+  if (!amend || amend.resolved) return;
+  amend.resolved = confirm ? 'confirmed' : 'cancelled';
+  const t = tasks.get(amend.taskId);
+  if (confirm && t) {
+    t.briefV += 1;
+    t.grantV += 1;
+    t.badge = '已按新约定收敛';
+    t.forbids.push('禁止新增或更新前端 PR');
+    t.summary = '已按约定 v2 收敛范围：仅保留已创建的后端 PR #142，后续前端改动与写入权限已撤销。';
+    t.next = '继续只读跟踪已保留 PR，不再发起任何代码写入。';
+    t.checkedAt = '刚刚';
+    feed.push({ id: 'm' + Date.now(), role: 'timo', time: '刚刚', text: `约定 v${t.briefV} 与授权 v${t.grantV} 已生效（${t.id}）：已停止后续前端写入，保留后端 PR #142。` });
+  }
+  render();
+  scrollToBottom();
+}
+
+function renderSidebar() {
+  const att = attentionTasks();
+  $('inbox-badge').textContent = att.length;
+  $('inbox-badge').hidden = att.length === 0;
+  $('total-count').textContent = tasks.size;
+
+  document.querySelectorAll('[data-nav]').forEach((btn) => {
+    btn.classList.toggle('active', btn.dataset.nav === state.nav);
+  });
+
+  const drawGroup = (id, list) => {
+    const target = $(id);
+    if (!list.length) { target.innerHTML = `<div class="side-empty">无</div>`; return; }
+    target.innerHTML = list.map((t) => `
+      <button type="button" data-select="${t.id}" class="side-task ${state.selectedId === t.id ? 'active' : ''}">
+        <span class="dot ${dotClass(t.status)}" style="margin-top:6px"></span>
+        <span class="side-task-body">
+          <span class="side-task-title truncate">${esc(t.title)}</span>
+          <span class="side-task-sub mono truncate">${t.id} · ${esc(t.badge)}</span>
+        </span>
+      </button>`).join('');
+  };
+
+  drawGroup('side-attention', att);
+  drawGroup('side-active', [...tasks.values()].filter((t) => t.status === 'active'));
+  drawGroup('side-done', [...tasks.values()].filter((t) => t.status === 'done' || t.status === 'stopped'));
+}
+
+function renderStickyStrip() {
+  $('sticky-strip').hidden = state.nav !== 'chat';
+  if (state.nav !== 'chat') return;
+  const list = [...tasks.values()].filter((t) => t.status !== 'done' && t.status !== 'stopped');
+  $('strip-pills').innerHTML = list.map((t) => `
+    <button type="button" data-select="${t.id}" class="pill ${state.selectedId === t.id ? 'active' : ''}">
+      <span class="dot ${dotClass(t.status)}"></span>
+      <span>${esc(t.title)}</span>
+      <span class="pill-sub">· ${esc(t.badge)}</span>
+    </button>`).join('');
+}
+
+function renderCard(card) {
+  if (card.type === 'amendment') {
+    const a = pendingAmendments.get(card.amendId);
+    if (!a) return '';
+    return `
+      <div class="card">
+        <div class="card-head">
+          <span style="font-weight:500">变更确认卡 · Amendment Diff</span>
+          <span class="mono" style="font-size:11px;color:var(--muted)">${a.taskId}</span>
+        </div>
+        <div class="card-body">
+          <div class="card-box mono">
+            <div style="color:var(--muted)">- 原约定: ${esc(a.before)}</div>
+            <div style="font-weight:500">+ 新约定: ${esc(a.after)}</div>
+          </div>
+          <p style="color:var(--muted)">影响：${esc(a.impact)}</p>
+          ${a.resolved
+            ? `<div style="font-size:11px;color:var(--muted)">${a.resolved === 'confirmed' ? '✓ 已确认并写入新约定版本' : '已取消变更'}</div>`
+            : `<div class="card-actions">
+                <button type="button" data-amend-ok="${a.id}" class="btn btn-primary">确认生效</button>
+                <button type="button" data-amend-cancel="${a.id}" class="btn btn-outline">取消</button>
+              </div>`
+          }
+        </div>
+      </div>`;
+  }
+
+  const t = tasks.get(card.taskId);
+  if (!t) return '';
+
+  if (card.type === 'decision') {
+    const resolved = t.status !== 'pending';
+    return `
+      <div class="card">
+        <div class="card-head-plain">
+          <span style="display:inline-flex;align-items:center;gap:8px;font-weight:500"><span class="dot ${dotClass(t.status)}"></span>${esc(t.title)}</span>
+          <span class="mono" style="font-size:11px;color:var(--muted)">${t.id} · ${esc(t.badge)}</span>
+        </div>
+        <div class="card-body">
+          <div class="card-box card-grid2">
+            <div><span style="color:var(--muted)">请求范围：</span>${esc(t.decision.scope)}</div>
+            <div><span style="color:var(--muted)">有效期：</span>${esc(t.decision.ttl)}</div>
+          </div>
+          <div class="card-foot">
+            <div class="card-actions">
+              ${resolved
+                ? `<span style="font-size:11px;color:var(--muted)">已处理：${esc(t.badge)}</span>`
+                : `<button type="button" data-decide-allow="${t.id}" class="btn btn-primary">批准只读查询</button>
+                   <button type="button" data-decide-deny="${t.id}" class="btn btn-outline">维持原范围</button>`
+              }
+            </div>
+            <button type="button" data-select="${t.id}" class="btn-link">打开检查器 →</button>
+          </div>
+        </div>
+      </div>`;
+  }
+
+  if (card.type === 'unknown') {
+    const resolved = t.status !== 'unknown';
+    return `
+      <div class="card">
+        <div class="card-head-plain">
+          <span style="display:inline-flex;align-items:center;gap:8px;font-weight:500"><span class="dot ${dotClass(t.status)}"></span>${esc(t.title)}</span>
+          <span class="mono" style="font-size:11px;color:${resolved ? 'var(--muted)' : 'var(--error)'}">${resolved ? esc(t.badge) : 'effect_unknown'}</span>
+        </div>
+        <div class="card-body">
+          <div class="card-box mono">
+            <div>op_id: ${esc(t.unknownOp.opId)}</div>
+            <div style="color:var(--muted)">target: ${esc(t.unknownOp.target)} · lost at ${t.unknownOp.lostAt}</div>
+          </div>
+          <p style="font-size:11px;color:var(--muted)">风险：${esc(t.unknownOp.risk)}。系统已禁止自动重发。</p>
+          <div class="card-foot">
+            <div class="card-actions">
+              ${resolved
+                ? `<span style="font-size:11px;color:var(--muted)">✓ 已完成对账并恢复跟踪</span>`
+                : `<button type="button" data-reconcile="${t.id}" class="btn btn-primary">向平台核查原操作</button>`
+              }
+            </div>
+            <button type="button" data-select="${t.id}" class="btn-link">查看详情 →</button>
+          </div>
+        </div>
+      </div>`;
+  }
+
+  return `
+    <div class="card-compact">
+      <div style="min-width:0;display:flex;align-items:center;gap:10px">
+        <span class="dot ${dotClass(t.status)}"></span>
+        <div style="min-width:0">
+          <div class="truncate" style="font-size:12px;font-weight:500">${esc(t.title)} <span class="mono" style="font-size:11px;color:var(--muted);margin-left:4px">${t.id}</span></div>
+          <div class="truncate" style="font-size:11px;color:var(--muted)">当前态：${esc(t.badge)} · 最后核验 ${t.checkedAt}</div>
+        </div>
+      </div>
+      <button type="button" data-select="${t.id}" class="btn btn-outline">查看</button>
+    </div>`;
+}
+
+function renderMain() {
+  const container = $('main-content');
+  $('composer-wrap').hidden = state.nav !== 'chat';
+
+  if (state.nav === 'chat') {
+    container.innerHTML = feed.map((m) => {
+      if (m.role === 'user') return `<div class="msg-user-wrap"><div class="msg-user">${esc(m.text)}</div></div>`;
+      return `
+        <div>
+          <div class="msg-timo-head">
+            <span class="msg-avatar">T</span>
+            <span style="font-weight:500">Timo</span>
+            <span class="mono" style="font-size:11px;color:var(--muted)">${m.time}</span>
+          </div>
+          <div class="msg-timo-body">
+            <p class="msg-timo-text">${esc(m.text)}</p>
+            ${m.card ? renderCard(m.card) : ''}
+          </div>
+        </div>`;
+    }).join('');
+    return;
+  }
+
+  if (state.nav === 'inbox') {
+    const att = attentionTasks();
+    container.innerHTML = `
+      <div class="page-head">
+        <div><h1>待你决定</h1><p>集中处理红线授权审批、需求歧义与外部效果核对。同任务原地更新，处理后与主对话同步。</p></div>
+      </div>
+      ${att.length === 0
+        ? `<div class="empty-box">所有待决事项已清空，其余任务正在安静推进。</div>`
+        : att.map((t) => renderCard({ type: t.status === 'unknown' ? 'unknown' : 'decision', taskId: t.id })).join('')
+      }`;
+    return;
+  }
+
+  if (state.nav === 'tasks') {
+    const filters = [['all', '全部'], ['attention', '需要关注'], ['active', '进行中'], ['done', '已结束']];
+    const list = [...tasks.values()].filter((t) => {
+      if (state.taskFilter === 'attention') return t.status === 'pending' || t.status === 'unknown';
+      if (state.taskFilter === 'active') return t.status === 'active';
+      if (state.taskFilter === 'done') return t.status === 'done' || t.status === 'stopped';
+      return true;
+    });
+    container.innerHTML = `
+      <div class="page-head">
+        <div><h1>全部任务</h1><p>所有业务承诺、多仓交付状态与核验记录。</p></div>
+        <div class="seg">${filters.map(([k, label]) => `<button type="button" data-filter="${k}" class="${state.taskFilter === k ? 'active' : ''}">${label}</button>`).join('')}</div>
+      </div>
+      <div class="list-box">
+        ${list.map((t) => `
+          <button type="button" data-select="${t.id}" class="list-row">
+            <div style="min-width:0;display:flex;align-items:center;gap:12px">
+              <span class="dot ${dotClass(t.status)}"></span>
+              <div style="min-width:0">
+                <div class="truncate" style="font-size:14px;font-weight:500">${esc(t.title)}</div>
+                <div class="truncate" style="font-size:12px;color:var(--muted)">${esc(t.summary)}</div>
+              </div>
+            </div>
+            <div class="mono" style="flex-shrink:0;text-align:right">
+              <div style="font-size:12px;font-weight:500">${esc(t.badge)}</div>
+              <div style="font-size:11px;color:var(--muted)">${t.id} · ${t.checkedAt}</div>
+            </div>
+          </button>`).join('')}
+      </div>`;
+    return;
+  }
+
+  container.innerHTML = `
+    <div class="page-head">
+      <div><h1>环境与授权健康度</h1><p>本地事件控制面、原生执行器与外部身份状态。真实凭据由本地能力网关从 Keychain 领取，不落任务库。</p></div>
+    </div>
+    <div class="list-box">
+      <div class="list-row">
+        <div><div style="font-weight:500">Timo Local Daemon</div><div class="mono" style="font-size:12px;color:var(--muted)">~/.timo/timo.sock · HTTP + SSE · SQLite WAL</div></div>
+        <span class="mono" style="display:inline-flex;align-items:center;gap:6px;font-size:12px"><span class="dot dot-success"></span>运行中</span>
+      </div>
+      <div class="list-row">
+        <div><div style="font-weight:500">执行器 · Codex / Pi / T3Adapter</div><div class="mono" style="font-size:12px;color:var(--muted)">Capability MCP Gateway · Fencing Token 已启用</div></div>
+        <span class="mono" style="display:inline-flex;align-items:center;gap:6px;font-size:12px"><span class="dot dot-success"></span>2 个就绪</span>
+      </div>
+      <div class="list-row">
+        <div><div style="font-weight:500">总助理常设策略（Standing Policy v1）</div><div class="mono" style="font-size:12px;color:var(--muted)">自动放行：开发/预发只读、开发仓 PR · 红线：生产发布/主干合并</div></div>
+        <span class="mono" style="font-size:12px;color:var(--muted)">已生效</span>
+      </div>
+      <div class="list-row">
+        <div><div style="font-weight:500">日志只读身份（staging-log-ro）</div><div class="mono" style="font-size:12px;color:var(--muted)">scope: staging-gateway:read</div></div>
+        <span class="mono" style="display:inline-flex;align-items:center;gap:6px;font-size:12px;color:var(--warning)"><span class="dot dot-warning"></span>45 分钟后过期</span>
+      </div>
+    </div>`;
+}
+
+function renderLiveStream(t) {
+  const logs = t._liveLogs || [
+    { ts: '10:11:04', tag: '总助理自动批复', text: 'Worker 请求只读预发日志（Standing Policy 委派范围内），已静默签发 grant v1，未打扰用户。' },
+    { ts: '10:12:19', tag: 'tool: read_logs', text: 'gateway-staging (10:00–10:10) -> 命中 3 条 cursor_rewind_gap' },
+    { ts: '10:15:42', tag: 'patch: gateway-api', text: 'src/sse/stream.ts (+14 -3) · 修正 Last-Event-ID 游标偏移' },
+    { ts: '10:18:10', tag: 'shell: npm test', text: 'PASS test/sse-reconnect.test.ts (12 passed, 0 failed · 1.4s)' },
+    { ts: '10:22:05', tag: 'Watchdog', text: '0-Token 巡检正常 · 无重复失败循环 · 正在监听前端 PR #87 CI' },
+  ];
+  return `
+    <div style="display:flex;flex-direction:column;gap:10px">
+      <div class="ins-panel mono" style="padding:8px 10px;flex-direction:row;align-items:center;justify-content:space-between;font-size:11px">
+        <span>${esc(t.executor)} (${t.generation})</span>
+        <span style="color:var(--muted)">${esc(t.threadRef)}</span>
+      </div>
+      <div class="mono" style="display:flex;flex-direction:column;gap:8px">
+        ${logs.map((l) => `
+          <div class="live-log">
+            <div style="display:flex;justify-content:space-between;font-size:10px;color:var(--muted)">
+              <span style="font-weight:600;color:var(--ink)">${esc(l.tag)}</span>
+              <span>${esc(l.ts)}</span>
+            </div>
+            <div style="color:var(--muted);line-height:1.55;word-break:break-word">${esc(l.text)}</div>
+          </div>`).join('')}
+      </div>
+      ${t.status === 'active' ? `
+        <div class="ins-divider">
+          <div style="font-size:11px;color:var(--muted)">发现走偏？直接向当前 Run 注入纠偏指令：</div>
+          <div class="steer-row">
+            <input id="steer-input" class="steer-input" type="text" placeholder="例如：优先检查重连抖动边界...">
+            <button type="button" data-steer="${t.id}" class="btn btn-outline">注入</button>
+          </div>
+        </div>` : ''}
+    </div>`;
+}
+
+function renderInspector() {
+  const el = $('inspector');
+  const t = tasks.get(state.selectedId);
+  if (!t) { el.innerHTML = `<div style="padding:24px;font-size:12px;color:var(--muted)">选择一个任务查看交付证据与护栏。</div>`; return; }
+
+  const ciDot = (ci) => ci === 'pass' ? 'dot-success' : ci === 'unknown' ? 'dot-error' : 'dot-warning';
+  const canStop = t.status === 'active' || t.status === 'pending' || t.status === 'unknown';
+
+  el.innerHTML = `
+    <div class="ins-inner">
+      <div style="display:flex;flex-direction:column;gap:10px">
+        <div class="ins-head-row">
+          <div class="mono" style="font-size:12px;color:var(--muted)">${t.id} · brief v${t.briefV} · grant v${t.grantV}</div>
+          <div style="display:flex;align-items:center;gap:6px">
+            ${canStop ? (state.confirmingStop
+              ? `<button type="button" data-stop-confirm="${t.id}" class="btn btn-danger btn-sm">确认停止</button>
+                 <button type="button" id="stop-cancel" class="btn btn-outline btn-sm">取消</button>`
+              : `<button type="button" id="stop-trigger" class="btn btn-outline btn-sm">停止任务</button>`
+            ) : ''}
+            <button type="button" id="close-inspector" class="icon-btn" style="width:24px;height:24px" title="收起检查器 (])" aria-label="收起任务检查器">×</button>
+          </div>
+        </div>
+        <h2 class="ins-title">${esc(t.title)}</h2>
+        <div class="seg" style="width:100%">
+          <button type="button" data-itab="overview" class="${state.inspectorTab === 'overview' ? 'active' : ''}" style="flex:1">交付概览</button>
+          <button type="button" data-itab="live" class="${state.inspectorTab === 'live' ? 'active' : ''}" style="flex:1;display:inline-flex;align-items:center;justify-content:center;gap:6px">
+            <span class="dot ${t.status === 'active' ? 'dot-success' : 'dot-muted'}"></span>实时运行流
+          </button>
+        </div>
+      </div>
+
+      ${state.inspectorTab === 'live' ? renderLiveStream(t) : `
+        <div style="display:flex;flex-direction:column;gap:8px">
+          <div class="ins-status-row">
+            <span class="status-pill"><span class="dot ${dotClass(t.status)}"></span>${esc(t.badge)}</span>
+            <span class="mono" style="font-size:11px;color:var(--muted)">核验 ${t.checkedAt}</span>
+          </div>
+          <p class="ins-summary">${esc(t.summary)}</p>
+        </div>
+
+        <div class="ins-panel">
+          <div style="display:flex;align-items:center;justify-content:space-between;gap:8px">
+            <div>
+              <div style="font-size:11px;color:var(--muted)">当前执行器 · 代次 <span class="mono" style="color:var(--ink)">${t.generation}</span></div>
+              <div class="mono" style="font-weight:500;margin-top:2px">${esc(t.executor)}</div>
+            </div>
+            ${t.status !== 'done' && t.status !== 'stopped'
+              ? `<button type="button" data-handoff="${t.id}" class="btn btn-outline btn-sm" title="以不可变目录快照切换执行器">换执行器</button>`
+              : ''}
+          </div>
+          <div style="display:flex;align-items:center;justify-content:space-between;font-size:11px;color:var(--muted);border-top:1px solid var(--border);padding-top:8px">
+            <span style="display:inline-flex;align-items:center;gap:6px"><span class="dot dot-success"></span>Watchdog · 18s 前心跳正常</span>
+            <button type="button" data-itab="live" class="btn-link" style="font-size:11px">透视会话 ↗</button>
+          </div>
+          <div style="display:flex;flex-direction:column;gap:5px">
+            <div class="mono" style="display:flex;justify-content:space-between;font-size:11px;color:var(--muted)">
+              <span>全树预算</span><span style="color:var(--ink)">${esc(t.budgetText)}</span>
+            </div>
+            <div class="bar-track"><div class="bar-fill" style="width:${t.budgetPct}%"></div></div>
+          </div>
+        </div>
+
+        <div class="ins-divider">
+          <div class="ins-section-label">权限护栏</div>
+          <div class="tags">
+            ${t.forbids.map((f) => `<span class="tag-forbid">✕ ${esc(f)}</span>`).join('')}
+            ${t.allows.map((a) => `<span class="tag-allow">✓ ${esc(a)}</span>`).join('')}
+          </div>
+        </div>
+
+        ${t.repos.length ? `
+          <div class="ins-divider">
+            <div style="display:flex;align-items:center;justify-content:space-between">
+              <span class="ins-section-label">跨仓交付矩阵</span>
+              ${t.id === 'T-1042' && t.status === 'active'
+                ? `<button type="button" data-sim-ci="${t.id}" class="btn-link" style="font-size:11px">模拟前端 CI 通过</button>`
+                : ''}
+            </div>
+            <div class="matrix-box">
+              ${t.repos.map((r) => `
+                <div class="matrix-row">
+                  <div style="min-width:0">
+                    <div class="mono truncate" style="font-weight:500">${esc(r.name)}</div>
+                    <div class="mono" style="font-size:11px;color:var(--muted)">${r.base} → ${r.head} · PR ${esc(r.pr)}</div>
+                  </div>
+                  <span class="mono" style="flex-shrink:0;display:inline-flex;align-items:center;gap:6px;font-size:11px">
+                    <span class="dot ${ciDot(r.ci)}"></span>${esc(r.ciLabel)}
+                  </span>
+                </div>`).join('')}
+              ${t.comboCheck ? `
+                <div class="matrix-row matrix-combo">
+                  <span style="font-weight:500">组合行为验收</span>
+                  <span class="mono" style="display:inline-flex;align-items:center;gap:6px"><span class="dot dot-success"></span>通过</span>
+                </div>` : ''}
+            </div>
+          </div>` : ''}
+
+        <div class="ins-divider">
+          <div class="ins-section-label">独立证据（点击展开原文）</div>
+          ${t.proofs.map((p) => {
+            const open = state.expandedProofKey === p.key;
+            return `
+              <div class="proof-item">
+                <button type="button" data-proof="${p.key}" class="proof-btn">
+                  <span class="truncate" style="font-weight:500">${esc(p.label)}</span>
+                  <span class="mono" style="flex-shrink:0;display:inline-flex;align-items:center;gap:6px;font-size:11px;color:var(--muted)">
+                    <span class="dot ${p.kind === 'pass' ? 'dot-success' : 'dot-warning'}"></span>${esc(p.status)}
+                  </span>
+                </button>
+                ${open ? `
+                  <div class="proof-body">
+                    <div class="mono" style="display:flex;justify-content:space-between;font-size:10px;color:var(--muted)">
+                      <span>verifier: ${esc(p.verifier)}</span><span>${esc(p.digest)}</span>
+                    </div>
+                    <pre class="proof-pre mono">${esc(p.snippet.join('\n'))}</pre>
+                  </div>` : ''}
+              </div>`;
+          }).join('')}
+        </div>
+
+        <div class="ins-divider">
+          <button type="button" data-ask="${t.id}" class="btn btn-outline-muted" style="width:100%;height:32px">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+            在主对话中追问此任务
+          </button>
+        </div>
+      `}
+    </div>`;
+}
+
+function renderChrome() {
+  $('shell').className = `shell theme-${state.theme}`;
+  $('theme-light').classList.toggle('active', state.theme === 'light');
+  $('theme-dark').classList.toggle('active', state.theme === 'dark');
+  $('tab-demo').classList.toggle('active', state.topTab === 'demo');
+  $('tab-prd').classList.toggle('active', state.topTab === 'prd');
+  $('view-demo').hidden = state.topTab !== 'demo';
+  $('view-prd').hidden = state.topTab !== 'prd';
+
+  $('left-sidebar').hidden = !state.leftOpen;
+  $('inspector').hidden = !state.rightOpen;
+  $('toggle-left').hidden = state.topTab !== 'demo';
+  $('toggle-right').hidden = state.topTab !== 'demo';
+  $('toggle-left').classList.toggle('active', state.leftOpen);
+  $('toggle-right').classList.toggle('active', state.rightOpen);
+
+  const ctx = state.contextTaskId ? tasks.get(state.contextTaskId) : null;
+  $('ctx-bar').hidden = !ctx;
+  if (ctx) { $('ctx-id').textContent = ctx.id; $('ctx-title').textContent = ctx.title; }
+}
+
+function renderCmd(query = '') {
+  const q = query.trim().toLowerCase();
+  const items = [
+    ...[...tasks.values()].map((t) => ({ label: t.title, sub: `${t.id} · ${t.badge}`, action: () => { state.topTab = 'demo'; selectTask(t.id); closeCmd(); } })),
+    { label: '跳转到：待你决定', sub: '收件箱视图', action: () => { state.topTab = 'demo'; state.nav = 'inbox'; closeCmd(); render(); } },
+    { label: '跳转到：环境与授权健康度', sub: '凭据与运行时', action: () => { state.topTab = 'demo'; state.nav = 'env'; closeCmd(); render(); } },
+    { label: '切换浅色 / 深色主题', sub: 'shadcn Zinc 配色', action: () => { state.theme = state.theme === 'light' ? 'dark' : 'light'; closeCmd(); render(); } },
+  ].filter((i) => !q || i.label.toLowerCase().includes(q) || i.sub.toLowerCase().includes(q));
+
+  $('cmd-results').innerHTML = items.length
+    ? items.map((i, idx) => `<button type="button" data-cmd-idx="${idx}" class="cmd-item"><span style="font-weight:500">${esc(i.label)}</span><span class="mono" style="font-size:11px;color:var(--muted)">${esc(i.sub)}</span></button>`).join('')
+    : `<div style="padding:20px;text-align:center;font-size:12px;color:var(--muted)">未找到匹配项</div>`;
+  $('cmd-results')._items = items;
+}
+
+function openCmd() { state.cmdOpen = true; $('cmd-modal').hidden = false; $('cmd-input').value = ''; renderCmd(''); $('cmd-input').focus(); }
+function closeCmd() { state.cmdOpen = false; $('cmd-modal').hidden = true; }
+function scrollToBottom() { requestAnimationFrame(() => { const el = $('main-scroll'); el.scrollTop = el.scrollHeight; }); }
+
+function sendMessage(rawText) {
+  const text = rawText.trim();
+  if (!text) return;
+  feed.push({ id: 'u' + Date.now(), role: 'user', time: '刚刚', text });
+
+  if (/停止|不要|改口|撤权|只保留|仅保留/.test(text)) {
+    const target = (state.contextTaskId && tasks.get(state.contextTaskId)) || tasks.get('T-1042');
+    const amendId = 'am_' + Date.now();
+    pendingAmendments.set(amendId, {
+      id: amendId, taskId: target.id,
+      before: '前后端一起修复，分别提交两个 PR 并等待两份 CI',
+      after: '停止后续前端修改与写入，仅保留已创建的后端 PR #142',
+      impact: '已提交的后端 PR 不会自动关闭；前端 worktree 将冻结并撤销写权限。',
+      resolved: null,
+    });
+    feed.push({ id: 't' + Date.now(), role: 'timo', time: '刚刚', text: `检测到针对 ${target.id}（${target.title}）的约定与权限变更。为避免误操作，请核对以下差异后确认生效：`, card: { type: 'amendment', amendId } });
+  } else if (/进度|卡在哪|状态|[?？]/.test(text)) {
+    const target = (state.contextTaskId && tasks.get(state.contextTaskId)) || tasks.get('T-1042');
+    feed.push({ id: 't' + Date.now(), role: 'timo', time: '刚刚', text: `${target.title}（${target.id}）：${target.summary} 下一步：${target.next}`, card: { type: 'accepted', taskId: target.id } });
+    state.selectedId = target.id;
+  } else {
+    const newId = 'T-' + (1046 + tasks.size);
+    const title = text.length > 18 ? text.slice(0, 18) + '…' : text;
+    tasks.set(newId, {
+      id: newId, title, status: 'active', badge: '已接单 · 准备中',
+      generation: 'g1', executor: 'Pi · qwen3.7-plus', threadRef: 'run:pi_new',
+      budgetPct: 5, budgetText: '¥0.05 / ¥2.00 · 10s', briefV: 1, grantV: 1,
+      summary: `已冻结请求并建立业务任务：${text}`,
+      next: '总助理已按 Standing Policy 放行只读权限并派发执行。',
+      allows: ['只读获准日志（总助理已自动放行）'], forbids: ['禁止外部写入', '禁止生产发布'],
+      repos: [], comboCheck: null,
+      proofs: [{ key: 'n' + Date.now(), label: '请求已持久化落盘', status: '就绪', kind: 'pass', verifier: 'ledger-v1', digest: 'event:seq_1', snippet: [`task_id=${newId}`, `request="${text}"`] }],
+      checkedAt: '刚刚',
+    });
+    state.selectedId = newId;
+    feed.push({ id: 't' + Date.now(), role: 'timo', time: '刚刚', text: `已接单（${newId}）。默认护栏「禁止外部写入 / 禁止生产发布」已生效，有独立核验结果或触及红线时我会再汇报。`, card: { type: 'accepted', taskId: newId } });
+  }
+
+  $('composer-input').value = '';
+  $('mention-menu').hidden = true;
+  render();
+  scrollToBottom();
+}
+
+function render() {
+  renderChrome();
+  renderSidebar();
+  renderStickyStrip();
+  renderMain();
+  renderInspector();
+}
+
+$('tab-demo').onclick = () => { state.topTab = 'demo'; render(); };
+$('tab-prd').onclick = () => { state.topTab = 'prd'; render(); };
+$('theme-light').onclick = () => { state.theme = 'light'; render(); };
+$('theme-dark').onclick = () => { state.theme = 'dark'; render(); };
+$('toggle-left').onclick = () => { state.leftOpen = !state.leftOpen; render(); };
+$('toggle-right').onclick = () => { state.rightOpen = !state.rightOpen; render(); };
+$('open-cmd').onclick = openCmd;
+$('health-footer').onclick = () => { state.nav = 'env'; render(); };
+$('ctx-clear').onclick = () => { state.contextTaskId = null; render(); $('composer-input').focus(); };
+$('send-btn').onclick = () => sendMessage($('composer-input').value);
+
+document.addEventListener('click', (e) => {
+  const navBtn = e.target.closest('[data-nav]');
+  if (navBtn) { state.nav = navBtn.dataset.nav; render(); return; }
+  const selBtn = e.target.closest('[data-select]');
+  if (selBtn) { selectTask(selBtn.dataset.select); return; }
+  const filterBtn = e.target.closest('[data-filter]');
+  if (filterBtn) { state.taskFilter = filterBtn.dataset.filter; render(); return; }
+  const itabBtn = e.target.closest('[data-itab]');
+  if (itabBtn) { state.inspectorTab = itabBtn.dataset.itab; renderInspector(); return; }
+  const allowBtn = e.target.closest('[data-decide-allow]');
+  if (allowBtn) { handleDecision(allowBtn.dataset.decideAllow, true); return; }
+  const denyBtn = e.target.closest('[data-decide-deny]');
+  if (denyBtn) { handleDecision(denyBtn.dataset.decideDeny, false); return; }
+  const recBtn = e.target.closest('[data-reconcile]');
+  if (recBtn) { handleReconcile(recBtn.dataset.reconcile); return; }
+  const ciBtn = e.target.closest('[data-sim-ci]');
+  if (ciBtn) { handleSimulateCiPass(ciBtn.dataset.simCi); return; }
+  const handoffBtn = e.target.closest('[data-handoff]');
+  if (handoffBtn) { handleHandoff(handoffBtn.dataset.handoff); return; }
+  const proofBtn = e.target.closest('[data-proof]');
+  if (proofBtn) { state.expandedProofKey = state.expandedProofKey === proofBtn.dataset.proof ? null : proofBtn.dataset.proof; renderInspector(); return; }
+  const askBtn = e.target.closest('[data-ask]');
+  if (askBtn) { state.contextTaskId = askBtn.dataset.ask; state.nav = 'chat'; render(); $('composer-input').focus(); return; }
+  const steerBtn = e.target.closest('[data-steer]');
+  if (steerBtn) {
+    const input = $('steer-input');
+    const msg = input && input.value.trim();
+    const t = tasks.get(steerBtn.dataset.steer);
+    if (msg && t) {
+      if (!t._liveLogs) {
+        t._liveLogs = [
+          { ts: '10:11:04', tag: '总助理自动批复', text: 'Worker 请求只读预发日志（Standing Policy 委派范围内），已静默签发 grant v1，未打扰用户。' },
+          { ts: '10:12:19', tag: 'tool: read_logs', text: 'gateway-staging (10:00–10:10) -> 命中 3 条 cursor_rewind_gap' },
+          { ts: '10:15:42', tag: 'patch: gateway-api', text: 'src/sse/stream.ts (+14 -3) · 修正 Last-Event-ID 游标偏移' },
+          { ts: '10:18:10', tag: 'shell: npm test', text: 'PASS test/sse-reconnect.test.ts (12 passed, 0 failed · 1.4s)' },
+        ];
+      }
+      t._liveLogs.push({ ts: '刚刚', tag: '人工纠偏注入', text: msg });
+      renderInspector();
+    }
+    return;
+  }
+  if (e.target.closest('#close-inspector')) { state.rightOpen = false; render(); return; }
+  if (e.target.closest('#stop-trigger')) { state.confirmingStop = true; renderInspector(); return; }
+  if (e.target.closest('#stop-cancel')) { state.confirmingStop = false; renderInspector(); return; }
+  const stopOk = e.target.closest('[data-stop-confirm]');
+  if (stopOk) { handleStopTask(stopOk.dataset.stopConfirm); return; }
+  const amendOk = e.target.closest('[data-amend-ok]');
+  if (amendOk) { applyAmendment(amendOk.dataset.amendOk, true); return; }
+  const amendCancel = e.target.closest('[data-amend-cancel]');
+  if (amendCancel) { applyAmendment(amendCancel.dataset.amendCancel, false); return; }
+  const quickBtn = e.target.closest('[data-quick]');
+  if (quickBtn) { sendMessage(quickBtn.dataset.quick); return; }
+  const mentionBtn = e.target.closest('[data-mention]');
+  if (mentionBtn) {
+    state.contextTaskId = mentionBtn.dataset.mention;
+    $('composer-input').value = $('composer-input').value.replace(/@$/, '');
+    $('mention-menu').hidden = true;
+    render();
+    $('composer-input').focus();
+    return;
+  }
+  const cmdIdx = e.target.closest('[data-cmd-idx]');
+  if (cmdIdx) { const item = $('cmd-results')._items?.[Number(cmdIdx.dataset.cmdIdx)]; if (item) item.action(); return; }
+  if (e.target === $('cmd-modal')) closeCmd();
+});
+
+$('composer-input').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); sendMessage(e.target.value); }
+});
+$('composer-input').addEventListener('input', (e) => {
+  if (e.target.value.endsWith('@')) {
+    $('mention-list').innerHTML = [...tasks.values()].map((t) => `<button type="button" data-mention="${t.id}" class="mention-item"><span class="truncate" style="font-weight:500">${esc(t.title)}</span><span class="mono" style="font-size:11px;color:var(--muted)">${t.id}</span></button>`).join('');
+    $('mention-menu').hidden = false;
+  } else {
+    $('mention-menu').hidden = true;
+  }
+});
+$('cmd-input').addEventListener('input', (e) => renderCmd(e.target.value));
+
+document.addEventListener('keydown', (e) => {
+  const tag = (e.target && e.target.tagName) || '';
+  const editing = tag === 'INPUT' || tag === 'TEXTAREA';
+  if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') { e.preventDefault(); state.cmdOpen ? closeCmd() : openCmd(); }
+  else if (e.key === 'Escape') { if (state.cmdOpen) closeCmd(); else $('mention-menu').hidden = true; }
+  else if (!editing && !e.metaKey && !e.ctrlKey && !e.altKey && state.topTab === 'demo') {
+    if (e.key === '[') { state.leftOpen = !state.leftOpen; render(); }
+    else if (e.key === ']') { state.rightOpen = !state.rightOpen; render(); }
+  }
+});
+
+if (window.innerWidth < 1100) state.rightOpen = false;
+if (window.innerWidth < 720) state.leftOpen = false;
+render();
+</script>
+</body>
+</html>

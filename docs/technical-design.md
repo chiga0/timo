@@ -1,63 +1,92 @@
 # Timo 技术设计与选型
 
-## 实现基线
+## 1. 技术选型基线
 
-| 层 | 采用方案 | 落地要求 |
+遵循**“单进程轻底座、零自研 Agent Loop、事件驱动 + 持久化账本、极简黑白前端”**原则：
+
+| 层 | 采用方案 | 选型依据与落地要求 |
 | --- | --- | --- |
-| 语言与构建 | TypeScript 严格模式、ESM、Node.js 24、npm、tsc | 单包起步，提交锁文件，使用 npm ci 可重复安装。M0 机器已核对 Node 24.15.0 与内置 SQLite 3.51.3。 |
-| 任务存储 | SQLite、Node 内置 node:sqlite、版本化 SQL 迁移 | 开启外键和 WAL。单服务进程写库，事务保持短小。初次实现验证迁移、异常退出与重启恢复。 [Node.js SQLite 文档](https://nodejs.org/docs/latest-v24.x/api/sqlite.html) |
-| T3 接入 | 官方 TypeScript MCP SDK 的 Streamable HTTP 客户端 | SDK 与 OAuth 仅由接入模块使用。M1 首个切片锁 SDK 版本，以 M0 探针对照验证工具发现、登录重连及超时。 [MCP TypeScript SDK](https://github.com/modelcontextprotocol/typescript-sdk) |
-| 本地入口 | Node 内置 HTTP，通过用户私有目录内的 Unix socket 提供命令接口 | macOS 和 Linux 为首版目标。CLI 及将来的总助理入口调用同一个应用层。目录权限 0700，socket 权限 0600，同一用户会话启动任务服务。需要独立网络 API 时再确定 HTTP 框架。 |
-| 测试 | node:test、临时 SQLite、可控时钟与替换传输 | 固定夹具做掉线和崩溃测试，固定版 T3 验证真实链路。M0 的 Python 探针继续作为运行版本核对工具。 |
+| **运行时与语言** | TypeScript 严格模式、ESM、Node.js 24、npm、tsc | 单仓库起步，锁定依赖与 `package-lock.json`；复用已核对的 Node 24.15.0 原生 `node:sqlite` 与 `node:test`。 |
+| **持久化账本** | SQLite（`node:sqlite`），WAL + 外键 + `BEGIN IMMEDIATE` | 单服务进程独占写入，事务短小且**网络调用期间绝不持有事务**。从当前 M1 表结构平滑演进为 **Event Log (`task_events`) + 物化投影 + `outbox_jobs` + 内容寻址制品索引**。 |
+| **本地控制面与实时推送** | Node 内置 `node:http`（或轻量 Hono）同时暴露 **Unix Socket + Loopback HTTP/SSE** | Unix Socket（`~/.timo/timo.sock`，`0600`）供 CLI 与高信任本地工具免密调用；`127.0.0.1:<port>`（启动生成随机 Session Token）供 Web 控制台提供 REST API 与 **SSE `/api/events?afterSeq=N`** 增量实时推送。CLI 与 Web 共用同一套应用层与 HTTP 契约。 |
+| **事件驱动内核** | 进程内 `TypedEventBus` + 持久化 `task_events` + `outbox_jobs` | 在线态事件落盘即触发 EventBus，毫秒级驱动前端 SSE、Watchdog 与状态机 Reactor；离线/休眠/崩溃/无公网回调场景由 `outbox_jobs` 按 `run_after` 退避补查，再转标准内部 Event 驱动状态机。 |
+| **独立 Web 工作台** | React 19 + Vite + Tailwind CSS v4 + shadcn/ui（Zinc 极简黑白） | 静态构建产物由 `timo serve` 内嵌托管；95% 黑白灰 + 5% 极微语义点，提供三栏可折叠布局、固定底部输入框、吸顶活跃条、Diff 确认卡、实时运行流下钻与 `⌘K` 命令面板。视觉与交互规范见 [product.html](product.html)。 |
+| **执行器接入层** | 统一 `ExecutionAdapter` 接口 + 归一化 `RunStreamEvent` | **绝不自研 Agent Loop / Harness**。保留已实测通过的 `T3Adapter`（`@modelcontextprotocol/sdk` Streamable HTTP），并参考 T3 的统一会话抽象补齐极薄的原生 CLI 直连适配器（`CodexAdapter`、`OpenCodeAdapter`、`PiAdapter`，各约 150–250 行）。 |
+| **工作区管理** | Timo 自主 `WorkspaceManager`（原生 `git worktree`） | 管理零仓/单仓/多仓目录（`~/.timo/workspaces/<taskId>/g<gen>/<repo>`）；逐仓校验精确 `baseSha`（禁止静默 fallback）；换执行器时采用 **`g1 → g2` 不可变目录快照交接**，物理隔绝旧进程双写风险。 |
+| **能力与权限网关** | 内置本地 **Capability MCP Gateway**（基于 `@modelcontextprotocol/sdk`） | 为每个执行代次签发短命 Endpoint（`/mcp/<taskId>/<gen>/<nonce>`）。按当前 `GrantRevision` **动态裁剪 `tools/list`**（无权工具对模型不可见）；强制校验 `Fencing Token`；外部写操作严格执行 `Intent-Before-Effect` 幂等落盘；真实凭据由网关从系统 Keychain / 企业 CLI 领取，不暴露给 Worker。 |
+| **验收引擎** | 声明式 `VerificationPipeline`（插件化 `VerifierRegistry`） | 将具体场景验证器（如 `sse-v1`）从核心服务与表结构解耦，支持组合 `command_check`、`platform_mr`、`log_citation` 与 `human_signoff`。 |
+| **测试体系** | `node:test`、临时 SQLite、可控时钟、替换传输/假 CLI | 夹具稳定复现崩溃、丢 ACK、旧代次越权、死循环与错误候选；固定真实环境验证纵向实机交付。 |
 
-T3 固定为 v0.1.12，使用核验后的独立发行进程。Timo 与 T3 各管数据和进程生命周期。M1 先交付 Timo CLI，用户可在 T3 中查看执行线程。若验证总助理能以可信身份调用本地命令，再提供创建、查看、修改、停止四项业务动作的入口。M1 记录两种入口各自的验收结果。 [T3 接入合同](t3-adoption.md) · [M0 证据](t3-integration.md)
+## 2. 核心模块边界
 
-## 模块与存储职责
-
-| 模块 | 接口与职责 |
+| 模块 | 职责与接口边界 |
 | --- | --- |
-| 入口 | 解析命令、校验输入、生成或传递请求标识。返回任务 ID、状态、最后观察和证据引用。CLI 的退出与任务生命周期独立。 |
-| 任务应用层 | 创建、修改、停止、查询，执行状态规则和授权校验。SQLite 事务内推进业务状态，并把待派发动作落盘。 |
-| 后台推进 | 认领待执行动作、调用适配器、等待外部状态、安排有界重试和通知。进程启动时补查未终结活动。 |
-| T3 适配器 | 能力探测、准备空线程、提交、读取、等待、停止。校验响应形状，向业务层返回稳定的运行引用及明确的错误类型。 [方法映射](t3-adoption.md) |
-| 验收 | 读取冻结输入和候选，并按当前任务约定运行检查。通过应用层写入证据及结论。 |
-| 凭据与制品 | 业务库存凭据引用，秘密由系统凭据存储提供。源日志、必要证据和候选制品经受控目录保存，索引记录内容摘要。 |
+| **控制面入口（HTTP/SSE + CLI）** | 校验参数与 Session Token，解析 `requestId` 去重与乐观并发版本号（`expectedBriefVersion` / `expectedGrantVersion`），统一映射错误码与退出码。 |
+| **事件账本与投影（Ledger）** | 原子写入 `task_events`、同步更新物化投影与 `outbox_jobs`，事务提交后广播至 `TypedEventBus`。 |
+| **总助理与策略引擎（Chief of Staff + Policy）** | 加载用户 `StandingPolicy`：判定 Worker 提权请求是由总助理自动签发 `GrantRevision` 还是升级为人审批卡；处理自然语言查询与高危变更 Diff 提案；响应 Watchdog 异常警报执行纠偏或换执行器。 |
+| **非阻塞调度与 Watchdog（Scheduler + Watchdog）** | 基于 `outbox_jobs` 的有界并发池（不串行阻塞多任务）推进派发、恢复、0-Token 外部 CI 轮询与重启补查；一级 0-Token Watchdog 持续检测进程活性、静默超时、重复失败指纹与文件范围漂移。 |
+| **执行器适配层（Adapters）** | 暴露极窄接口：`spawn / resume / steer / interrupt / observe`，并将各执行器原始输出归一化为 `RunStreamEvent` 写入独立运行流日志并推送给 Live SSE。 |
+| **工作区与能力网关（Workspace + MCP Gateway）** | 管多仓 worktree 创建、快照交接与清理；管 MCP 工具可见性裁剪、Fencing Token 校验、外部平台调用幂等与脱敏。 |
+| **独立验收引擎（Verifier）** | 从冻结制品或隔离 worktree 读取候选，按声明式步骤独立计算证据并回写验证结论；任一仓新提交自动令旧组合证据失效。 |
 
-M1 首批表覆盖任务及约定版本、授权快照、执行及外部运行引用、待办操作及尝试、候选与验证、额度与待通知事项。名称和列以实现迁移为准。后续引入多仓工作目录约束、平台回执对账和组合候选。T3 完整会话通过外部引用读取。
-
-任务创建请求使用客户端请求标识去重。相同标识和内容返回原任务，内容冲突返回冲突。修改和停止附带当前约定版本或任务版本，防止迟到命令覆盖用户的新决定。业务事务写入状态、待执行意图或通知。提交后再调用 T3 或平台。网络调用期间不持有数据库事务。
-
-## 派发、重启与取消
+## 3. 事件驱动与异步调度时序
 
 ```mermaid
 sequenceDiagram
     actor User as 用户
-    participant CLI as CLI 或总助理
-    participant Timo as Timo 任务服务
-    participant DB as SQLite
-    participant T3 as T3 MCP
-    participant Verify as 独立检查
-    User->>CLI: 交办日志诊断
-    CLI->>Timo: 创建任务与请求标识
-    Timo->>DB: 保存任务约定与待执行意图
-    Timo-->>CLI: 返回 Task ID
-    Timo->>T3: 创建线程并派发
-    Timo->>DB: 保存外部标识与回执
-    Timo->>T3: 读取指定 run
-    T3-->>Timo: 运行观察与候选
-    Timo->>Verify: 检查冻结输入和候选
-    Verify-->>Timo: 带摘要的检查结果
-    Timo->>DB: 保存证据、结果和待通知事项
-    CLI->>Timo: 按 Task ID 查询
-    Timo-->>CLI: 返回结论与证据
+    participant Web as Web 工作台 / CLI
+    participant API as HTTP+SSE 控制面
+    participant DB as SQLite Ledger
+    participant Bus as EventBus + Reactor
+    participant WD as Watchdog
+    participant GW as Capability MCP Gateway
+    participant Worker as 原生执行器 (Codex/Pi/OpenCode/T3)
+    participant Verify as 独立验收器
+
+    User->>Web: 交办任务（或自然语言请求）
+    Web->>API: POST /api/tasks (带 requestId)
+    API->>DB: 同事务写入 TASK_CREATED + Outbox 派发任务
+    DB-->>Bus: 发布 TASK_CREATED
+    Bus-->>Web: SSE 实时推送任务卡片
+    Bus->>Worker: 准备 worktree + Handoff Capsule + 注入短命 MCP Endpoint
+    Worker-->>API: 归一化 RunStreamEvent（按需推 Live 抽屉，不刷主对话）
+    Worker->>GW: 调用受控工具（携带 Fencing Token）
+    GW->>DB: 校验代次与 Grant -> 写 Operation 意图 -> 调外部平台 -> 存回执
+    alt Watchdog 监测到卡死/死循环/范围漂移
+        WD-->>Bus: 发布 WATCHDOG_ALERT
+        Bus->>Worker: 总助理会诊 -> 注入纠偏指令或切换 g2 执行器
+    end
+    Worker-->>Bus: RUN_COMPLETED（提交候选）
+    Bus->>Verify: 隔离环境执行声明式检查步骤
+    Verify->>DB: 写入独立证据与 VERIFICATION_PASSED
+    DB-->>Bus: 发布 DELIVERY_VERIFIED
+    Bus-->>Web: 主对话推送已核验交付总结
 ```
 
-每次派发持久记录请求 ID、输入摘要、执行代次、T3 实例与 OAuth 授权代次。服务冷启动后先按已知 threadId、runId 和操作回执补查。工具明确拒绝、运行失败、网络超时、结果未知分别处理。只有原请求的授权仍有效且重放语义成立，才使用原请求键重试。重新授权后的未知效果等待查证。
+## 4. 关键工程契约
 
-待办由任务服务认领，状态变更与预留额度同事务提交。一个任务同时只派发一个负责人可写执行。用户停止后立即拒绝新的业务派发，按原 run 请求中断，核对后台写者及已发往平台的动作后结束停止。实例重启或租约到期后的目录接管仍需要确认原写者停止，或由执行端实际拒绝旧代次。
+### 4.1 实时运行流与主账本分离
+- 执行器实时产生的细粒度流（Thinking 摘要、工具调用参数与输出、终端 stdout/stderr、文件 Patch Diff）写入独立只读文件 `~/.timo/runs/<taskId>/<runId>.ndjson`，并通过 `GET /api/tasks/:id/runs/:runId/stream` 实时流式推送给前端「实时运行流」Tab。
+- 这些高频过程流**绝不写入 `task_events` 业务主表**，也不穿透注意力防火墙进入主对话，既保障数据库轻量，又满足随时下钻透视和人工纠偏。
 
-## M1 的证据与权限
+### 4.2 声明式验收管线解耦
+业务任务不再硬编码 `sse-v1`。每项任务通过 `kind` 与 `verificationPlan` 声明验收步骤：
+- `log_citation`：如现有 `sse-v1`，从冻结日志重算断连与行号事实；
+- `command_check`：在干净隔离的 worktree/环境中执行指定命令（如 `npm run typecheck && npm test` 或联调脚本），记录退出码与原始摘要；
+- `platform_mr`：按保存的平台 MR ID 校验目标分支、精确 `head SHA == 候选 SHA` 及所需 CI 列表全绿；
+- `human_signoff`：针对体验或重大业务取舍，显式进入 `Waiting(needs_human_decision)` 等待人签字。
 
-第一条真实链以合成 SSE 日志为输入，Timo 冻结文件摘要和规则版本。Agent 输出断连／重连事件的证据行号及诊断结果，验证器读取原输入、核对行号、事件事实和约定的必须项。空证据日志、伪造行号及不匹配摘要作为反例。验收程序和结果由 Timo 控制，候选通过校验后才变成对用户的交付。
+### 4.3 凭据、隐私与文件权限
+- `~/.timo` 目录权限 `0700`，SQLite、Unix Socket、锁文件与制品文件权限 `0600`。
+- 制品目录 `~/.timo/blobs/` 严格按原始 `Uint8Array` 二进制读写，绝不经过字符串编码往返。
+- 业务凭据不落 SQLite、不进日志、不进命令行参数；仅由 Capability MCP Gateway 在执行瞬间从系统 Keychain、环境变量或受控企业 CLI 读取。
 
-受限 T3 环境只接收获准输入，任务提交时核对环境、项目、身份与授权。能访问真实业务服务的凭据在对应平台工具的执行位置取得。共享主机上以同一 OS 用户运行时，仍依赖主机信任和目标平台权限。报告费用时分别列出已报用量、估算或未知，并以应用层轮次、期限和准入预算控制新增工作。 [业务状态](domain-model.md) · [实施路径](milestones.md)
+## 5. 当前底座技术债清单（Sprint 1 优先修复）
+
+基于对现有 M1.1–M1.3 实现（`src/`）的代码审计，升级至事件驱动控制面前需优先修复以下 5 项已定位缺陷：
+
+1. **二进制制品编码损坏**：[artifacts.ts](../src/store/artifacts.ts) 将字节按 `binary` 转字符串后交给 [home.ts](../src/home.ts) 以 UTF-8 写盘，会导致含非 ASCII/中文字符的冻结输入字节损坏、摘要失配；改为直接写入原始 `Uint8Array`。
+2. **重启与超时后的 `reconcile` 断链**：[runner.ts](../src/service/runner.ts) 在派发拿到 `runId` 后即将 `operation` 标为 `done`，导致进程被杀或超时进入 `effect_unknown` 后，重启不再捞出在途任务，且 `reconcile()` 目前仅打日志未完成补查与验收闭环。
+3. **调度循环串行阻塞**：[runner.ts](../src/service/runner.ts) 在 `for` 循环中同步 `await` 最长 120s 的单任务等待，导致多任务并发时后序任务被饿死；改为基于 Outbox 的非阻塞并发池。
+4. **单实例锁竞态与强杀残留 `.sock`**：[ipc.ts](../src/ipc.ts) 使用非原子 `existsSync + writeFileSync`，且旧进程被 `SIGKILL` 留下 `.lock` 和 `.sock` 时重启会报 `EADDRINUSE`；升级为 `node:http` 控制面时改为 `O_CREAT | O_EXCL` 原子锁并先校验旧 PID 清理残留 socket。
+5. **通知去重丢失与执行元信息未回写**：[migrations.ts](../src/store/migrations.ts) 的 `notifications` 使用 `UNIQUE(task_id, kind)` 会静默丢弃同一任务的第二次同类等待通知；[task-service.ts](../src/service/task-service.ts) 创建 `executions` 写入的 `providerInstanceId/model = "pending"` 在派发后未回写实际值。升级事件账本时一并根除。
