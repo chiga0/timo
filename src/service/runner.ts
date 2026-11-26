@@ -12,6 +12,8 @@ import type { TypedEventBus } from "../events/bus.js";
 import { toIso, newId } from "../util.js";
 import { SSE_CANDIDATE_SCHEMA } from "../sse/contract.js";
 import { WatchdogMonitor, type WatchdogThresholds } from "../watchdog/monitor.js";
+import type { RunStreamStore } from "../workspace/run-stream.js";
+import type { ExecutorRegistry } from "../adapters/execution.js";
 
 const NON_RUNNABLE_WAIT_REASONS: ReadonlySet<string> = new Set([
   "needs_human_decision",
@@ -40,6 +42,9 @@ export interface RunnerOptions {
   retryPolicy?: RetryPolicy;
   /** Watchdog thresholds; `null` disables the first-level scan. */
   watchdog?: Partial<WatchdogThresholds> | null;
+  /** Live run stream sink + executor registry (Step 3.2). Absent disables both. */
+  runStreams?: RunStreamStore;
+  executors?: ExecutorRegistry;
   log: (line: string) => void;
 }
 
