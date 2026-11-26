@@ -196,6 +196,15 @@ const MIGRATIONS: ReadonlyArray<{ id: string; sql: string }> = [
       CREATE INDEX outbox_jobs_task ON outbox_jobs (task_id, kind);
     `,
   },
+  {
+    // Stopping a task must revoke its execution generation so late callbacks and
+    // in-flight runs cannot keep writing results for a task the user ended.
+    id: "0004-execution-revocation",
+    sql: `
+      ALTER TABLE executions ADD COLUMN revoked_at TEXT;
+      CREATE INDEX executions_task_gen ON executions (task_id, generation);
+    `,
+  },
 ];
 
 export interface MigrationResult {

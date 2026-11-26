@@ -5,13 +5,14 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { TaskService, TaskNotFoundError } from "../src/service/task-service.js";
-import { RequestConflictError } from "../src/store/tasks.js";
+import { TaskService } from "../src/service/task-service.js";
 import { TaskRunner } from "../src/service/runner.js";
 import { TaskStore } from "../src/store/tasks.js";
 import { ArtifactStore } from "../src/store/artifacts.js";
 import { defaultConfig } from "../src/config.js";
-import { startServiceServer, type WireRequest, type WireResponse } from "../src/ipc.js";
+import { acquireServiceLock } from "../src/ipc.js";
+import { Router, startListener } from "../src/http/server.js";
+import { registerApi } from "../src/http/routes.js";
 import { sha256Hex } from "../src/util.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -33,28 +34,11 @@ interface Booted {
 async function boot(): Promise<Booted> {
   const home = mkdtempSync(join(tmpdir(), "timo-cli-"));
   const config = defaultConfig({}, home);
-  const { service } = TaskService.open(config);
-  const server = await startServiceServer(config, async (request: WireRequest): Promise<WireResponse> => {
-    try {
-      return { id: request.id, ok: true, result: dispatch(request) };
-    } catch (error) {
-      const code =
-        error instanceof TaskNotFoundError
-          ? "not_found"
-          : error instanceof RequestConflictError
-            ? "request_conflict"
-            : "invalid_input";
-      return { id: request.id, ok: false, error: { code, message: error instanceof Error ? error.message : String(error) } };
-    }
-  });
-  function dispatch(request: WireRequest): unknown {
-    if (request.command === "create") {
-      const bytes = Uint8Array.from(Buffer.from(String(request.params.log), "base64"));
-      const created = service.createTask({ requestId: String(request.params.requestId), log: bytes });
-      return { taskId: created.taskId, status: created.status };
-    }
-    return service.getTask(String(request.params.taskId));
-  }
+  const lock = acquireServiceLock(config.socketPath);
+  const { service, writer, bus } = TaskService.open(config);
+  const router = new Router();
+  registerApi(router, { service, ledger: writer.ledger, bus, startedAt: new Date().toISOString(), t3Configured: false });
+  const server = await startListener({ router, target: { socketPath: config.socketPath } });
   const env = { ...process.env, TIMO_HOME: home };
   return {
     home,
@@ -62,6 +46,7 @@ async function boot(): Promise<Booted> {
     close: async () => {
       await server.close();
       service.close();
+      lock.release();
       rmSync(home, { recursive: true, force: true });
     },
     run: (args) =>

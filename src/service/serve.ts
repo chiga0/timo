@@ -4,16 +4,19 @@ import type { ServiceConfig, T3RuntimeConfig } from "../config.js";
 import { defaultConfig } from "../config.js";
 import { ensureHome, resolveHome } from "../home.js";
 import { resolveT3Config } from "../settings.js";
-import { TaskService, TaskNotFoundError, InvalidInputError } from "./task-service.js";
-import { RequestConflictError, TaskStore } from "../store/tasks.js";
+import { TaskService } from "./task-service.js";
+import { TaskStore } from "../store/tasks.js";
 import { ArtifactStore } from "../store/artifacts.js";
 import { TaskRunner } from "./runner.js";
 import { createMcpT3Client } from "../adapters/t3.js";
-import { startServiceServer, CommandError, ServiceUnavailableError, type WireRequest, type WireResponse } from "../ipc.js";
+import { acquireServiceLock, ServiceUnavailableError } from "../ipc.js";
+import { Router, newSessionToken, startListener, type RunningListener } from "../http/server.js";
+import { registerApi } from "../http/routes.js";
 
 /**
- * Foreground task service. Data lives under TIMO_HOME; the CLI reaches it over
- * a Unix socket. A second instance refuses to start.
+ * Foreground task service. Data lives under TIMO_HOME. Two listeners share one
+ * router: the Unix socket for the local CLI (trusted by file mode 0600) and,
+ * optionally, a loopback port for the Web console that requires a session token.
  */
 export async function serve(): Promise<void> {
   const env = process.env;
@@ -21,6 +24,9 @@ export async function serve(): Promise<void> {
   ensureHome(home);
   const config: ServiceConfig = defaultConfig(env, home);
   const t3: T3RuntimeConfig | null = resolveT3Config(env, home);
+
+  // Claim the single-instance lock before binding anything.
+  const lock = acquireServiceLock(config.socketPath);
 
   const { service, db, bus, writer } = TaskService.open(config);
   const logFd = openSync(`${home}/service.log`, constants.O_WRONLY | constants.O_CREAT | constants.O_APPEND, 0o600);
@@ -46,29 +52,50 @@ export async function serve(): Promise<void> {
     log,
   });
 
-  const server = await startServiceServer(config, async (request) => {
-    try {
-      return { id: request.id, ok: true, result: dispatch(request) };
-    } catch (error) {
-      return toErrorResponse(request, error);
-    }
+  const router = new Router();
+  registerApi(router, {
+    service,
+    ledger: writer.ledger,
+    bus,
+    startedAt: new Date().toISOString(),
+    t3Configured: t3 !== null,
   });
 
-  function dispatch(request: WireRequest): unknown {
-    switch (request.command) {
-      case "create": {
-        const rawLog = request.params.log;
-        if (typeof rawLog !== "string") throw new CommandError("invalid_input", "log bytes are required");
-        const bytes = Uint8Array.from(Buffer.from(rawLog, "base64"));
-        const requestText = typeof request.params.requestText === "string" ? request.params.requestText : undefined;
-        const created = service.createTask({ requestId: String(request.params.requestId ?? ""), log: bytes, requestText });
-        return { taskId: created.taskId, status: created.status };
-      }
-      case "get":
-        return service.getTask(String(request.params.taskId ?? ""));
-      default:
-        throw new CommandError("unsupported", `unknown command ${request.command}`);
+  const listeners: RunningListener[] = [];
+  try {
+    listeners.push(await startListener({ router, target: { socketPath: config.socketPath }, onError: (error) => log(`unix socket: ${String(error)}`) }));
+    log(`listening on unix socket ${config.socketPath}`);
+
+    const httpPort = Number(env.TIMO_HTTP_PORT);
+    if (Number.isInteger(httpPort) && httpPort > 0) {
+      const token = env.TIMO_SESSION_TOKEN?.trim() || newSessionToken();
+      const indexHtml = readWebIndex(home);
+      const webRouter = new Router();
+      registerApi(webRouter, {
+        service,
+        ledger: writer.ledger,
+        bus,
+        startedAt: new Date().toISOString(),
+        t3Configured: t3 !== null,
+      });
+      webRouter.add("GET", "/", () => ({ status: 200, body: undefined }));
+      const loopback = await startListener({
+        router: webRouter,
+        target: { host: "127.0.0.1", port: httpPort },
+        token,
+        onError: (error) => log(`loopback: ${String(error)}`),
+      });
+      listeners.push(loopback);
+      // The token goes to the log for the operator, never into the task database.
+      log(`loopback http://127.0.0.1:${loopback.port} session token ${token}`);
+      if (indexHtml) log(`web bundle found at ${home}/web/index.html`);
+      if (env.TIMO_SESSION_TOKEN) log("session token taken from TIMO_SESSION_TOKEN");
     }
+  } catch (error) {
+    for (const listener of listeners.reverse()) await listener.close().catch(() => undefined);
+    service.close();
+    lock.release();
+    throw error instanceof ServiceUnavailableError ? error : new ServiceUnavailableError(String(error));
   }
 
   runner.start();
@@ -79,7 +106,8 @@ export async function serve(): Promise<void> {
     closing = true;
     log(`received ${signal}, stopping`);
     await runner.stop();
-    await server.close().catch(() => undefined);
+    for (const listener of listeners.reverse()) await listener.close().catch(() => undefined);
+    lock.release();
     service.close();
     closeSync(logFd);
     process.exit(0);
@@ -90,12 +118,16 @@ export async function serve(): Promise<void> {
   await new Promise<void>(() => undefined);
 }
 
-function toErrorResponse(request: WireRequest, error: unknown): WireResponse {
-  const message = error instanceof Error ? error.message : String(error);
-  if (error instanceof TaskNotFoundError) return { id: request.id, ok: false, error: { code: "not_found", message } };
-  if (error instanceof RequestConflictError) return { id: request.id, ok: false, error: { code: "request_conflict", message } };
-  if (error instanceof InvalidInputError) return { id: request.id, ok: false, error: { code: "invalid_input", message } };
-  if (error instanceof CommandError) return { id: request.id, ok: false, error: { code: error.code, message } };
-  if (error instanceof ServiceUnavailableError) return { id: request.id, ok: false, error: { code: "service_unavailable", message } };
-  return { id: request.id, ok: false, error: { code: "internal", message } };
+function readWebIndex(home: string): boolean {
+  try {
+    return existsSyncSafe(`${home}/web/index.html`);
+  } catch {
+    return false;
+  }
+}
+
+function existsSyncSafe(path: string): boolean {
+  // Kept tiny so the health of the optional web bundle cannot break startup.
+  const { existsSync } = require("node:fs") as typeof import("node:fs");
+  return existsSync(path);
 }

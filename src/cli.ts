@@ -1,8 +1,7 @@
 #!/usr/bin/env node
 import { readFileSync } from "node:fs";
-import { randomUUID } from "node:crypto";
+import { request } from "node:http";
 import { resolveHome } from "./home.js";
-import { callService, ServiceUnavailableError, type WireResponse } from "./ipc.js";
 import { defaultConfig } from "./config.js";
 import { serve } from "./service/serve.js";
 
@@ -13,15 +12,27 @@ const EXIT_NOT_FOUND = 3;
 const EXIT_CONFLICT = 4;
 
 const USAGE = `用法：
-  timo serve                          前台启动任务服务
+  timo serve                          前台启动任务服务（Unix socket，可加 TIMO_HTTP_PORT 开 Web）
   timo create --request-id ID --log FILE [--request TEXT]
                                       提交一份 SSE 日志诊断
   timo get TASK_ID                    查询任务
+  timo list [--status STATUS] [--limit N]
+                                      列出任务，最新在前
+  timo amend TASK_ID --version N [--goal TEXT] [--must ITEM]... [--must-not ITEM]...
+                                      追加新的约定版本；版本过期返回冲突
+  timo stop TASK_ID [--reason TEXT]   停止任务并作废当前执行代次
 
 退出码：0 成功，1 服务或其他错误，2 参数或日志输入无效，3 任务不存在，4 请求冲突。
 成功时 JSON 只写 stdout；诊断写 stderr。`;
 
 class UsageError extends Error {}
+
+interface CliResponse {
+  ok: boolean;
+  statusCode: number;
+  result?: unknown;
+  error?: { code: string; message: string };
+}
 
 async function main(argv: string[]): Promise<number> {
   const [command, ...rest] = argv;
@@ -33,6 +44,9 @@ async function main(argv: string[]): Promise<number> {
   if (command === "serve") return runServe();
   if (command === "create") return runCreate(rest);
   if (command === "get") return runGet(rest);
+  if (command === "list") return runList(rest);
+  if (command === "amend") return runAmend(rest);
+  if (command === "stop") return runStop(rest);
   process.stderr.write(`未知命令：${command}\n\n${USAGE}\n`);
   return EXIT_INVALID_INPUT;
 }
@@ -46,8 +60,9 @@ function runServe(): number {
   return -1;
 }
 
-function parseFlags(args: string[], known: Set<string>): Map<string, string> {
-  const flags = new Map<string, string>();
+/** Flags may repeat (`--must a --must b`), so values are accumulated. */
+function parseFlags(args: string[], known: Set<string>, repeatable = new Set<string>()): Map<string, string[]> {
+  const flags = new Map<string, string[]>();
   for (let index = 0; index < args.length; index++) {
     const arg = args[index]!;
     if (!arg.startsWith("--")) throw new UsageError(`无法识别的参数：${arg}`);
@@ -55,31 +70,41 @@ function parseFlags(args: string[], known: Set<string>): Map<string, string> {
     if (!known.has(name)) throw new UsageError(`未知选项：--${name}`);
     const value = inline ?? args[++index];
     if (value === undefined) throw new UsageError(`选项 --${name} 缺少取值`);
-    flags.set(name, value);
+    if (!repeatable.has(name)) flags.set(name, [value]);
+    else flags.set(name, [...(flags.get(name) ?? []), value]);
   }
   return flags;
 }
 
+function first(flags: Map<string, string[]>, name: string): string | undefined {
+  return flags.get(name)?.[0];
+}
+
+function fail(code: number, message: string): number {
+  process.stderr.write(`timo: ${message}\n`);
+  return code;
+}
+
 async function runCreate(args: string[]): Promise<number> {
-  let flags: Map<string, string>;
+  let flags: Map<string, string[]>;
   try {
     flags = parseFlags(args, new Set(["request-id", "log", "request"]));
-    if (!flags.get("request-id")) throw new UsageError("缺少 --request-id");
-    if (!flags.get("log")) throw new UsageError("缺少 --log");
+    if (!first(flags, "request-id")) throw new UsageError("缺少 --request-id");
+    if (!first(flags, "log")) throw new UsageError("缺少 --log");
   } catch (error) {
     return fail(EXIT_INVALID_INPUT, error instanceof Error ? error.message : String(error));
   }
-  const logPath = flags.get("log")!;
+  const logPath = first(flags, "log")!;
   let bytes: Uint8Array;
   try {
     bytes = new Uint8Array(readFileSync(logPath));
   } catch (error) {
     return fail(EXIT_INVALID_INPUT, `无法读取日志文件 ${logPath}：${error instanceof Error ? error.message : String(error)}`);
   }
-  const response = await call("create", {
-    requestId: flags.get("request-id")!,
+  const response = await call("POST", "/api/tasks", {
+    requestId: first(flags, "request-id"),
     log: Buffer.from(bytes).toString("base64"),
-    requestText: flags.get("request") ?? "",
+    requestText: first(flags, "request") ?? "",
   });
   return emit(response);
 }
@@ -87,28 +112,137 @@ async function runCreate(args: string[]): Promise<number> {
 async function runGet(args: string[]): Promise<number> {
   const positional = args.filter((arg) => !arg.startsWith("--"));
   if (positional.length !== 1) return fail(EXIT_INVALID_INPUT, "timo get 需要一个 TASK_ID");
-  const response = await call("get", { taskId: positional[0] });
-  return emit(response);
+  return emit(await call("GET", `/api/tasks/${encodeURIComponent(positional[0]!)}`));
+}
+
+async function runList(args: string[]): Promise<number> {
+  let flags: Map<string, string[]>;
+  try {
+    flags = parseFlags(args, new Set(["status", "limit"]));
+  } catch (error) {
+    return fail(EXIT_INVALID_INPUT, error instanceof Error ? error.message : String(error));
+  }
+  const query = new URLSearchParams();
+  const status = first(flags, "status");
+  const limit = first(flags, "limit");
+  if (status) query.set("status", status);
+  if (limit) query.set("limit", limit);
+  const suffix = query.toString() ? `?${query.toString()}` : "";
+  const response = await call("GET", `/api/tasks${suffix}`);
+  if (!response.ok) return emit(response);
+  const tasks = (response.result as { tasks: unknown[] } | undefined)?.tasks ?? [];
+  for (const task of tasks) process.stdout.write(`${JSON.stringify(task)}\n`);
+  return EXIT_OK;
+}
+
+async function runAmend(args: string[]): Promise<number> {
+  const parsed = splitPositional(args, new Set(["version", "goal", "must", "must-not", "evidence", "request"]));
+  if (parsed.positional.length !== 1) return fail(EXIT_INVALID_INPUT, "timo amend 需要一个 TASK_ID");
+  const taskId = parsed.positional[0]!;
+  let flags: Map<string, string[]>;
+  try {
+    flags = parsed.flags;
+    if (!first(flags, "version")) throw new UsageError("缺少 --version（当前约定版本号）");
+  } catch (error) {
+    return fail(EXIT_INVALID_INPUT, error instanceof Error ? error.message : String(error));
+  }
+  const expected = Number(first(flags, "version"));
+  if (!Number.isInteger(expected) || expected < 1) return fail(EXIT_INVALID_INPUT, "--version 必须是正整数");
+  const body: Record<string, unknown> = { expectedBriefVersion: expected };
+  const goal = first(flags, "goal");
+  if (goal) body.goal = goal;
+  if (flags.get("must")) body.must = flags.get("must");
+  if (flags.get("must-not")) body.mustNot = flags.get("must-not");
+  if (flags.get("evidence")) body.evidence = flags.get("evidence");
+  const requestText = first(flags, "request");
+  if (requestText) body.requestText = requestText;
+  return emit(await call("POST", `/api/tasks/${encodeURIComponent(taskId)}/amend`, body));
+}
+
+async function runStop(args: string[]): Promise<number> {
+  const parsed = splitPositional(args, new Set(["reason"]));
+  if (parsed.positional.length !== 1) return fail(EXIT_INVALID_INPUT, "timo stop 需要一个 TASK_ID");
+  return emit(
+    await call("POST", `/api/tasks/${encodeURIComponent(parsed.positional[0]!)}/stop`, {
+      reason: first(parsed.flags, "reason") ?? "user_requested",
+    }),
+  );
 }
 
 /**
- * Talks to the service over the Unix socket. The task is durable once the
- * service answers, so the CLI returns only after a response arrives.
+ * Splits `args` into positional values and flags. Flag values are consumed by
+ * `parseFlags`, so a value like `99` in `--version 99` is never mistaken for a
+ * positional argument.
  */
-async function call(command: "create" | "get", params: Record<string, unknown>): Promise<WireResponse> {
-  const home = resolveHome(process.env);
-  const config = defaultConfig(process.env, home);
-  try {
-    return await callService(config.socketPath, { id: randomUUID(), command, params });
-  } catch (error) {
-    if (error instanceof ServiceUnavailableError) return { id: "", ok: false, error: { code: "service_unavailable", message: error.message } };
-    throw error;
+function splitPositional(args: string[], known: Set<string>, repeatable = new Set<string>()): { positional: string[]; flags: Map<string, string[]> } {
+  const flagArgs: string[] = [];
+  const positional: string[] = [];
+  for (let index = 0; index < args.length; index++) {
+    const arg = args[index]!;
+    if (!arg.startsWith("--")) {
+      positional.push(arg);
+      continue;
+    }
+    flagArgs.push(arg);
+    const [name, inline] = arg.slice(2).split("=", 2) as [string, string | undefined];
+    if (inline === undefined && known.has(name)) {
+      const value = args[++index];
+      if (value === undefined) throw new UsageError(`选项 --${name} 缺少取值`);
+      flagArgs.push(value);
+    }
   }
+  return { positional, flags: parseFlags(flagArgs, known, repeatable) };
 }
 
-function emit(response: WireResponse): number {
+/**
+ * Talks to the service over the Unix socket using `node:http`. The task is
+ * durable once the service answers, so the CLI returns only after a response.
+ */
+async function call(method: "GET" | "POST", path: string, body?: unknown): Promise<CliResponse> {
+  const home = resolveHome(process.env);
+  const config = defaultConfig(process.env, home);
+  return new Promise<CliResponse>((resolve) => {
+    const payload = body === undefined ? undefined : Buffer.from(JSON.stringify(body), "utf8");
+    const req = request(
+      {
+        socketPath: config.socketPath,
+        path,
+        method,
+        headers: payload ? { "content-type": "application/json", "content-length": String(payload.length) } : {},
+      },
+      (res) => {
+        const chunks: Buffer[] = [];
+        res.on("data", (chunk: Buffer) => chunks.push(chunk));
+        res.on("end", () => {
+          const text = Buffer.concat(chunks).toString("utf8");
+          const statusCode = res.statusCode ?? 0;
+          let parsed: unknown;
+          try {
+            parsed = text === "" ? undefined : JSON.parse(text);
+          } catch {
+            resolve({ ok: false, statusCode, error: { code: "internal", message: `服务返回了无法解析的内容：${text.slice(0, 200)}` } });
+            return;
+          }
+          if (statusCode >= 200 && statusCode < 300) resolve({ ok: true, statusCode, result: parsed });
+          else resolve({ ok: false, statusCode, error: (parsed as { error?: { code: string; message: string } })?.error });
+        });
+      },
+    );
+    req.on("error", (error: NodeJS.ErrnoException) => {
+      const message =
+        error.code === "ENOENT" || error.code === "ECONNREFUSED"
+          ? `无法连接任务服务（${error.code}）。请先运行 timo serve。`
+          : `无法连接任务服务：${error.message}`;
+      resolve({ ok: false, statusCode: 0, error: { code: "service_unavailable", message } });
+    });
+    if (payload) req.write(payload);
+    req.end();
+  });
+}
+
+function emit(response: CliResponse): number {
   if (response.ok) {
-    process.stdout.write(`${JSON.stringify(response.result)}\n`);
+    process.stdout.write(`${JSON.stringify(response.result ?? null)}\n`);
     return EXIT_OK;
   }
   const code = response.error?.code ?? "internal";
@@ -117,6 +251,9 @@ function emit(response: WireResponse): number {
     case "not_found":
       return fail(EXIT_NOT_FOUND, message);
     case "request_conflict":
+    case "version_conflict":
+    case "task_terminated":
+    case "invalid_state":
       return fail(EXIT_CONFLICT, message);
     case "invalid_input":
     case "unsupported":
@@ -124,11 +261,6 @@ function emit(response: WireResponse): number {
     default:
       return fail(EXIT_ERROR, message);
   }
-}
-
-function fail(code: number, message: string): number {
-  process.stderr.write(`timo: ${message}\n`);
-  return code;
 }
 
 main(process.argv.slice(2))
@@ -139,4 +271,3 @@ main(process.argv.slice(2))
     fail(EXIT_ERROR, error instanceof Error ? error.message : String(error));
     process.exitCode = EXIT_ERROR;
   });
-

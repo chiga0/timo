@@ -1,7 +1,25 @@
 import type { Database } from "./database.js";
 import type { SseCandidate, SseIncident, SseVerdict, Finding } from "../sse/contract.js";
 
-export type TaskStatus = "accepted" | "running" | "waiting" | "verifying" | "completed" | "failed";
+export type TaskStatus =
+  | "accepted"
+  | "running"
+  | "waiting"
+  | "verifying"
+  | "stopping"
+  | "stopped"
+  | "completed"
+  | "failed";
+
+/** Terminal states never advance again. */
+export function isTerminal(status: TaskStatus): boolean {
+  return status === "completed" || status === "failed" || status === "stopped";
+}
+
+/** States where a stop request is meaningful. */
+export function canStop(status: TaskStatus): boolean {
+  return status === "accepted" || status === "running" || status === "waiting" || status === "verifying";
+}
 
 export type WaitingReason =
   | "t3_unavailable"
@@ -449,6 +467,47 @@ export class TaskStore {
       this.db.prepare("UPDATE tasks SET updated_at = ? WHERE task_id = ?").run(now, taskId);
       return version;
     });
+  }
+
+  currentBriefVersion(taskId: string): number {
+    const row = this.db
+      .prepare("SELECT COALESCE(MAX(version), 0) AS version FROM brief_revisions WHERE task_id = ?")
+      .get(taskId) as { version: number };
+    return Number(row.version);
+  }
+
+  currentBrief(taskId: string): BriefRequirements | undefined {
+    const row = this.db
+      .prepare("SELECT requirements_json FROM brief_revisions WHERE task_id = ? ORDER BY version DESC LIMIT 1")
+      .get(taskId) as { requirements_json: string } | undefined;
+    return row ? (JSON.parse(row.requirements_json) as BriefRequirements) : undefined;
+  }
+
+  latestRequestText(taskId: string): string {
+    const row = this.db
+      .prepare("SELECT request_text FROM brief_revisions WHERE task_id = ? ORDER BY version DESC LIMIT 1")
+      .get(taskId) as { request_text: string } | undefined;
+    return row?.request_text ?? "";
+  }
+
+  /** All tasks, newest first, with the fields the task list needs. */
+  listTasks(limit = 200, status?: string): TaskRow[] {
+    const rows = status
+      ? (this.db.prepare("SELECT * FROM tasks WHERE status = ? ORDER BY created_at DESC LIMIT ?").all(status, limit) as TaskDbRow[])
+      : (this.db.prepare("SELECT * FROM tasks ORDER BY created_at DESC LIMIT ?").all(limit) as TaskDbRow[]);
+    return rows.map(toTaskRow);
+  }
+
+  /** Marks every non-terminal execution generation as revoked for a stopped task. */
+  revokeExecutions(taskId: string, now: string): void {
+    this.db.prepare("UPDATE executions SET revoked_at = ? WHERE task_id = ? AND revoked_at IS NULL").run(now, taskId);
+  }
+
+  executionReachable(taskId: string): boolean {
+    const row = this.db
+      .prepare("SELECT revoked_at FROM executions WHERE task_id = ? ORDER BY generation DESC LIMIT 1")
+      .get(taskId) as { revoked_at: string | null } | undefined;
+    return row ? row.revoked_at === null : false;
   }
 }
 

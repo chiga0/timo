@@ -1,0 +1,235 @@
+import type { Router } from "../http/server.js";
+import { RouteError } from "../http/server.js";
+import type { TaskService } from "../service/task-service.js";
+import { TaskConflictError, TaskNotFoundError, InvalidInputError } from "../service/task-service.js";
+import { RequestConflictError } from "../store/tasks.js";
+import { CommandError } from "../ipc.js";
+import type { EventLedger } from "../events/ledger.js";
+import type { TypedEventBus } from "../events/bus.js";
+import type { TaskEvent } from "../events/types.js";
+
+export interface ApiDeps {
+  service: TaskService;
+  ledger: EventLedger;
+  bus: TypedEventBus;
+  /** Heartbeat interval for SSE streams, in ms. */
+  heartbeatMs?: number;
+  /** Human-readable service start time, for `/api/health`. */
+  startedAt: string;
+  t3Configured: boolean;
+}
+
+const SSE_HEADERS = {
+  "content-type": "text/event-stream; charset=utf-8",
+  "cache-control": "no-store",
+  connection: "keep-alive",
+  "x-accel-buffering": "no",
+} as const;
+
+/**
+ * REST + SSE surface shared by the CLI (over the Unix socket) and the Web
+ * console (over loopback with a session token). Both hit the same application
+ * layer, so the CLI cannot drift from what the browser sees.
+ */
+export function registerApi(router: Router, deps: ApiDeps): void {
+  const heartbeatMs = deps.heartbeatMs ?? 15_000;
+
+  router.add("GET", "/api/health", () => ({
+    body: {
+      ok: true,
+      startedAt: deps.startedAt,
+      latestSeq: deps.ledger.latestSeq(),
+      t3: deps.t3Configured ? "configured" : "unconfigured",
+    },
+  }));
+
+  router.add("GET", "/api/tasks", (context) => {
+    const limit = parsePositiveInt(context.query.get("limit"), 200);
+    const status = context.query.get("status") ?? undefined;
+    return { body: { tasks: deps.service.listTasks(limit, status) } };
+  });
+
+  router.add("POST", "/api/tasks", (context) => {
+    const body = asRecord(context.body);
+    const requestId = requireString(body.requestId, "requestId");
+    const rawLog = body.log;
+    if (typeof rawLog !== "string") throw new RouteError(400, "invalid_input", "log (base64) is required");
+    const bytes = Uint8Array.from(Buffer.from(rawLog, "base64"));
+    const created = withMappedErrors(() =>
+      deps.service.createTask({
+        requestId,
+        log: bytes,
+        requestText: typeof body.requestText === "string" ? body.requestText : undefined,
+      }),
+    );
+    return { status: 201, body: { taskId: created.taskId, status: created.status, reused: created.reused } };
+  });
+
+  router.add("GET", "/api/tasks/:id", (context) => {
+    const taskId = context.params.id!;
+    return { body: withMappedErrors(() => deps.service.getTask(taskId)) };
+  });
+
+  router.add("GET", "/api/tasks/:id/events", (context) => {
+    const taskId = context.params.id!;
+    return {
+      stream: async (res, signal) => {
+        const afterSeq = parseNonNegativeInt(context.query.get("afterSeq"), 0);
+        await streamEvents(deps, res, signal, { afterSeq, heartbeatMs, filter: (event) => event.taskId === taskId });
+      },
+    };
+  });
+
+  router.add("GET", "/api/events", (context) => {
+    return {
+      stream: async (res, signal) => {
+        const afterSeq = parseNonNegativeInt(context.query.get("afterSeq"), 0);
+        await streamEvents(deps, res, signal, { afterSeq, heartbeatMs });
+      },
+    };
+  });
+
+  router.add("POST", "/api/tasks/:id/amend", (context) => {
+    const taskId = context.params.id!;
+    const body = asRecord(context.body);
+    const expected = body.expectedBriefVersion;
+    if (typeof expected !== "number" || !Number.isInteger(expected)) {
+      throw new RouteError(400, "invalid_input", "expectedBriefVersion (integer) is required");
+    }
+    const result = withMappedErrors(() =>
+      deps.service.amendTask(taskId, {
+        expectedBriefVersion: expected,
+        goal: optionalString(body.goal),
+        must: optionalStringArray(body.must),
+        mustNot: optionalStringArray(body.mustNot),
+        evidence: optionalStringArray(body.evidence),
+        requestText: optionalString(body.requestText),
+      }),
+    );
+    return { body: { taskId, briefVersion: result.briefVersion } };
+  });
+
+  router.add("POST", "/api/tasks/:id/stop", (context) => {
+    const taskId = context.params.id!;
+    const body = asRecord(context.body);
+    const result = withMappedErrors(() =>
+      deps.service.stopTask(taskId, { reason: optionalString(body.reason) }),
+    );
+    // The final `stopped` transition follows once the interrupt is acknowledged.
+    return { status: 202, body: { taskId, status: result.status } };
+  });
+}
+
+interface StreamOptions {
+  afterSeq: number;
+  heartbeatMs: number;
+  filter?: (event: TaskEvent) => boolean;
+}
+
+/**
+ * Replays `seq > afterSeq` first, then forwards live bus events. The client's
+ * `lastSeq` therefore never skips an event: the replay and the subscription are
+ * installed before the first read, and duplicates are dropped by sequence.
+ */
+async function streamEvents(
+  deps: ApiDeps,
+  res: import("node:http").ServerResponse,
+  signal: AbortSignal,
+  options: StreamOptions,
+): Promise<void> {
+  res.writeHead(200, SSE_HEADERS);
+  res.flushHeaders?.();
+  let last = options.afterSeq;
+
+  const write = (event: TaskEvent) => {
+    if (event.seq <= last) return;
+    if (options.filter && !options.filter(event)) {
+      last = event.seq;
+      return;
+    }
+    last = event.seq;
+    res.write(`id: ${event.seq}\nevent: task_event\ndata: ${JSON.stringify(event)}\n\n`);
+  };
+
+  // Subscribe first so an event committed during replay is not lost; the
+  // sequence guard makes the overlap harmless.
+  const pending: TaskEvent[] = [];
+  let replaying = true;
+  const unsubscribe = deps.bus.on("*", (event) => {
+    if (replaying) pending.push(event);
+    else write(event);
+  });
+
+  try {
+    for (const event of deps.ledger.afterSeq(options.afterSeq, 1000)) write(event);
+    replaying = false;
+    for (const event of pending) write(event);
+    pending.length = 0;
+
+    const heartbeat = setInterval(() => {
+      if (signal.aborted) return;
+      res.write(`: heartbeat ${Date.now()}\n\n`);
+    }, options.heartbeatMs);
+    heartbeat.unref?.();
+
+    await new Promise<void>((resolve) => {
+      signal.addEventListener("abort", () => resolve(), { once: true });
+      res.on("close", () => resolve());
+    });
+    clearInterval(heartbeat);
+  } finally {
+    replaying = false;
+    unsubscribe();
+    if (!res.writableEnded) res.end();
+  }
+}
+
+/** Maps application errors to HTTP status codes and stable error codes. */
+export function withMappedErrors<T>(fn: () => T): T {
+  try {
+    return fn();
+  } catch (error) {
+    throw toRouteError(error);
+  }
+}
+
+export function toRouteError(error: unknown): RouteError {
+  if (error instanceof RouteError) return error;
+  if (error instanceof TaskNotFoundError) return new RouteError(404, "not_found", error.message);
+  if (error instanceof TaskConflictError) return new RouteError(409, error.code, error.message, error.details);
+  if (error instanceof RequestConflictError) return new RouteError(409, "request_conflict", error.message);
+  if (error instanceof InvalidInputError) return new RouteError(400, "invalid_input", error.message);
+  if (error instanceof CommandError) {
+    const status = error.code === "not_found" ? 404 : error.code === "request_conflict" ? 409 : error.code === "unsupported" ? 405 : 400;
+    return new RouteError(status, error.code, error.message);
+  }
+  return new RouteError(500, "internal", error instanceof Error ? error.message : String(error));
+}
+
+function asRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
+}
+
+function requireString(value: unknown, field: string): string {
+  if (typeof value !== "string" || value.trim() === "") throw new RouteError(400, "invalid_input", `${field} is required`);
+  return value;
+}
+
+function optionalString(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim() !== "" ? value : undefined;
+}
+
+function optionalStringArray(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  return value.filter((item): item is string => typeof item === "string");
+}
+
+function parsePositiveInt(raw: string | null, fallback: number): number {
+  const value = Number(raw);
+  return Number.isInteger(value) && value > 0 ? value : fallback;
+}
+
+function parseNonNegativeInt(raw: string | null, fallback: number): number {
+  const value = Number(raw);
+  return Number.isInteger(value) && value >= 0 ? value : fallback;
+}
