@@ -55,9 +55,17 @@ export interface Route {
  */
 export class Router {
   private readonly routes: Route[] = [];
+  /** Optional catch-all for client-side routing (static bundle fallback). */
+  private fallbackHandler: RouteHandler | null = null;
 
   add(method: string, path: string, handler: RouteHandler): this {
     this.routes.push({ method: method.toUpperCase(), path, handler });
+    return this;
+  }
+
+  /** Serves every unmatched GET, used by the SPA bundle for deep client routes. */
+  fallback(handler: RouteHandler): this {
+    this.fallbackHandler = handler;
     return this;
   }
 
@@ -74,6 +82,9 @@ export class Router {
         const params = matchPath(route.path, context.path);
         if (params) return { route, params };
       }
+    }
+    if (this.fallbackHandler && (context.method === "GET" || context.method === "HEAD")) {
+      return { route: { method: "GET", path: "*", handler: this.fallbackHandler }, params: {} };
     }
     return null;
   }
@@ -188,7 +199,7 @@ async function handleRequest(
   const path = url.pathname;
   try {
     const trustedLocal = options.token === undefined;
-    if (!trustedLocal && !authorize(options.token!, req)) {
+    if (!trustedLocal && !authorize(options.token!, req, url.searchParams)) {
       res.writeHead(401, { "content-type": "application/json; charset=utf-8", "www-authenticate": "Bearer" });
       res.end(JSON.stringify({ error: { code: "unauthorized", message: "missing or invalid session token" } }));
       return;
@@ -252,8 +263,13 @@ async function handleRequest(
   }
 }
 
-/** Bearer header first, then a `timo_session` cookie for browser SSE clients. */
-export function authorize(token: string, req: IncomingMessage): boolean {
+/**
+ * Accepts the session token three ways, each for a different client shape:
+ * a bearer header (CLI/curl), the `timo_session` cookie (browser pages), and a
+ * `?token=` query parameter — EventSource cannot set headers, so a live stream
+ * opened from the page has no other way to authenticate.
+ */
+export function authorize(token: string, req: IncomingMessage, query?: URLSearchParams): boolean {
   const header = req.headers.authorization;
   if (typeof header === "string" && header.toLowerCase().startsWith("bearer ")) {
     if (constantTimeEquals(header.slice(7).trim(), token)) return true;
@@ -265,6 +281,8 @@ export function authorize(token: string, req: IncomingMessage): boolean {
       if (name === "timo_session" && constantTimeEquals(rest.join("="), token)) return true;
     }
   }
+  const fromQuery = query?.get("token");
+  if (typeof fromQuery === "string" && fromQuery !== "" && constantTimeEquals(fromQuery, token)) return true;
   return false;
 }
 

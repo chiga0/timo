@@ -11,6 +11,7 @@ import { TaskRunner } from "./runner.js";
 import { createMcpT3Client } from "../adapters/t3.js";
 import { acquireServiceLock, ServiceUnavailableError } from "../ipc.js";
 import { Router, newSessionToken, startListener, type RunningListener } from "../http/server.js";
+import { registerWeb, resolveWebDir } from "../http/web.js";
 import { registerApi } from "../http/routes.js";
 
 /**
@@ -72,7 +73,7 @@ export async function serve(): Promise<void> {
     const httpPort = Number(env.TIMO_HTTP_PORT);
     if (Number.isInteger(httpPort) && httpPort > 0) {
       const token = env.TIMO_SESSION_TOKEN?.trim() || newSessionToken();
-      const indexHtml = readWebIndex(home);
+      const webDir = resolveWebDir(home);
       const webRouter = new Router();
       registerApi(webRouter, {
         service,
@@ -81,7 +82,7 @@ export async function serve(): Promise<void> {
         startedAt: new Date().toISOString(),
         t3Configured: t3 !== null,
       });
-      webRouter.add("GET", "/", () => ({ status: 200, body: undefined }));
+      registerWeb(webRouter, webDir, token);
       const loopback = await startListener({
         router: webRouter,
         target: { host: "127.0.0.1", port: httpPort },
@@ -91,7 +92,10 @@ export async function serve(): Promise<void> {
       listeners.push(loopback);
       // The token goes to the log for the operator, never into the task database.
       log(`loopback http://127.0.0.1:${loopback.port} session token ${token}`);
-      if (indexHtml) log(`web bundle found at ${home}/web/index.html`);
+      // The bundle URL carries the token once; the page stores it as a cookie.
+      log(`web http://127.0.0.1:${loopback.port}/?token=${token}`);
+      if (webDir) log(`web bundle served from ${webDir}`);
+      else log("web bundle not found; run `npm run build:web` to build it");
       if (env.TIMO_SESSION_TOKEN) log("session token taken from TIMO_SESSION_TOKEN");
     }
   } catch (error) {
