@@ -19,6 +19,10 @@ import { ensureHome } from "../home.js";
 import { TypedEventBus } from "../events/bus.js";
 import { TransitionWriter, JOB_DISPATCH } from "../events/writer.js";
 import type { ServiceConfig, CreateTaskRequest, CreateTaskResponse, GetTaskResponse } from "../config.js";
+import { AuthorizationEvaluator } from "../auth/evaluator.js";
+import { DEFAULT_POLICY, describePolicy, parsePolicy, type LoadedPolicy } from "../auth/policy.js";
+import { Inbox, type DecisionKey, type InboxItem } from "../auth/inbox.js";
+import { ProposalStore, ProposalConflictError, type Proposal, type ProposalChange } from "../auth/proposals.js";
 
 export class TaskNotFoundError extends Error {
   override readonly name = "TaskNotFoundError";
@@ -35,6 +39,8 @@ export interface TaskServiceDeps {
   artifacts: ArtifactStore;
   config: ServiceConfig;
   writer: TransitionWriter;
+  /** Loaded standing policy; defaults apply when no file is present. */
+  policy?: LoadedPolicy;
   now?: () => Date;
 }
 
@@ -51,6 +57,11 @@ export class TaskService {
   private readonly artifacts: ArtifactStore;
   private readonly writer: TransitionWriter;
   private readonly now: () => Date;
+  private readonly loadedPolicy: LoadedPolicy;
+  private readonly evaluator: AuthorizationEvaluator;
+  private readonly proposalStore: ProposalStore;
+  /** Built after `writer` exists so it can project only committed events. */
+  private inboxStore!: Inbox;
 
   constructor(private readonly deps: TaskServiceDeps) {
     this.db = deps.db;
@@ -58,11 +69,20 @@ export class TaskService {
     this.artifacts = deps.artifacts;
     this.writer = deps.writer;
     this.now = deps.now ?? (() => new Date());
+    this.loadedPolicy = deps.policy ?? { policy: DEFAULT_POLICY, source: "default" };
+    this.evaluator = new AuthorizationEvaluator(this.loadedPolicy.policy);
+    this.proposalStore = new ProposalStore(this.db);
   }
 
   static open(
     config: ServiceConfig,
-    options: { now?: () => Date; dbPath?: string; bus?: TypedEventBus; onEventError?: (error: unknown) => void } = {},
+    options: {
+      now?: () => Date;
+      dbPath?: string;
+      bus?: TypedEventBus;
+      onEventError?: (error: unknown) => void;
+      policy?: LoadedPolicy;
+    } = {},
   ): { service: TaskService; db: Database; bus: TypedEventBus; writer: TransitionWriter } {
     ensureHome(config.home);
     const dbPath = options.dbPath ?? config.databasePath;
@@ -72,7 +92,40 @@ export class TaskService {
     const artifacts = ArtifactStore.create(config.home);
     const bus = options.bus ?? new TypedEventBus();
     const writer = new TransitionWriter(db, bus, options.onEventError);
-    return { service: new TaskService({ db, store, artifacts, config, writer, now: options.now }), db, bus, writer };
+    const service = new TaskService({ db, store, artifacts, config, writer, now: options.now, policy: options.policy });
+    service.attachInbox(bus);
+    return { service, db, bus, writer };
+  }
+
+  /**
+   * Builds the attention-firewall projection and subscribes it to the bus. The
+   * inbox only ever sees committed events (the bus publishes after commit), and
+   * it ignores everything outside the three permitted event classes.
+   */
+  private attachInbox(bus: TypedEventBus): void {
+    this.inboxStore = new Inbox(this.db);
+    bus.on("*", (event) => {
+      // Resolve a stale card before projecting: a completed task clears its
+      // "needs decision" card instead of leaving both on screen.
+      if (event.type === "task_completed" || event.type === "task_failed") {
+        this.inboxStore.resolve(event.taskId, "decision_required");
+      }
+      this.inboxStore.project(event);
+    });
+  }
+
+  /** Read access to the attention-firewall inbox. */
+  get inbox() {
+    return this.inboxStore;
+  }
+
+  /** Current policy plus where it came from, for the auth-health panel. */
+  policySnapshot(): { source: string; summary: string; warning?: string } {
+    return {
+      source: this.loadedPolicy.source,
+      summary: describePolicy(this.loadedPolicy.policy),
+      ...(this.loadedPolicy.warning ? { warning: this.loadedPolicy.warning } : {}),
+    };
   }
 
   /** Read access to the ledger for SSE replay and tests. */
@@ -419,6 +472,210 @@ export class TaskService {
       createdAt: task.createdAt,
       updatedAt: task.updatedAt,
     }));
+  }
+
+  /**
+   * Evaluates a worker's permission request against the standing policy.
+   *
+   * - Tier 0: allowed, nothing recorded beyond the audit trail.
+   * - Tier 1: the chief of staff issues a new grant revision silently.
+   * - Tier 2: the task parks in `waiting(needs_human_decision)` and one inbox
+   *   card is upserted for the user.
+   */
+  requestAuthorization(taskId: string, request: { action: string; environment?: string | null; resource?: string | null }): {
+    decision: "allow" | "auto_grant" | "needs_human" | "deny";
+    tier: number;
+    grantVersion?: number;
+    reason?: string;
+  } {
+    const view = this.store.view(taskId);
+    if (!view) throw new TaskNotFoundError(`task ${taskId} not found`);
+    const decision = this.evaluator.classify(request);
+    const now = toIso(this.now());
+
+    if (decision.kind === "allow") {
+      this.audit(taskId, request, 0, "policy", "tier 0 default allow", now);
+      return { decision: "allow", tier: 0 };
+    }
+    if (decision.kind === "deny") {
+      this.audit(taskId, request, -1, "policy", decision.reason, now);
+      return { decision: "deny", tier: -1, reason: decision.reason };
+    }
+    if (decision.kind === "auto_grant") {
+      // Tier 1 stays silent: a new grant revision plus an audit row, no inbox card.
+      const grant = {
+        action: request.action,
+        resource: request.resource ?? "*",
+        environment: request.environment ?? null,
+        identity: "chief_of_staff",
+        expiresAt: null,
+      };
+      let grantVersion = view.authorizationVersion;
+      this.writer.commit({
+        taskId,
+        type: "run_observed",
+        payload: { authorization: { action: request.action, tier: 1 } },
+        options: { idempotencyKey: `grant:${request.action}:${view.authorizationVersion + 1}`, now },
+        project: () => {
+          grantVersion = this.store.appendGrantRevision(taskId, [...view.grants, grant], now);
+        },
+      });
+      this.audit(taskId, request, 1, "chief_of_staff", "auto-granted within standing policy", now, grantVersion);
+      return { decision: "auto_grant", tier: 1, grantVersion };
+    }
+
+    // Tier 2 red line: park the task and raise exactly one decision card.
+    const reason = decision.reason;
+    this.writer.commit({
+      taskId,
+      type: "decision_required",
+      payload: {
+        action: request.action,
+        environment: request.environment ?? null,
+        resource: request.resource ?? null,
+        reason,
+        options: ["批准", "拒绝"],
+      },
+      options: {
+        idempotencyKey: `decision:${request.action}:${view.authorizationVersion}`,
+        now,
+        enqueue: [{ kind: JOB_DISPATCH, dedupeKey: `resume:${request.action}`, runAfter: now }],
+      },
+      project: () => {
+        this.store.setStatus(taskId, "waiting", "needs_human_decision", now);
+        this.store.enqueueNotification(taskId, "needs_human_decision", { action: request.action, reason }, now);
+      },
+    });
+    this.audit(taskId, request, 2, "user", reason, now);
+    return { decision: "needs_human", tier: 2, reason };
+  }
+
+  /** Records an approval/denial of a red-line request and resumes or closes it. */
+  resolveAuthorization(taskId: string, input: { action: string; approved: boolean; reason?: string }): { status: TaskStatus } {
+    const view = this.store.view(taskId);
+    if (!view) throw new TaskNotFoundError(`task ${taskId} not found`);
+    const now = toIso(this.now());
+    let grantVersion = view.authorizationVersion;
+    this.writer.commit({
+      taskId,
+      type: "run_observed",
+      payload: { authorization: { action: input.action, approved: input.approved } },
+      options: { idempotencyKey: `decision-resolved:${input.action}:${input.approved}`, now },
+      project: () => {
+        this.inboxStore.resolve(taskId, "decision_required", now);
+        if (input.approved) {
+          grantVersion = this.store.appendGrantRevision(
+            taskId,
+            [...view.grants, { action: input.action, resource: "*", environment: null, identity: "user", expiresAt: null }],
+            now,
+          );
+          // Approval resumes in place; the task keeps its worktree and progress.
+          this.store.setStatus(taskId, "waiting", "retrying", now);
+        } else {
+          this.store.setStatus(taskId, "failed", null, now);
+          this.store.setFailure(taskId, `user declined ${input.action}`, now);
+        }
+      },
+    });
+    this.audit(taskId, { action: input.action }, 2, "user", input.approved ? "user approved" : "user declined", now, grantVersion);
+    return { status: this.store.get(taskId)!.status };
+  }
+
+  /** Two-phase change: records the diff card without touching the task. */
+  proposeChange(taskId: string, input: { change: ProposalChange; reason: string }): Proposal {
+    const view = this.store.view(taskId);
+    if (!view) throw new TaskNotFoundError(`task ${taskId} not found`);
+    if (isTerminal(view.task.status)) {
+      throw new TaskConflictError("task_terminated", `task ${taskId} is ${view.task.status} and cannot be changed`);
+    }
+    return this.proposalStore.create({
+      taskId,
+      change: input.change,
+      expectedBriefVersion: view.briefVersion,
+      expectedGrantVersion: view.authorizationVersion,
+      reason: input.reason,
+    });
+  }
+
+  /**
+   * Applies a confirmed proposal. The revision guard runs again here: if the task
+   * moved since the proposal was drafted, the change is refused rather than
+   * clobbering newer work.
+   */
+  confirmProposal(proposalId: string): { applied: boolean; briefVersion: number } {
+    const proposal = this.proposalStore.get(proposalId);
+    if (!proposal) throw new TaskNotFoundError(`proposal ${proposalId} not found`);
+    const view = this.store.view(proposal.taskId);
+    if (!view) throw new TaskNotFoundError(`task ${proposal.taskId} not found`);
+    if (view.briefVersion !== proposal.expectedBriefVersion || view.authorizationVersion !== proposal.expectedGrantVersion) {
+      throw new ProposalConflictError("stale_revision", `proposal ${proposalId} was drafted on an older revision`);
+    }
+    this.proposalStore.markConfirmed(proposalId);
+    const now = toIso(this.now());
+    let briefVersion = view.briefVersion;
+    if (proposal.change.kind === "brief" && proposal.change.brief) {
+      const brief = proposal.change.brief;
+      this.writer.commit({
+        taskId: proposal.taskId,
+        type: "task_amended",
+        payload: { fromVersion: view.briefVersion, brief, proposalId },
+        options: { idempotencyKey: `amended:${view.briefVersion + 1}`, now },
+        project: () => {
+          briefVersion = this.store.appendBriefRevision(proposal.taskId, proposal.reason, brief, now);
+        },
+      });
+    } else if (proposal.change.kind === "grant" && proposal.change.grants) {
+      const grants = proposal.change.grants;
+      this.writer.commit({
+        taskId: proposal.taskId,
+        type: "run_observed",
+        payload: { authorization: { granted: grants.length, proposalId } },
+        options: { idempotencyKey: `grant-proposal:${proposalId}`, now },
+        project: () => {
+          this.store.appendGrantRevision(proposal.taskId, [...view.grants, ...grants], now);
+        },
+      });
+    }
+    this.inboxStore.resolve(proposal.taskId, "decision_required", now);
+    return { applied: true, briefVersion };
+  }
+
+  cancelProposal(proposalId: string): { status: string } {
+    const proposal = this.proposalStore.markCancelled(proposalId);
+    return { status: proposal.status };
+  }
+
+  /** Inbox projection: only the three attention-worthy classes ever appear here. */
+  listInbox(): InboxItem[] {
+    return this.inboxStore.list();
+  }
+
+  private audit(
+    taskId: string,
+    request: { action: string; environment?: string | null; resource?: string | null },
+    tier: number,
+    approvedBy: string,
+    reason: string,
+    now: string,
+    grantVersion?: number,
+  ): void {
+    this.db
+      .prepare(
+        `INSERT INTO authorization_audit (audit_id, task_id, action, environment, resource, tier, approved_by, grant_version, reason, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        newId(),
+        taskId,
+        request.action,
+        request.environment ?? null,
+        request.resource ?? null,
+        tier,
+        approvedBy,
+        grantVersion ?? null,
+        reason,
+        now,
+      );
   }
 }
 

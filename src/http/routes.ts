@@ -118,6 +118,71 @@ export function registerApi(router: Router, deps: ApiDeps): void {
     // The final `stopped` transition follows once the interrupt is acknowledged.
     return { status: 202, body: { taskId, status: result.status } };
   });
+
+  // ---- Step 2.1: standing policy, attention firewall, two-phase proposals ----
+
+  router.add("GET", "/api/inbox", () => ({
+    body: { items: deps.service.listInbox() },
+  }));
+
+  router.add("GET", "/api/policy", () => ({
+    body: withMappedErrors(() => deps.service.policySnapshot()),
+  }));
+
+  router.add("POST", "/api/tasks/:id/authorize", (context) => {
+    const taskId = context.params.id!;
+    const body = asRecord(context.body);
+    const action = requireString(body.action, "action");
+    const result = withMappedErrors(() =>
+      deps.service.requestAuthorization(taskId, {
+        action,
+        environment: optionalString(body.environment) ?? null,
+        resource: optionalString(body.resource) ?? null,
+      }),
+    );
+    return { body: { taskId, ...result } };
+  });
+
+  router.add("POST", "/api/tasks/:id/authorize/resolve", (context) => {
+    const taskId = context.params.id!;
+    const body = asRecord(context.body);
+    const action = requireString(body.action, "action");
+    const approved = body.approved;
+    if (typeof approved !== "boolean") throw new RouteError(400, "invalid_input", "approved (boolean) is required");
+    const result = withMappedErrors(() =>
+      deps.service.resolveAuthorization(taskId, { action, approved, reason: optionalString(body.reason) }),
+    );
+    return { body: { taskId, ...result } };
+  });
+
+  router.add("POST", "/api/tasks/:id/proposals", (context) => {
+    const taskId = context.params.id!;
+    const body = asRecord(context.body);
+    const kind = body.kind === "grant" ? "grant" : "brief";
+    const diff = Array.isArray(body.diff)
+      ? body.diff.filter(
+          (item): item is { field: string; before: string; after: string } =>
+            !!item && typeof item === "object" && typeof (item as { field?: unknown }).field === "string",
+        )
+      : [];
+    const change = {
+      kind,
+      diff,
+      ...(kind === "brief" && body.brief ? { brief: body.brief } : {}),
+      ...(kind === "grant" && Array.isArray(body.grants) ? { grants: body.grants } : {}),
+    } as Parameters<TaskService["proposeChange"]>[1]["change"];
+    const proposal = withMappedErrors(() => deps.service.proposeChange(taskId, { change, reason: optionalString(body.reason) ?? "proposed change" }));
+    // A proposal never mutates the task: it only surfaces a diff card.
+    return { status: 201, body: proposal };
+  });
+
+  router.add("POST", "/api/proposals/:pid/confirm", (context) => {
+    return { body: withMappedErrors(() => deps.service.confirmProposal(context.params.pid!)) };
+  });
+
+  router.add("POST", "/api/proposals/:pid/cancel", (context) => {
+    return { body: withMappedErrors(() => deps.service.cancelProposal(context.params.pid!)) };
+  });
 }
 
 interface StreamOptions {

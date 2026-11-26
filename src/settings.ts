@@ -1,6 +1,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import type { T3RuntimeConfig } from "./config.js";
+import { parsePolicy, type LoadedPolicy } from "./auth/policy.js";
 
 /**
  * Optional non-secret T3 settings read from TIMO_HOME/t3.json (0600):
@@ -37,4 +38,25 @@ export function resolveT3Config(env: NodeJS.ProcessEnv, home: string): T3Runtime
   const model = env.TIMO_T3_MODEL?.trim() || file.model;
   if (!url || !token || !projectId || !providerId || !model) return null;
   return { url, token, projectId, providerId, model };
+}
+
+/**
+ * Loads `TIMO_HOME/policy.json` if present. A file that exists but cannot be
+ * parsed is reported as a warning and the safe defaults apply — a broken policy
+ * file must never silently widen the delegation.
+ */
+export function loadPolicyFile(home: string): LoadedPolicy {
+  const path = join(home, "policy.json");
+  if (!existsSync(path)) return parsePolicy(undefined);
+  let raw: unknown;
+  try {
+    raw = JSON.parse(readFileSync(path, "utf8"));
+  } catch (error) {
+    return {
+      policy: parsePolicy(undefined).policy,
+      source: "default",
+      warning: `policy.json rejected: ${error instanceof Error ? error.message : String(error)}`,
+    };
+  }
+  return parsePolicy(raw);
 }

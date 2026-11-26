@@ -27,7 +27,9 @@ export type WaitingReason =
   | "input_incomplete"
   | "effect_unknown"
   | "retrying"
-  | "budget_exhausted";
+  | "budget_exhausted"
+  /** A red-line permission request is parked until the user decides. */
+  | "needs_human_decision";
 
 export interface ResultIncident {
   connectionId: string;
@@ -485,6 +487,24 @@ export class TaskStore {
       .prepare("SELECT COALESCE(MAX(version), 0) AS version FROM brief_revisions WHERE task_id = ?")
       .get(taskId) as { version: number };
     return Number(row.version);
+  }
+
+  /**
+   * Appends a new grant revision. Authorization is versioned independently of the
+   * brief, so an amendment never accidentally re-authorises an action.
+   */
+  appendGrantRevision(taskId: string, grants: Grant[], now: string): number {
+    return this.db.transaction(() => {
+      const row = this.db
+        .prepare("SELECT COALESCE(MAX(version), 0) AS version FROM authorization_snapshots WHERE task_id = ?")
+        .get(taskId) as { version: number };
+      const version = Number(row.version) + 1;
+      this.db
+        .prepare("INSERT INTO authorization_snapshots (task_id, version, grants_json, created_at) VALUES (?, ?, ?, ?)")
+        .run(taskId, version, JSON.stringify(grants), now);
+      this.db.prepare("UPDATE tasks SET updated_at = ? WHERE task_id = ?").run(now, taskId);
+      return version;
+    });
   }
 
   currentBrief(taskId: string): BriefRequirements | undefined {

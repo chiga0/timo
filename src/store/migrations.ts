@@ -205,6 +205,54 @@ const MIGRATIONS: ReadonlyArray<{ id: string; sql: string }> = [
       CREATE INDEX executions_task_gen ON executions (task_id, generation);
     `,
   },
+  {
+    // Step 2.1: attention-firewall inbox and two-phase change proposals.
+    // `inbox_items` is keyed by (task_id, decision_key) so repeated updates for
+    // the same decision replace the card instead of appending another one.
+    // `proposals` records a pending change; the task is only touched on confirm.
+    id: "0005-policy-inbox-proposals",
+    sql: `
+      CREATE TABLE inbox_items (
+        item_id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL REFERENCES tasks(task_id),
+        decision_key TEXT NOT NULL,
+        title TEXT NOT NULL,
+        summary TEXT NOT NULL,
+        options_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE (task_id, decision_key)
+      );
+      CREATE INDEX inbox_items_updated ON inbox_items (updated_at);
+
+      CREATE TABLE proposals (
+        proposal_id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL REFERENCES tasks(task_id),
+        status TEXT NOT NULL,
+        change_json TEXT NOT NULL,
+        expected_brief_version INTEGER NOT NULL,
+        expected_grant_version INTEGER NOT NULL,
+        reason TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        decided_at TEXT
+      );
+      CREATE INDEX proposals_task ON proposals (task_id, status);
+
+      CREATE TABLE authorization_audit (
+        audit_id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL REFERENCES tasks(task_id),
+        action TEXT NOT NULL,
+        environment TEXT,
+        resource TEXT,
+        tier INTEGER NOT NULL,
+        approved_by TEXT NOT NULL,
+        grant_version INTEGER,
+        reason TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+      CREATE INDEX authorization_audit_task ON authorization_audit (task_id, created_at);
+    `,
+  },
 ];
 
 export interface MigrationResult {

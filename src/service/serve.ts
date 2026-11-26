@@ -3,7 +3,7 @@ import { constants } from "node:fs";
 import type { ServiceConfig, T3RuntimeConfig } from "../config.js";
 import { defaultConfig } from "../config.js";
 import { ensureHome, resolveHome } from "../home.js";
-import { resolveT3Config } from "../settings.js";
+import { loadPolicyFile, resolveT3Config } from "../settings.js";
 import { TaskService } from "./task-service.js";
 import { TaskStore } from "../store/tasks.js";
 import { ArtifactStore } from "../store/artifacts.js";
@@ -24,11 +24,13 @@ export async function serve(): Promise<void> {
   ensureHome(home);
   const config: ServiceConfig = defaultConfig(env, home);
   const t3: T3RuntimeConfig | null = resolveT3Config(env, home);
+  // A missing or broken policy.json falls back to the safe defaults.
+  const policy = loadPolicyFile(home);
 
   // Claim the single-instance lock before binding anything.
   const lock = acquireServiceLock(config.socketPath);
 
-  const { service, db, bus, writer } = TaskService.open(config);
+  const { service, db, bus, writer } = TaskService.open(config, { policy });
   const logFd = openSync(`${home}/service.log`, constants.O_WRONLY | constants.O_CREAT | constants.O_APPEND, 0o600);
   const log = (line: string) => {
     const text = `${new Date().toISOString()} ${line}\n`;
