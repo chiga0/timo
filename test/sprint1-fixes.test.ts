@@ -14,6 +14,7 @@ import { acquireServiceLock } from "../src/ipc.js";
 import { Router, startListener } from "../src/http/server.js";
 import { registerApi } from "../src/http/routes.js";
 import { sha256Hex } from "../src/util.js";
+import { T3Error } from "../src/adapters/t3.js";
 import { FakeT3 } from "./support/fake-t3.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -26,6 +27,7 @@ interface Booted {
   service: TaskService;
   db: ReturnType<typeof TaskService.open>["db"];
   writer: ReturnType<typeof TaskService.open>["writer"];
+  bus: ReturnType<typeof TaskService.open>["bus"];
   fake: FakeT3;
   runner: TaskRunner;
   close: () => Promise<void>;
@@ -33,7 +35,7 @@ interface Booted {
 }
 
 /** Boots the real CLI + real socket API + a runner backed by the fake T3 transport. */
-async function boot(): Promise<Booted> {
+async function boot(overrides: { pollIntervalMs?: number; runDeadlineMs?: number } = {}): Promise<Booted> {
   const home = mkdtempSync(join(tmpdir(), "timo-cli2-"));
   const config = defaultConfig({}, home);
   const lock = acquireServiceLock(config.socketPath);
@@ -47,11 +49,12 @@ async function boot(): Promise<Booted> {
     service,
     artifacts: ArtifactStore.create(home),
     writer,
+    bus,
     t3: t3Config,
     clientFactory: FakeT3.factory(fake),
-    pollIntervalMs: 10,
+    pollIntervalMs: overrides.pollIntervalMs ?? 10,
     waitTimeoutMs: 50,
-    runDeadlineMs: 5_000,
+    runDeadlineMs: overrides.runDeadlineMs ?? 5_000,
     retryPolicy: { maxSameFailure: 3, firstDelayMs: 5, maxDelayMs: 40 },
     log: () => undefined,
   });
@@ -61,9 +64,11 @@ async function boot(): Promise<Booted> {
     service,
     db,
     writer,
+    bus,
     fake,
     runner,
     close: async () => {
+      await runner.stop();
       await server.close();
       service.close();
       lock.release();
@@ -235,43 +240,129 @@ test("run transitions reach the event ledger so SSE subscribers see them", async
       return result;
     };
 
-    const published: string[] = [];
-    // Count what the bus actually broadcast for this task.
     const seen = new Set<string>();
-    const listener = (event: { taskId: string; type: string }) => {
+    const unsubscribe = b.bus.on("*", (event) => {
       if (event.taskId === created.taskId) seen.add(event.type);
-    };
-    b.service["writer"]["bus" as never];
-    void published;
+    });
 
-    await b.runner.runOnce();
+    try {
+      await b.runner.runOnce();
+    } finally {
+      unsubscribe();
+    }
     const types = b.writer.ledger
       .forTask(created.taskId)
       .map((event) => event.type);
     assert.ok(types.includes("dispatch_started"), `missing dispatch_started in ${types.join(",")}`);
     assert.ok(types.includes("run_observed"), `missing run_observed in ${types.join(",")}`);
     assert.ok(types.includes("task_completed"), `missing task_completed in ${types.join(",")}`);
-    void listener;
+    assert.ok(seen.has("dispatch_started"));
+    assert.ok(seen.has("run_observed"));
+    assert.ok(seen.has("task_completed"));
+
+    // A completed task must mark its dispatch outbox job `done` (never re-queued as failed).
+    const job = b.writer.outbox.byTask(created.taskId).find((item) => item.kind === "dispatch");
+    assert.ok(job);
+    assert.equal(job.status, "done");
+    assert.equal(job.lastError, null);
   } finally {
     await b.close();
   }
 });
 
-test("a failed dispatch is retried by the outbox rather than silently completed", async () => {
+test("transient dispatch failure retries via outbox while terminal failure completes the job", async () => {
   const b = await boot();
   try {
-    const created = JSON.parse((await b.run(["create", "--request-id", "r1", "--log", join(FIXTURES, "healthy.log")])).stdout) as { taskId: string };
-    // A protocol error is not retryable in-process, so the task fails and the job
-    // must go back on the queue instead of being marked done.
+    // 1. Transient failure -> task waits with t3_unavailable, outbox job goes back to pending with backoff.
+    const transient = JSON.parse((await b.run(["create", "--request-id", "r-transient", "--log", join(FIXTURES, "healthy.log")])).stdout) as { taskId: string };
     b.fake.launch = async () => {
-      throw new Error("boom");
+      throw new T3Error("transient", "ECONNREFUSED");
     };
     await b.runner.runOnce();
-    assert.equal(b.service.getTask(created.taskId).status, "failed");
-    const job = b.writer.outbox.byTask(created.taskId).find((item) => item.kind === "dispatch");
-    assert.ok(job);
-    assert.notEqual(job.status, "done");
-    assert.equal(job.attempts >= 1, true);
+    assert.equal(b.service.getTask(transient.taskId).status, "waiting");
+    assert.equal(b.service.getTask(transient.taskId).waitingReason, "t3_unavailable");
+    const transientJobs = b.writer.outbox.byTask(transient.taskId).filter((item) => item.kind === "dispatch");
+    assert.equal(transientJobs.length, 1);
+    assert.equal(transientJobs[0]!.status, "pending");
+    assert.equal(transientJobs[0]!.attempts, 1);
+
+    // 2. Definite protocol failure -> task enters terminal `failed`, outbox job completes and is not retried.
+    const terminal = JSON.parse((await b.run(["create", "--request-id", "r-terminal", "--log", join(FIXTURES, "healthy.log")])).stdout) as { taskId: string };
+    b.fake.launch = async () => {
+      throw new T3Error("tool_error", "invalid schema");
+    };
+    await b.runner.runOnce();
+    assert.equal(b.service.getTask(terminal.taskId).status, "failed");
+    const terminalJob = b.writer.outbox.byTask(terminal.taskId).find((item) => item.kind === "dispatch");
+    assert.ok(terminalJob);
+    assert.equal(terminalJob.status, "done");
+  } finally {
+    await b.close();
+  }
+});
+
+test("EventBus wakes TaskRunner immediately without waiting for pollIntervalMs", async () => {
+  const b = await boot({ pollIntervalMs: 60_000 });
+  try {
+    const digest = sha256Hex(readFileSync(join(FIXTURES, "healthy.log")));
+    const launch = b.fake.launch.bind(b.fake);
+    b.fake.launch = async (input) => {
+      const result = await launch(input);
+      const run = b.fake.runs.get(`${result.threadId}:${result.runId}`);
+      if (run) run.structured = { inputDigest: digest, verdict: "no_disconnect", incidents: [] };
+      return result;
+    };
+
+    b.runner.start();
+    // Wait a tick for the initial empty pass to finish and park on the 60s poll timer.
+    await new Promise((resolve) => setTimeout(resolve, 30));
+
+    const started = Date.now();
+    const created = b.service.createTask({ requestId: "wake-1", log: new Uint8Array(readFileSync(join(FIXTURES, "healthy.log"))) });
+    // Poll briefly for completion; must finish far faster than the 60s poll interval.
+    for (let i = 0; i < 40; i++) {
+      if (b.service.getTask(created.taskId).status === "completed") break;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    assert.equal(b.service.getTask(created.taskId).status, "completed");
+    assert.ok(Date.now() - started < 2_000, "runner should wake from EventBus rather than waiting for pollIntervalMs");
+  } finally {
+    await b.close();
+  }
+});
+
+test("stop interrupts an actively waiting run before runDeadlineMs expires", async () => {
+  const b = await boot({ pollIntervalMs: 10, runDeadlineMs: 30_000 });
+  try {
+    const created = b.service.createTask({ requestId: "stop-live", log: new Uint8Array(readFileSync(join(FIXTURES, "healthy.log"))) });
+    const launch = b.fake.launch.bind(b.fake);
+    b.fake.launch = async (input) => {
+      const result = await launch(input);
+      const run = b.fake.runs.get(`${result.threadId}:${result.runId}`);
+      if (run) run.waittimeouts = 1_000;
+      return result;
+    };
+    const origWait = b.fake.wait.bind(b.fake);
+    b.fake.wait = async (input) => {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      return origWait(input);
+    };
+
+    const started = Date.now();
+    const pass = b.runner.runOnce();
+    // Wait until the run is persisted and actively waiting.
+    for (let i = 0; i < 40; i++) {
+      if (b.service.getTask(created.taskId).runId) break;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.ok(b.service.getTask(created.taskId).runId);
+
+    b.service.stopTask(created.taskId, { reason: "abort_live" });
+    await pass;
+
+    assert.equal(b.service.getTask(created.taskId).status, "stopped");
+    assert.ok(Date.now() - started < 2_000, "stop should exit the wait loop immediately rather than waiting for 30s deadline");
+    assert.equal(b.fake.stops.length, 1);
   } finally {
     await b.close();
   }

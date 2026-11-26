@@ -44,6 +44,7 @@ export async function serve(): Promise<void> {
     service,
     artifacts,
     writer,
+    bus,
     t3,
     clientFactory: (clientConfig) => Promise.resolve(createMcpT3Client(clientConfig)),
     pollIntervalMs: config.pollIntervalMs,

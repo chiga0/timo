@@ -8,6 +8,7 @@ import type { ArtifactStore } from "../store/artifacts.js";
 import type { TaskService } from "../service/task-service.js";
 import type { TransitionWriter } from "../events/writer.js";
 import { JOB_DISPATCH, JOB_STOP } from "../events/writer.js";
+import type { TypedEventBus } from "../events/bus.js";
 import { toIso, newId } from "../util.js";
 import { SSE_CANDIDATE_SCHEMA } from "../sse/contract.js";
 
@@ -17,6 +18,8 @@ export interface RunnerOptions {
   artifacts: ArtifactStore;
   /** Commits every transition atomically with its event and follow-up jobs. */
   writer: TransitionWriter;
+  /** Optional event bus for immediate online wake-up on `task_created` / `task_stopping`. */
+  bus?: TypedEventBus;
   t3: T3RuntimeConfig | null;
   clientFactory: T3ClientFactory;
   pollIntervalMs: number;
@@ -40,12 +43,14 @@ export class TaskRunner {
   private timer: NodeJS.Timeout | null = null;
   private running = false;
   private closed = false;
+  private wakePending = false;
+  private readonly unsubscribes: Array<() => void> = [];
   private readonly active = new Set<string>();
   private readonly inflight = new Set<Promise<void>>();
   /** Identifies this process's outbox leases; a restarted process steals expired ones. */
   private readonly owner = `runner-${process.pid}-${newId().slice(0, 8)}`;
   private readonly leaseMs: number;
-  private claimedJobs: Array<{ jobId: string; taskId: string }> = [];
+  private claimedJobs: Array<{ jobId: string; taskId: string; kind: string }> = [];
 
   constructor(private readonly options: RunnerOptions) {
     this.leaseMs = Math.max(options.pollIntervalMs * 10, 30_000);
@@ -56,22 +61,41 @@ export class TaskRunner {
   }
 
   start(): void {
+    const schedule = (delayMs: number) => {
+      if (this.closed) return;
+      if (this.timer) clearTimeout(this.timer);
+      this.timer = setTimeout(tick, delayMs);
+      this.timer.unref?.();
+    };
     const tick = () => {
       if (this.closed) return;
+      this.timer = null;
+      this.wakePending = false;
       void this.runOnce()
         .catch((error: unknown) => this.options.log(`runner: ${error instanceof Error ? error.message : String(error)}`))
         .finally(() => {
           if (this.closed) return;
-          this.timer = setTimeout(tick, this.options.pollIntervalMs);
-          this.timer.unref?.();
+          schedule(this.wakePending ? 0 : this.options.pollIntervalMs);
         });
     };
-    this.timer = setTimeout(tick, 0);
-    this.timer.unref?.();
+    if (this.options.bus) {
+      const wake = () => {
+        if (this.closed) return;
+        if (this.running) {
+          this.wakePending = true;
+          return;
+        }
+        schedule(0);
+      };
+      this.unsubscribes.push(this.options.bus.on("task_created", wake));
+      this.unsubscribes.push(this.options.bus.on("task_stopping", wake));
+    }
+    schedule(0);
   }
 
   async stop(): Promise<void> {
     this.closed = true;
+    for (const unsub of this.unsubscribes.splice(0)) unsub();
     if (this.timer) clearTimeout(this.timer);
     this.timer = null;
     while (this.running || this.inflight.size > 0) {
@@ -98,7 +122,7 @@ export class TaskRunner {
         leaseMs: this.leaseMs,
         kinds: [JOB_DISPATCH, JOB_STOP],
       });
-      this.claimedJobs = claimed.map((job) => ({ jobId: job.jobId, taskId: job.taskId }));
+      this.claimedJobs = claimed.map((job) => ({ jobId: job.jobId, taskId: job.taskId, kind: job.kind }));
       for (const job of claimed) {
         const task = this.options.store.get(job.taskId);
         if (!task) continue;
@@ -130,14 +154,16 @@ export class TaskRunner {
           const [taskId, mode] = next;
           if (this.closed) return;
           this.active.add(taskId);
+          let threwError: string | null = null;
           const promise = (
             mode === "dispatch" ? this.advance(taskId) : mode === "stop" ? this.stopTask(taskId) : this.reconcileTask(taskId)
           )
             .catch((error: unknown) => {
-              this.options.log(`runner ${taskId}: ${error instanceof Error ? error.message : String(error)}`);
+              threwError = error instanceof Error ? error.message : String(error);
+              this.options.log(`runner ${taskId}: ${threwError}`);
             })
             .finally(() => {
-              this.finishClaimedJobs(taskId);
+              this.finishClaimedJobs(taskId, threwError);
               this.active.delete(taskId);
               this.inflight.delete(promise);
             });
@@ -308,7 +334,7 @@ export class TaskRunner {
   private async advance(taskId: string): Promise<void> {
     const { store, t3 } = this.options;
     const task = store.get(taskId);
-    if (!task) return;
+    if (!task || !this.isRunnable(task.status)) return;
     const now = () => toIso(new Date());
 
     if (!t3) {
@@ -423,9 +449,17 @@ export class TaskRunner {
       const deadline = startedAt + this.options.runDeadlineMs;
       let finalStatus: string | null = null;
       while (Date.now() < deadline) {
+        if (store.get(taskId)?.status === "stopping") {
+          await this.stopTask(taskId);
+          return;
+        }
         const waited = await this.withRetry(retry, client, () =>
           client!.wait({ threadId: threadId!, runId: resolveRunId, timeoutMs: this.options.waitTimeoutMs }),
         );
+        if (store.get(taskId)?.status === "stopping") {
+          await this.stopTask(taskId);
+          return;
+        }
         if (!waited.ok) {
           if (waited.error.retryable) continue;
           return this.failFromError(taskId, waited.error, attemptId, "wait", { externalEffect: true });
@@ -579,7 +613,6 @@ export class TaskRunner {
       options: {
         idempotencyKey: `waiting:${reason}:${counter}`,
         now,
-        enqueue: runAfter ? [{ kind: JOB_DISPATCH, dedupeKey: `retry:${counter}`, runAfter }] : [],
       },
       project: () => {
         store.setStatus(taskId, "waiting", reason, now);
@@ -590,21 +623,32 @@ export class TaskRunner {
   }
 
   /**
-   * Marks this pass's claimed jobs done once the task has been advanced. Liveness
-   * for a still-running task comes from `listInflightTasks`, not from repeatedly
-   * re-claiming the dispatch job.
+   * Resolves this pass's claimed outbox jobs according to the actual outcome:
+   * - Terminal tasks (`completed`, `failed`, `stopped`) complete their jobs so
+   *   finished work is never re-queued.
+   * - Transient waits (`t3_unavailable`, `effect_unknown`) or uncaught runner
+   *   exceptions retry the existing job with bounded backoff instead of marking
+   *   it done or spawning duplicate jobs.
    */
-  private finishClaimedJobs(taskId: string): void {
+  private finishClaimedJobs(taskId: string, threwError: string | null): void {
     const now = toIso(new Date());
+    const task = this.options.store.get(taskId);
+    const policy = this.options.retryPolicy ?? DEFAULT_RETRY_POLICY;
     for (const job of this.claimedJobs) {
       if (job.taskId !== taskId) continue;
-      const task = this.options.store.get(taskId);
-      const failed = task !== undefined && !this.isRunnable(task.status) && task.status !== "stopping";
-      if (failed) {
-        // The attempt failed, so the job goes back on the queue with a backoff
-        // (or dies after its attempt budget) instead of being marked done.
-        const policy = this.options.retryPolicy ?? DEFAULT_RETRY_POLICY;
-        this.options.writer.outbox.retry(job.jobId, task?.failureReason ?? "task failed", this.backoffMs(job.taskId, policy));
+      if (!task || isTerminal(task.status)) {
+        this.options.writer.outbox.complete(job.jobId, now);
+        continue;
+      }
+      const needsRetry =
+        threwError !== null ||
+        (job.kind === JOB_DISPATCH &&
+          task.status === "waiting" &&
+          (task.waitingReason === "t3_unavailable" || task.waitingReason === "effect_unknown")) ||
+        (job.kind === JOB_STOP && task.status === "stopping");
+      if (needsRetry) {
+        const reason = threwError ?? task.waitingReason ?? `still_${task.status}`;
+        this.options.writer.outbox.retry(job.jobId, reason, this.backoffMs(job.taskId, policy), now);
       } else {
         this.options.writer.outbox.complete(job.jobId, now);
       }

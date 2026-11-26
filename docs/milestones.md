@@ -4,7 +4,7 @@
 
 **架构定案原则**：绝不自研 Agent Loop / Harness，不 Fork T3 Code；基于当前 `timo` 仓库自主演进事件驱动控制面、总助理分级委派授权、两级 Watchdog、自主多仓 Worktree、本地 Capability MCP Gateway 与极简黑白（Tailwind + shadcn/ui）Web 工作台，并通过统一 `ExecutionAdapter` 复用成熟外部运行时（Codex / OpenCode / Pi，以及保留为可选适配器的 T3 Code）。
 
-**当前状态（2026-11-26）：M0 已通过；M1.1–M1.3 已实现并通过工程测试与固定版 T3 `v0.1.12` 实机验收；即将启动 Sprint 1（M1.4）。** 关联文档：[README](../README.md)、[架构](architecture.md)、[领域模型](domain-model.md)、[技术设计](technical-design.md)、[执行器与 T3 决策](t3-adoption.md)、[托管开发任务书](implementation-plan.md)、[验收剧本](acceptance.md)、[产品设计 HTML](product.html)。
+**当前状态（2026-11-26）：M0、M1.1–M1.3 与 M1.4（Sprint 1）均已通过工程验收（`npm run typecheck && npm test` 65 项全通过）；即将启动 Sprint 2（M1.5）。** 关联文档：[README](../README.md)、[架构](architecture.md)、[领域模型](domain-model.md)、[技术设计](technical-design.md)、[执行器与 T3 决策](t3-adoption.md)、[托管开发任务书](implementation-plan.md)、[验收剧本](acceptance.md)、[产品设计 HTML](product.html)。
 
 > **托管开发派发入口**：每个冲刺与里程碑已进一步拆解为可直接托管给外部 Agent 的原子任务包（含前置依赖、改动边界、禁止越界项、必含反例测试与可执行验收命令），详见 [托管开发任务书与逐阶段验收合同](implementation-plan.md)。
 
@@ -29,17 +29,17 @@
 
 ## M1：从本地 CLI 闭环演进到事件驱动控制面与极简黑白 Web 自用
 
-### 已完成切片（M1.1–M1.3）
+### 已完成切片（M1.1–M1.4）
 
 - [x] **M1.1 持久化接单**：单包 TS + SQLite WAL 迁移 + 幂等 `requestId` 去重与冲突退出码 4 + CLI `create/get` 与重启读回。
 - [x] **M1.2 T3 MCP 适配器**：锁定 `@modelcontextprotocol/sdk` 1.32.2，完成 `launch / wait / read / stop`、错误分类与替换传输测试。
-- [x] **M1.3 零仓 SSE 独立验收**：串起 `sse-v1` 独立重算验收器；`npm test` 33 项通过，并在隔离 T3 `v0.1.12` + Pi 上通过 `disconnect.log` 正例、重启原样读回、幂等冲突与 T3 拒绝路径验证。详细证据与待补项见 [M1.1–M1.3 开发合同](m1-delivery.md)。
+- [x] **M1.3 零仓 SSE 独立验收**：串起 `sse-v1` 独立重算验收器；并在隔离 T3 `v0.1.12` + Pi 上通过 `disconnect.log` 正例、重启原样读回、幂等冲突与 T3 拒绝路径验证。详细证据与待补项见 [M1.1–M1.3 开发合同](m1-delivery.md)。
+- [x] **M1.4（Sprint 1）底座加固 + 事件驱动 HTTP/SSE 控制面**：修复 5 项底座缺陷（二进制制品、真实重启 `reconcile`、非阻塞并发池、原子锁与残留 `.sock` 自愈、通知去重与执行元信息回写）；引入 `task_events`、`TypedEventBus` 在线唤醒与 `outbox_jobs`；升级 `node:http`（Unix Socket + Loopback REST/SSE 分页断点续传）及 CLI `list` / `amend` / `stop`（含运行中实时中断与防复活）。`npm run typecheck && npm test` 65 项全通过。
 
-### 接下来的 3 个短冲刺（M1.4–M1.6，目标：2 周内开启 Timo 自用）
+### 接下来的 2 个短冲刺（M1.5–M1.6，目标：开启 Timo 自用）
 
 | 切片 | 冲刺 | 核心改动与依赖 | 可执行的通过条件 |
 | --- | --- | --- | --- |
-| **M1.4 底座加固 + 事件驱动 HTTP/SSE 控制面** | Sprint 1（2–3 天） | 1. 修复 `src/` 5 项底座债：`ArtifactStore` 原始二进制写盘、`reconcile` 强杀/超时补查闭环、`TaskRunner` 非阻塞并发池、`ipc.ts` 原子锁与残留 `.sock` 清理、`notifications` 去重键与 `executions` 元信息回写；<br>2. 将控制面升级为 `node:http`（Unix Socket 供 CLI + Loopback REST & SSE `/api/events?afterSeq=N` 供 Web）；<br>3. 引入追加式 `task_events` + `TypedEventBus` + `outbox_jobs`，支持 `amend`（带版本号冲突校验）与 `stop`（含撤销旧代次令牌语义）。 | 1. 含中文 UTF-8 日志冻结与重读字节完全一致；<br>2. `SIGKILL` 强杀重启后在途任务自动 `reconcile` 并完成验收；<br>3. 并发 3 个任务互不阻塞；<br>4. SSE 断线按 `afterSeq` 重连零丢事件；<br>5. 过期版本 `amend` 返回冲突，撤权后拒绝新派发。 |
 | **M1.5 极简黑白 Web 工作台 + 分级授权 + 一级 Watchdog** | Sprint 2（3–4 天） | 1. 基于 React 19 + Vite + Tailwind v4 + shadcn/ui（Zinc 极简黑白）落地 [product.html](product.html) 定义的三栏可折叠控制台（固定底部输入框、吸顶实时条、Diff 确认卡、审批卡、证据展开、`⌘K`、环境健康度），由 `timo serve` 静态托管并直连 SSE；<br>2. 实现 `StandingPolicy`（Tier 0/1 总助理静默批复 + Tier 2 红线请示）与注意力防火墙 3 枚举白名单；<br>3. 实现一级 0-Token Watchdog（进程心跳停滞、重复同错循环、软超时、文件范围漂移告警）。 | 1. 浏览器打开本地 Web，无刷屏噪音，可完成接单、查询、Diff 确认改口、红线审批与停止；<br>2. 模拟 Tier 1 常规提权由总助理静默放行并记审计流，不打扰主对话；<br>3. 注入静默卡死或连续 3 次同错，一级 Watchdog 在预设阈值内准确发出异常事件。 |
 | **M1.6 自主 Worktree + 统一执行器（含 Live 运行流）+ 真实单测验收** | Sprint 3（3–4 天） | 1. 实现自主 `WorkspaceManager`（原生多仓 `git worktree`、精确 `baseSha` 校验、禁止静默 fallback）；<br>2. 抽离统一 `ExecutionAdapter` 与归一化 `RunStreamEvent`：保留 `T3Adapter`，新增至少 1 个直连原生 CLI 适配器（Codex / OpenCode / Pi），接通前端「实时运行流」SSE 透视与人工纠偏注入；<br>3. 抽离声明式 `VerifierRegistry`，在保留 `sse-v1` 的同时新增真实 `command_check`（隔离目录跑 `npm run typecheck && npm test`）。 | 1. 从极简黑白 Web 交办一项 `timo` 仓库自身的真实低风险开发需求；<br>2. 可在右侧检查器一键切到「实时运行流」看到真实工具调用与测试输出；<br>3. 独立验收在干净 worktree 跑通真实测试并附原文证据，进入日常自用试点。 |
 
