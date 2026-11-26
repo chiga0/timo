@@ -161,7 +161,16 @@ async function streamEvents(
   });
 
   try {
-    for (const event of deps.ledger.afterSeq(options.afterSeq, 1000)) write(event);
+    // Page through history so a backlog larger than one batch is never truncated
+    // (the ledger read has a hard per-call limit).
+    const batchSize = 500;
+    let cursor = options.afterSeq;
+    for (;;) {
+      const batch = deps.ledger.afterSeq(cursor, batchSize);
+      for (const event of batch) write(event);
+      if (batch.length < batchSize) break;
+      cursor = batch[batch.length - 1]!.seq;
+    }
     replaying = false;
     for (const event of pending) write(event);
     pending.length = 0;

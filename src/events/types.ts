@@ -15,12 +15,22 @@ export const EVENT_TYPES = [
   "task_stopping",
   "task_stopped",
   "watchdog_signal",
+  "decision_required",
 ] as const;
 
 export type EventType = (typeof EVENT_TYPES)[number];
 
-/** The only types allowed through the attention firewall (docs/architecture.md). */
-export const ATTENTION_TYPES: ReadonlySet<EventType> = new Set<EventType>(["task_completed", "task_failed", "watchdog_signal"]);
+/**
+ * The only types allowed through the attention firewall (docs/architecture.md,
+ * "严格 3 枚举事件穿透"). A first-level `watchdog_signal` is deliberately NOT in
+ * this set: it wakes the chief-of-staff triage (Sprint 5), and only that triage
+ * can escalate to `decision_required` or `task_blocked_final`.
+ */
+export const ATTENTION_TYPES: ReadonlySet<EventType> = new Set<EventType>([
+  "decision_required",
+  "task_completed",
+  "task_failed",
+]);
 
 export function isAttentionEvent(type: EventType): boolean {
   return ATTENTION_TYPES.has(type);

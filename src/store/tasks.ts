@@ -454,6 +454,17 @@ export class TaskStore {
     return rows.map((row) => ({ taskId: row.task_id, threadId: row.thread_id, runId: row.run_id, status: row.status }));
   }
 
+  /**
+   * Tasks that entered `stopping`. The task row, not the outbox job, is the
+   * authority: after a restart or an expired lease the stop must still finish.
+   */
+  listStoppingTasks(): Array<{ taskId: string; threadId: string | null; runId: string | null }> {
+    const rows = this.db
+      .prepare("SELECT task_id, thread_id, run_id FROM tasks WHERE status = 'stopping' ORDER BY updated_at")
+      .all() as Array<{ task_id: string; thread_id: string | null; run_id: string | null }>;
+    return rows.map((row) => ({ taskId: row.task_id, threadId: row.thread_id, runId: row.run_id }));
+  }
+
   /** Records a completed brief amendment as a new immutable revision. */
   appendBriefRevision(taskId: string, requestText: string, brief: BriefRequirements, now: string): number {
     return this.db.transaction(() => {

@@ -1,4 +1,4 @@
-import { openSync, closeSync, writeSync } from "node:fs";
+import { closeSync, existsSync, openSync, writeSync } from "node:fs";
 import { constants } from "node:fs";
 import type { ServiceConfig, T3RuntimeConfig } from "../config.js";
 import { defaultConfig } from "../config.js";
@@ -119,15 +119,5 @@ export async function serve(): Promise<void> {
 }
 
 function readWebIndex(home: string): boolean {
-  try {
-    return existsSyncSafe(`${home}/web/index.html`);
-  } catch {
-    return false;
-  }
-}
-
-function existsSyncSafe(path: string): boolean {
-  // Kept tiny so the health of the optional web bundle cannot break startup.
-  const { existsSync } = require("node:fs") as typeof import("node:fs");
-  return existsSync(path);
+  return existsSync(`${home}/web/index.html`);
 }

@@ -2,11 +2,12 @@ import type { T3Client, T3ClientFactory } from "../adapters/t3.js";
 import { T3Error, buildPrompt } from "../adapters/t3.js";
 import { RetryTracker, failureFingerprint, DEFAULT_RETRY_POLICY, type RetryPolicy } from "../adapters/retry.js";
 import type { T3RuntimeConfig } from "../config.js";
-import type { TaskStore, WaitingReason } from "../store/tasks.js";
+import type { TaskStore, TaskStatus, WaitingReason } from "../store/tasks.js";
+import { isTerminal } from "../store/tasks.js";
 import type { ArtifactStore } from "../store/artifacts.js";
 import type { TaskService } from "../service/task-service.js";
 import type { TransitionWriter } from "../events/writer.js";
-import { JOB_DISPATCH } from "../events/writer.js";
+import { JOB_DISPATCH, JOB_STOP } from "../events/writer.js";
 import { toIso, newId } from "../util.js";
 import { SSE_CANDIDATE_SCHEMA } from "../sse/contract.js";
 
@@ -89,24 +90,31 @@ export class TaskRunner {
     if (this.running) return;
     this.running = true;
     try {
-      const work = new Map<string, "dispatch" | "reconcile">();
-      this.claimedJobs = this.options.writer.outbox
-        .claim({
-          owner: this.owner,
-          now: toIso(new Date()),
-          limit: this.concurrency * 4,
-          leaseMs: this.leaseMs,
-          kinds: [JOB_DISPATCH],
-        })
-        .map((job) => ({ jobId: job.jobId, taskId: job.taskId }));
-      for (const job of this.claimedJobs) {
+      const work = new Map<string, "dispatch" | "reconcile" | "stop">();
+      const claimed = this.options.writer.outbox.claim({
+        owner: this.owner,
+        now: toIso(new Date()),
+        limit: this.concurrency * 4,
+        leaseMs: this.leaseMs,
+        kinds: [JOB_DISPATCH, JOB_STOP],
+      });
+      this.claimedJobs = claimed.map((job) => ({ jobId: job.jobId, taskId: job.taskId }));
+      for (const job of claimed) {
         const task = this.options.store.get(job.taskId);
-        if (!task || task.status === "completed" || task.status === "failed") continue;
-        if (!work.has(job.taskId)) work.set(job.taskId, "dispatch");
+        if (!task) continue;
+        if (task.status === "stopping") work.set(job.taskId, "stop");
+        else if (this.isRunnable(task.status)) {
+          if (!work.has(job.taskId) || work.get(job.taskId) === "reconcile") work.set(job.taskId, "dispatch");
+        }
+      }
+      // A stop intent that outlived its job (restart, lease expiry) is still
+      // honoured: the task row is authoritative, the job is only a wake-up.
+      for (const item of this.options.store.listStoppingTasks()) {
+        if (!work.has(item.taskId)) work.set(item.taskId, "stop");
       }
       for (const item of this.options.store.listPendingDispatches()) {
         const task = this.options.store.get(item.taskId);
-        if (!task || task.status === "completed" || task.status === "failed") continue;
+        if (!task || !this.isRunnable(task.status)) continue;
         if (!work.has(item.taskId)) work.set(item.taskId, "dispatch");
       }
       for (const item of this.options.store.listInflightTasks()) {
@@ -122,7 +130,9 @@ export class TaskRunner {
           const [taskId, mode] = next;
           if (this.closed) return;
           this.active.add(taskId);
-          const promise = (mode === "dispatch" ? this.advance(taskId) : this.reconcileTask(taskId))
+          const promise = (
+            mode === "dispatch" ? this.advance(taskId) : mode === "stop" ? this.stopTask(taskId) : this.reconcileTask(taskId)
+          )
             .catch((error: unknown) => {
               this.options.log(`runner ${taskId}: ${error instanceof Error ? error.message : String(error)}`);
             })
@@ -139,6 +149,55 @@ export class TaskRunner {
       await Promise.all(workers);
     } finally {
       this.running = false;
+    }
+  }
+
+  /** Only these states may still be dispatched or reconciled. */
+  private isRunnable(status: TaskStatus): boolean {
+    return status === "accepted" || status === "running" || status === "waiting";
+  }
+
+  /**
+   * Carries out a stop: interrupts the in-flight T3 run, then finalises the task.
+   * A task that never reached T3 needs no interrupt and is finalised directly, so
+   * `timo stop` never leaves a task parked in `stopping` forever.
+   */
+  private async stopTask(taskId: string): Promise<void> {
+    const { store, service, t3 } = this.options;
+    const task = store.get(taskId);
+    if (!task) return;
+    // Only a task parked in `stopping` needs the interrupt + finalise step; any
+    // other state means the stop already finished or was never requested.
+    if (task.status !== "stopping") return;
+    let interrupted = true;
+    let message: string | undefined;
+    if (task.threadId) {
+      if (!t3) {
+        interrupted = false;
+        message = "t3 not configured; the local run was revoked but the remote thread could not be interrupted";
+      } else {
+        let client: T3Client | null = null;
+        try {
+          client = await this.connect(t3);
+          const outcome = await this.withRetry(new RetryTracker(this.options.retryPolicy ?? DEFAULT_RETRY_POLICY), client, () =>
+            client!.stop({ threadId: task.threadId!, runId: task.runId }),
+          );
+          if (!outcome.ok) {
+            interrupted = false;
+            message = `interrupt failed: ${outcome.error.message}`;
+          }
+        } catch (error) {
+          interrupted = false;
+          message = error instanceof Error ? error.message : String(error);
+        } finally {
+          await client?.close().catch(() => undefined);
+        }
+      }
+    }
+    try {
+      service.markStopped(taskId, { interrupted, message });
+    } catch (error) {
+      this.options.log(`stop ${taskId}: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
 
@@ -192,9 +251,7 @@ export class TaskRunner {
       status,
       now,
     });
-    store.setFailure(taskId, `t3 run ended as ${status}`, now);
-    store.setStatus(taskId, "failed", null, now);
-    store.enqueueNotification(taskId, "task_failed", { reason: `run_${status}` }, now);
+    this.commitFailure(taskId, { reason: `run_${status}`, detail: `t3 run ended as ${status}` });
   }
 
   /**
@@ -205,11 +262,7 @@ export class TaskRunner {
   private async finishCompletedRun(taskId: string, threadId: string, runId: string, output: unknown, retry: RetryTracker): Promise<void> {
     const { store, service } = this.options;
     const now = toIso(new Date());
-    const fail = (reason: string) => {
-      store.setStatus(taskId, "failed", null, now);
-      store.setFailure(taskId, reason, now);
-      store.enqueueNotification(taskId, "task_failed", { reason }, now);
-    };
+    const fail = (reason: string) => this.commitFailure(taskId, { reason, detail: reason });
     store.upsertRunReference({
       taskId,
       executionId: store.executionFor(taskId)?.executionId ?? `${taskId}:g1`,
@@ -220,8 +273,17 @@ export class TaskRunner {
       now,
     });
     const current = store.get(taskId);
-    if (!current || current.status === "completed" || current.status === "failed") return;
-    store.setStatus(taskId, "verifying", null, now);
+    // A task stopped while the run was finishing must not be resurrected.
+    if (!current || isTerminal(current.status) || current.status === "stopping") return;
+    this.options.writer.commit({
+      taskId,
+      type: "run_observed",
+      payload: { threadId, runId, runStatus: "completed" },
+      options: { idempotencyKey: `observed:${runId}:completed`, now },
+      project: () => {
+        store.setStatus(taskId, "verifying", null, now);
+      },
+    });
 
     let client: T3Client | null = null;
     try {
@@ -271,14 +333,20 @@ export class TaskRunner {
 
     const input = this.options.artifacts.get(task.artifactPath);
     if (input === null) {
-      store.setFailure(taskId, `frozen input missing at ${task.artifactPath}`, now());
-      store.setStatus(taskId, "failed", null, now());
+      this.commitFailure(taskId, { reason: "artifact_missing", detail: `frozen input missing at ${task.artifactPath}` });
       store.setOperationStatus(operation.operationId, "failed", { reason: "artifact_missing" }, now());
-      store.enqueueNotification(taskId, "task_failed", { reason: "artifact_missing" }, now());
       return;
     }
 
-    store.setStatus(taskId, "running", null, now());
+    this.options.writer.commit({
+      taskId,
+      type: "dispatch_started",
+      payload: { operationId: operation.operationId },
+      options: { idempotencyKey: `dispatch:${operation.operationId}`, now: now() },
+      project: () => {
+        store.setStatus(taskId, "running", null, now());
+      },
+    });
     const retry = new RetryTracker(this.options.retryPolicy ?? DEFAULT_RETRY_POLICY);
     let client: T3Client | null = null;
     const attemptId = `${operation.operationId}:attempt:${newId()}`;
@@ -389,8 +457,10 @@ export class TaskRunner {
       if (kind?.kind === "auth" || kind?.kind === "transient" || kind?.kind === "timeout") {
         this.markWaiting(taskId, kind.kind === "auth" ? "t3_auth" : "t3_unavailable", kind.message);
       } else {
-        store.setFailure(taskId, error instanceof Error ? error.message : String(error), now());
-        store.setStatus(taskId, "failed", null, now());
+        this.commitFailure(taskId, {
+          reason: "unexpected_error",
+          detail: error instanceof Error ? error.message : String(error),
+        });
       }
     } finally {
       await client?.close().catch(() => undefined);
@@ -457,24 +527,65 @@ export class TaskRunner {
       this.markWaiting(taskId, options.externalEffect ? "effect_unknown" : "t3_unavailable", `${phase}: ${error.message}`);
       return;
     }
-    store.setFailure(taskId, `${phase}: ${error.message}`, now);
-    store.setStatus(taskId, "failed", null, now);
     if (operation) store.setOperationStatus(operation.operationId, "failed", { phase, message: error.message }, now);
-    store.enqueueNotification(taskId, "task_failed", { phase, reason: error.kind }, now);
+    this.commitFailure(taskId, { reason: `${phase}:${error.kind}`, detail: `${phase}: ${error.message}` });
+  }
+
+  /**
+   * The single failure path. It commits `task_failed` with the projection and the
+   * notification in one transaction, so the ledger and the task row can never
+   * disagree, and SSE subscribers see the failure.
+   */
+  private commitFailure(taskId: string, input: { reason: string; detail: string }): void {
+    const { store } = this.options;
+    if (!this.isRunnable(store.get(taskId)?.status ?? "failed")) {
+      // A stopped or finished task keeps its outcome; a late failure is noise.
+      this.options.log(`task ${taskId}: ignoring failure after terminal state (${input.reason})`);
+      return;
+    }
+    const now = toIso(new Date());
+    this.options.writer.commit({
+      taskId,
+      type: "task_failed",
+      payload: { reason: input.reason, detail: input.detail },
+      options: { idempotencyKey: `failed:${input.reason}`, now },
+      project: () => {
+        store.setFailure(taskId, input.detail, now);
+        store.setStatus(taskId, "failed", null, now);
+        store.enqueueNotification(taskId, "task_failed", { reason: input.reason, detail: input.detail }, now);
+      },
+    });
   }
 
   private markWaiting(taskId: string, reason: WaitingReason, detail: string): void {
     const { store } = this.options;
     const now = toIso(new Date());
     const task = store.get(taskId);
-    if (!task || task.status === "completed" || task.status === "failed") return;
-    store.setStatus(taskId, "waiting", reason, now);
-    store.enqueueNotification(taskId, `waiting_${reason}`, { waitingReason: reason, detail }, now);
+    if (!task || !this.isRunnable(task.status)) return;
+    // A fresh occurrence of the same reason is a distinct fact, so the counter is
+    // part of the idempotency key; a replay of the same attempt is not.
+    const counter = (store.getEvidence<number>(taskId, `waitCount:${reason}`) ?? 0) + 1;
+    store.setEvidence(taskId, `waitCount:${reason}`, counter, now);
+    let runAfter: string | undefined;
     if (reason === "t3_unavailable" || reason === "effect_unknown") {
-      // Retry after a bounded backoff instead of on every poll.
       const delay = this.backoffFor(taskId);
-      store.setEvidence(taskId, "dispatchNotBefore", toIso(new Date(Date.now() + delay)), now);
+      runAfter = toIso(new Date(Date.now() + delay));
+      store.setEvidence(taskId, "dispatchNotBefore", runAfter, now);
     }
+    this.options.writer.commit({
+      taskId,
+      type: "task_waiting",
+      payload: { waitingReason: reason, detail, attempt: counter },
+      options: {
+        idempotencyKey: `waiting:${reason}:${counter}`,
+        now,
+        enqueue: runAfter ? [{ kind: JOB_DISPATCH, dedupeKey: `retry:${counter}`, runAfter }] : [],
+      },
+      project: () => {
+        store.setStatus(taskId, "waiting", reason, now);
+        store.enqueueNotification(taskId, `waiting_${reason}`, { waitingReason: reason, detail, attempt: counter }, now);
+      },
+    });
     this.options.log(`task ${reason}: ${detail}`);
   }
 
@@ -487,9 +598,26 @@ export class TaskRunner {
     const now = toIso(new Date());
     for (const job of this.claimedJobs) {
       if (job.taskId !== taskId) continue;
-      this.options.writer.outbox.complete(job.jobId, now);
+      const task = this.options.store.get(taskId);
+      const failed = task !== undefined && !this.isRunnable(task.status) && task.status !== "stopping";
+      if (failed) {
+        // The attempt failed, so the job goes back on the queue with a backoff
+        // (or dies after its attempt budget) instead of being marked done.
+        const policy = this.options.retryPolicy ?? DEFAULT_RETRY_POLICY;
+        this.options.writer.outbox.retry(job.jobId, task?.failureReason ?? "task failed", this.backoffMs(job.taskId, policy));
+      } else {
+        this.options.writer.outbox.complete(job.jobId, now);
+      }
     }
     this.claimedJobs = this.claimedJobs.filter((job) => job.taskId !== taskId);
+  }
+
+  /** Exponential backoff bounded by the retry policy. */
+  private backoffMs(taskId: string, policy: RetryPolicy): number {
+    const { store } = this.options;
+    const previous = store.getEvidence<number>(taskId, "dispatchFailures") ?? 0;
+    const count = previous + 1;
+    return Math.min(policy.maxDelayMs, Math.max(policy.firstDelayMs, this.options.pollIntervalMs * 4 * 2 ** Math.min(count - 1, 6)));
   }
 
   private backoffFor(taskId: string): number {

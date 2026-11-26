@@ -40,6 +40,8 @@ export interface GetTaskResponse {
   failureReason: string | null;
   verification: { result: string; verifierVersion: string; findings: unknown[]; createdAt: string } | null;
   lastObservedAt: string | null;
+  /** Current brief revision; callers must echo it back when amending. */
+  briefVersion: number;
 }
 
 export function defaultConfig(env: NodeJS.ProcessEnv, home: string): ServiceConfig {

@@ -199,6 +199,8 @@ export class TaskService {
         ? { result: view.verification.result, verifierVersion: view.verification.verifierVersion, findings: view.verification.findings, createdAt: view.verification.createdAt }
         : null,
       lastObservedAt: task.updatedAt,
+      // Callers need this to send a correct `expectedBriefVersion` to amend.
+      briefVersion: view.briefVersion,
     };
   }
 

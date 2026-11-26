@@ -136,17 +136,22 @@ async function runList(args: string[]): Promise<number> {
 }
 
 async function runAmend(args: string[]): Promise<number> {
-  const parsed = splitPositional(args, new Set(["version", "goal", "must", "must-not", "evidence", "request"]));
-  if (parsed.positional.length !== 1) return fail(EXIT_INVALID_INPUT, "timo amend 需要一个 TASK_ID");
-  const taskId = parsed.positional[0]!;
-  let flags: Map<string, string[]>;
+  let parsed: ReturnType<typeof splitPositional>;
   try {
-    flags = parsed.flags;
-    if (!first(flags, "version")) throw new UsageError("缺少 --version（当前约定版本号）");
+    parsed = splitPositional(
+      args,
+      new Set(["version", "goal", "must", "must-not", "evidence", "request"]),
+      new Set(["must", "must-not", "evidence"]),
+    );
   } catch (error) {
     return fail(EXIT_INVALID_INPUT, error instanceof Error ? error.message : String(error));
   }
-  const expected = Number(first(flags, "version"));
+  if (parsed.positional.length !== 1) return fail(EXIT_INVALID_INPUT, "timo amend 需要一个 TASK_ID");
+  const taskId = parsed.positional[0]!;
+  const flags = parsed.flags;
+  const version = first(flags, "version");
+  if (!version) return fail(EXIT_INVALID_INPUT, "缺少 --version（当前约定版本号）");
+  const expected = Number(version);
   if (!Number.isInteger(expected) || expected < 1) return fail(EXIT_INVALID_INPUT, "--version 必须是正整数");
   const body: Record<string, unknown> = { expectedBriefVersion: expected };
   const goal = first(flags, "goal");
@@ -160,7 +165,12 @@ async function runAmend(args: string[]): Promise<number> {
 }
 
 async function runStop(args: string[]): Promise<number> {
-  const parsed = splitPositional(args, new Set(["reason"]));
+  let parsed: ReturnType<typeof splitPositional>;
+  try {
+    parsed = splitPositional(args, new Set(["reason"]));
+  } catch (error) {
+    return fail(EXIT_INVALID_INPUT, error instanceof Error ? error.message : String(error));
+  }
   if (parsed.positional.length !== 1) return fail(EXIT_INVALID_INPUT, "timo stop 需要一个 TASK_ID");
   return emit(
     await call("POST", `/api/tasks/${encodeURIComponent(parsed.positional[0]!)}/stop`, {
