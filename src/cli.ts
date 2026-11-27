@@ -15,12 +15,16 @@ const USAGE = `用法：
   timo serve                          前台启动任务服务（Unix socket，可加 TIMO_HTTP_PORT 开 Web）
   timo create --request-id ID --log FILE [--request TEXT]
                                       提交一份 SSE 日志诊断
+  timo create --request-id ID --repo PATH[:BASE[:NAME]]... --request TEXT [--executor ID] [--check CMD]... [--model MODEL] [--max-repair N]
+                                      提交一个多仓代码交付任务（独立 worktree + 声明式验收）
   timo get TASK_ID                    查询任务
   timo list [--status STATUS] [--limit N]
                                       列出任务，最新在前
   timo amend TASK_ID --version N [--goal TEXT] [--must ITEM]... [--must-not ITEM]...
                                       追加新的约定版本；版本过期返回冲突
+  timo steer TASK_ID --message TEXT   向正在运行的执行器注入实时纠偏指令
   timo stop TASK_ID [--reason TEXT]   停止任务并作废当前执行代次
+  timo executors                      查看已探测就绪的执行器列表
 
 退出码：0 成功，1 服务或其他错误，2 参数或日志输入无效，3 任务不存在，4 请求冲突。
 成功时 JSON 只写 stdout；诊断写 stderr。`;
@@ -46,7 +50,9 @@ async function main(argv: string[]): Promise<number> {
   if (command === "get") return runGet(rest);
   if (command === "list") return runList(rest);
   if (command === "amend") return runAmend(rest);
+  if (command === "steer") return runSteer(rest);
   if (command === "stop") return runStop(rest);
+  if (command === "executors") return emit(await call("GET", "/api/executors"));
   process.stderr.write(`未知命令：${command}\n\n${USAGE}\n`);
   return EXIT_INVALID_INPUT;
 }
@@ -88,12 +94,52 @@ function fail(code: number, message: string): number {
 async function runCreate(args: string[]): Promise<number> {
   let flags: Map<string, string[]>;
   try {
-    flags = parseFlags(args, new Set(["request-id", "log", "request"]));
+    flags = parseFlags(
+      args,
+      new Set(["request-id", "log", "request", "repo", "executor", "model", "check", "max-repair"]),
+      new Set(["repo", "check"]),
+    );
     if (!first(flags, "request-id")) throw new UsageError("缺少 --request-id");
-    if (!first(flags, "log")) throw new UsageError("缺少 --log");
+    const hasLog = Boolean(first(flags, "log"));
+    const hasRepo = (flags.get("repo")?.length ?? 0) > 0;
+    if (!hasLog && !hasRepo) throw new UsageError("缺少 --log 或 --repo");
   } catch (error) {
     return fail(EXIT_INVALID_INPUT, error instanceof Error ? error.message : String(error));
   }
+
+  const repoSpecs = flags.get("repo") ?? [];
+  if (repoSpecs.length > 0) {
+    const requestText = first(flags, "request")?.trim() ?? "";
+    if (!requestText) return fail(EXIT_INVALID_INPUT, "代码交付任务必须提供 --request TEXT");
+    const repos = repoSpecs.map((spec) => {
+      const [sourcePath, baseRef = "main", name] = spec.split(":");
+      return { sourcePath: sourcePath!, baseRef, ...(name ? { name } : {}) };
+    });
+    const checks = flags.get("check") ?? ["npm run typecheck && npm test"];
+    const maxRepairRaw = first(flags, "max-repair");
+    const maxRepairRounds = maxRepairRaw !== undefined ? Number(maxRepairRaw) : 2;
+    const response = await call("POST", "/api/tasks", {
+      requestId: first(flags, "request-id"),
+      kind: "repo_delivery",
+      requestText,
+      executorId: first(flags, "executor") ?? "qwen-code",
+      ...(first(flags, "model") ? { model: first(flags, "model") } : {}),
+      repos,
+      maxRepairRounds: Number.isInteger(maxRepairRounds) && maxRepairRounds >= 0 ? maxRepairRounds : 2,
+      verificationPlan: {
+        version: "cli-check-v1",
+        steps: checks.map((command, idx) => ({
+          type: "command_check",
+          name: `check-${idx + 1}`,
+          command,
+          ...(repos.length === 1 && repos[0]?.name ? { repo: repos[0].name } : {}),
+          combo: repos.length > 1,
+        })),
+      },
+    });
+    return emit(response);
+  }
+
   const logPath = first(flags, "log")!;
   let bytes: Uint8Array;
   try {
@@ -105,8 +151,22 @@ async function runCreate(args: string[]): Promise<number> {
     requestId: first(flags, "request-id"),
     log: Buffer.from(bytes).toString("base64"),
     requestText: first(flags, "request") ?? "",
+    ...(first(flags, "executor") ? { executorId: first(flags, "executor") } : {}),
   });
   return emit(response);
+}
+
+async function runSteer(args: string[]): Promise<number> {
+  let parsed: ReturnType<typeof splitPositional>;
+  try {
+    parsed = splitPositional(args, new Set(["message"]));
+  } catch (error) {
+    return fail(EXIT_INVALID_INPUT, error instanceof Error ? error.message : String(error));
+  }
+  if (parsed.positional.length !== 1) return fail(EXIT_INVALID_INPUT, "timo steer 需要一个 TASK_ID");
+  const message = first(parsed.flags, "message")?.trim();
+  if (!message) return fail(EXIT_INVALID_INPUT, "缺少 --message TEXT");
+  return emit(await call("POST", `/api/tasks/${encodeURIComponent(parsed.positional[0]!)}/steer`, { message }));
 }
 
 async function runGet(args: string[]): Promise<number> {

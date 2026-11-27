@@ -152,7 +152,7 @@ export class Api {
     return parsed as T;
   }
 
-  health(): Promise<{ ok: boolean; latestSeq: number; t3: string; executors?: ExecutorDescriptor[] }> {
+  health(): Promise<{ ok: boolean; latestSeq: number; t3: string; defaultRepoPath?: string; executors?: ExecutorDescriptor[] }> {
     return this.call("/api/health");
   }
 
@@ -189,6 +189,33 @@ export class Api {
 
   createTask(requestId: string, logBase64: string): Promise<{ taskId: string; status: string }> {
     return this.call("/api/tasks", { method: "POST", body: JSON.stringify({ requestId, log: logBase64 }) });
+  }
+
+  createRepoTask(input: {
+    requestId: string;
+    requestText: string;
+    executorId: string;
+    sourcePath: string;
+    baseRef: string;
+    checkCommand: string;
+    maxRepairRounds?: number;
+  }): Promise<{ taskId: string; status: string }> {
+    const repoName = input.sourcePath.replace(/\/+$/, "").split("/").at(-1) || "repo";
+    return this.call("/api/tasks", {
+      method: "POST",
+      body: JSON.stringify({
+        requestId: input.requestId,
+        kind: "repo_delivery",
+        requestText: input.requestText,
+        executorId: input.executorId,
+        repos: [{ sourcePath: input.sourcePath, baseRef: input.baseRef, name: repoName }],
+        maxRepairRounds: input.maxRepairRounds ?? 2,
+        verificationPlan: {
+          version: "web-check-v1",
+          steps: [{ type: "command_check", name: "verify", command: input.checkCommand, repo: repoName }],
+        },
+      }),
+    });
   }
 
   inbox(): Promise<{ items: InboxItem[] }> {

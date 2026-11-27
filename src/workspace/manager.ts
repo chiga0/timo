@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 
 /**
@@ -111,6 +111,7 @@ export class WorkspaceManager {
         const safeTask = taskId.replace(/[^A-Za-z0-9_-]/g, "-").slice(0, 32) || "task";
         const branch = `timo/${safeTask}/g${generation}/${repo.name}`;
         this.run(["worktree", "add", "-b", branch, worktreePath, repo.baseSha], repo.sourcePath);
+        this.linkIgnoredNodeModules(repo.sourcePath, worktreePath);
         prepared.push({
           name: repo.name,
           sourcePath: repo.sourcePath,
@@ -226,7 +227,29 @@ export class WorkspaceManager {
     }
     mkdirSync(dirname(targetDir), { recursive: true, mode: 0o700 });
     this.run(["worktree", "add", "--detach", targetDir, verified], sourcePath);
+    this.linkIgnoredNodeModules(sourcePath, targetDir);
     return targetDir;
+  }
+
+  /**
+   * Symlinks `node_modules` from the source clone when it exists and is
+   * gitignored, so Node/TS repos can run `npm test` inside fresh worktrees
+   * without network installs or dirtying `git status`.
+   */
+  private linkIgnoredNodeModules(sourcePath: string, targetDir: string): void {
+    const srcNm = join(sourcePath, "node_modules");
+    const dstNm = join(targetDir, "node_modules");
+    if (!existsSync(srcNm) || existsSync(dstNm)) return;
+    const ignored = safe(() => {
+      this.run(["check-ignore", "-q", "node_modules"], targetDir);
+      return true;
+    }, false);
+    if (!ignored) return;
+    try {
+      symlinkSync(srcNm, dstNm, "dir");
+    } catch {
+      // Best-effort; if symlinking fails, repo commands fall back to repo setup.
+    }
   }
 
   /** Removes a detached verification checkout created by `materializeCleanCheckout`. */

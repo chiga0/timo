@@ -53,6 +53,7 @@ export function registerApi(router: Router, deps: ApiDeps): void {
       startedAt: deps.startedAt,
       latestSeq: deps.ledger.latestSeq(),
       t3: deps.t3Configured ? "configured" : "unconfigured",
+      defaultRepoPath: process.cwd(),
       executors: deps.executors?.snapshot() ?? [],
     },
   }));

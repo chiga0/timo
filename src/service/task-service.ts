@@ -306,11 +306,12 @@ export class TaskService {
       version: "pipeline-v1",
       steps: [{ type: "command_check", name: "default-check", command: "npm test" }],
     };
+    const defaultExecutor = request.executorId ?? "qwen-code";
     const specBytes = Buffer.from(
       stableJson({
         kind: "repo_delivery",
         requestText,
-        executorId: request.executorId ?? "pi",
+        executorId: defaultExecutor,
         repos: normalizedRepos,
         verificationPlan,
       }),
@@ -338,7 +339,7 @@ export class TaskService {
     this.store.createTask({
       taskId,
       kind: "repo_delivery",
-      executorId: request.executorId ?? "pi",
+      executorId: defaultExecutor,
       requestId,
       requestDigest,
       inputDigest,
@@ -366,8 +367,8 @@ export class TaskService {
       repos: normalizedRepos,
       verificationPlan,
       maxRepairRounds,
-      environment: request.executorId ?? "pi",
-      providerInstanceId: request.executorId ?? "pi",
+      environment: defaultExecutor,
+      providerInstanceId: defaultExecutor,
       model: request.model ?? "default",
       now,
     });
@@ -379,7 +380,7 @@ export class TaskService {
         kind: "repo_delivery",
         inputDigest,
         requestId,
-        executorId: request.executorId ?? "pi",
+        executorId: defaultExecutor,
         repos: normalizedRepos.map((r) => ({ name: r.name, baseRef: r.baseRef })),
       },
       options: {

@@ -12,6 +12,7 @@ import { TaskRunner } from "./runner.js";
 import { createMcpT3Client } from "../adapters/t3.js";
 import { ExecutorRegistry } from "../adapters/execution.js";
 import { PiAdapter } from "../adapters/pi.js";
+import { QwenCodeAdapter } from "../adapters/qwen-code.js";
 import { T3ExecutionAdapter } from "../adapters/t3-adapter.js";
 import { WorkspaceManager } from "../workspace/manager.js";
 import { RunStreamStore } from "../workspace/run-stream.js";
@@ -54,6 +55,8 @@ export async function serve(): Promise<void> {
   const workspaces = new WorkspaceManager({ home: join(home, "workspaces") });
   const runStreams = new RunStreamStore(home);
   const executors = new ExecutorRegistry();
+  // Register local qwen-code first as the primary resident coding agent, plus pi & optional t3.
+  executors.register(new QwenCodeAdapter());
   executors.register(new PiAdapter());
   if (t3) {
     executors.register(new T3ExecutionAdapter({ clientFactory: () => Promise.resolve(createMcpT3Client(t3)) }));

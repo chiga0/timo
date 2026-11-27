@@ -28,6 +28,7 @@ export interface WorkbenchState {
   inbox: InboxItem[];
   policy: PolicySnapshot | null;
   executors: ExecutorDescriptor[];
+  defaultRepoPath: string;
   selectedId: string | null;
   detail: TaskDetail | null;
   events: TaskEvent[];
@@ -51,6 +52,7 @@ export function App(): React.JSX.Element {
     inbox: [],
     policy: null,
     executors: [],
+    defaultRepoPath: "",
     selectedId: null,
     detail: null,
     events: [],
@@ -66,7 +68,7 @@ export function App(): React.JSX.Element {
 
   const refresh = async (selectId?: string) => {
     try {
-      const [tasks, inbox, policy, execRes] = await Promise.all([api.listTasks(), api.inbox(), api.policy(), api.executors()]);
+      const [tasks, inbox, policy, health] = await Promise.all([api.listTasks(), api.inbox(), api.policy(), api.health()]);
       const nextId = selectId ?? selectedRef.current ?? tasks.tasks[0]?.taskId ?? null;
       const [detail, events, proposalsRes, runsRes] = nextId
         ? await Promise.all([api.getTask(nextId), api.taskEvents(nextId, 0), api.listProposals(nextId), api.taskRuns(nextId)])
@@ -77,7 +79,8 @@ export function App(): React.JSX.Element {
         tasks: tasks.tasks,
         inbox: inbox.items,
         policy,
-        executors: execRes.executors,
+        executors: health.executors ?? previous.executors,
+        defaultRepoPath: health.defaultRepoPath ?? previous.defaultRepoPath,
         selectedId: nextId,
         detail,
         events,
@@ -237,12 +240,23 @@ export function App(): React.JSX.Element {
           />
           <Composer
             disabled={false}
-            onSubmit={(text) =>
+            defaultRepoPath={state.defaultRepoPath}
+            executors={state.executors}
+            onSubmit={(submission) =>
               run(async () => {
-                const legal = text.trim();
-                if (legal === "") return;
                 const requestId = `web-${Date.now()}`;
-                const log = btoa(new TextEncoder().encode(legal).reduce((acc, byte) => acc + String.fromCharCode(byte), ""));
+                if (submission.kind === "repo_delivery") {
+                  const created = await api.createRepoTask({
+                    requestId,
+                    requestText: submission.text,
+                    executorId: submission.executorId,
+                    sourcePath: submission.sourcePath,
+                    baseRef: submission.baseRef,
+                    checkCommand: submission.checkCommand,
+                  });
+                  return created.taskId;
+                }
+                const log = btoa(new TextEncoder().encode(submission.text).reduce((acc, byte) => acc + String.fromCharCode(byte), ""));
                 const created = await api.createTask(requestId, log);
                 return created.taskId;
               })
