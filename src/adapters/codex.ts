@@ -227,7 +227,8 @@ export class CodexAdapter implements ExecutionAdapter {
     const exitCode = child.exitCode;
     const status = run.timedOut ? "timed_out" : run.interrupted ? "interrupted" : exitCode === 0 ? "succeeded" : "failed";
     if (status !== "succeeded") {
-      emit("error", stderrTail.trim() !== "" ? stderrTail.trim() : `codex exited with ${exitCode ?? "signal"}`);
+      const errText = stderrTail.trim();
+      emit("error", errText !== "" ? extractReadableCodexError(errText) : `codex exited with ${exitCode ?? "signal"}`);
     }
     emit("status", `codex ${status}`);
     return { runId: request.runId, externalId, status, exitCode, output };
@@ -256,12 +257,13 @@ export class CodexAdapter implements ExecutionAdapter {
     if (type === "turn.started") return { events: [{ type: "status", summary: "turn started" }] };
     if (type === "turn.completed") return { events: [{ type: "status", summary: "turn completed", data: record.usage }] };
     if (type === "error" || type === "turn.failed") {
-      const msg =
+      const rawMsg =
         typeof record.message === "string"
           ? record.message
           : typeof (record.error as { message?: unknown } | undefined)?.message === "string"
             ? String((record.error as { message: string }).message)
             : trimmed;
+      const msg = extractReadableCodexError(rawMsg);
       return { events: [{ type: "error", summary: msg }] };
     }
 
@@ -270,7 +272,7 @@ export class CodexAdapter implements ExecutionAdapter {
       if (!item) return null;
       const itemType = typeof item.type === "string" ? item.type : "";
       if (itemType === "agent_message" && typeof item.text === "string" && item.text.trim() !== "") {
-        return { finalText: item.text, events: [{ type: "thinking", summary: item.text }] };
+        return { finalText: item.text, events: [{ type: "thinking", summary: item.text, data: { fullText: item.text } }] };
       }
       if (itemType === "reasoning" && typeof item.text === "string" && item.text.trim() !== "") {
         return { events: [{ type: "thinking", summary: item.text }] };
@@ -320,6 +322,24 @@ export class CodexAdapter implements ExecutionAdapter {
     }, 2_000);
     escalate.unref?.();
   }
+}
+
+function extractReadableCodexError(raw: string): string {
+  const trimmed = raw.trim();
+  if (trimmed.startsWith("{")) {
+    try {
+      const parsed = JSON.parse(trimmed) as { message?: unknown; error?: { message?: unknown; code?: unknown } };
+      if (typeof parsed.error?.message === "string" && parsed.error.message.trim() !== "") {
+        return parsed.error.message.trim();
+      }
+      if (typeof parsed.message === "string" && parsed.message.trim() !== "") {
+        return parsed.message.trim();
+      }
+    } catch {
+      // fall through to raw text
+    }
+  }
+  return trimmed;
 }
 
 function resolveOnPath(command: string): string | null {

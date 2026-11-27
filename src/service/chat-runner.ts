@@ -234,10 +234,20 @@ export class MainChatRunner {
 
     this.activeTurns.set(messageId, { executorId: adapter.id, runId });
     let accumulated = "";
+    let firstStructuredError = "";
+    let lastError = "";
     let lastPersistAt = 0;
 
     const handleEvent = (event: RunStreamEvent) => {
       if (!this.activeTurns.has(messageId)) return;
+      if (event.type === "error" && event.summary.trim() !== "") {
+        const msg = event.summary.trim();
+        lastError = msg;
+        if (!firstStructuredError && !/^Reading additional input from stdin/i.test(msg)) {
+          firstStructuredError = msg;
+        }
+        return;
+      }
       if (event.type === "text_delta" && event.summary.length > 0) {
         accumulated += event.summary;
         this.deps.chatBus.publish({
@@ -280,14 +290,20 @@ export class MainChatRunner {
         handleEvent,
       );
       if (!this.activeTurns.has(messageId)) return;
+      const errDetail = firstStructuredError || lastError;
+      if (result.status !== "succeeded" && result.status !== "interrupted") {
+        this.deps.log?.(`chat turn ${result.status} (${adapter.id}, ${messageId}): ${errDetail || `exit=${result.exitCode}`}`);
+      }
       const finalContent =
         result.status === "succeeded"
           ? (result.output?.trim() || accumulated.trim() || "已完成处理。")
           : result.status === "interrupted"
             ? (accumulated.trim() || "（已停止生成）")
             : accumulated.trim()
-              ? `${accumulated.trim()}\n\n> 生成中断（${result.status}）`
-              : `执行器 \`${adapter.id}\` 返回异常状态：${result.status}`;
+              ? `${accumulated.trim()}\n\n> 生成中断（${result.status}${errDetail ? `：${errDetail}` : ""}）`
+              : errDetail
+                ? `执行器 \`${adapter.id}\` 调用失败（${result.status}）：\n\n> ${errDetail}\n\n可在输入框左下角切换其他模型或执行器后重试。`
+                : `执行器 \`${adapter.id}\` 返回异常状态：${result.status}`;
       const updated = this.deps.chatStore.update(messageId, {
         content: finalContent,
         status: result.status === "succeeded" || result.status === "interrupted" ? "done" : "error",

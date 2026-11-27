@@ -190,6 +190,57 @@ describe("Timo Unified Skills, Main Chat Context Engine & Chief-of-Staff MCP", (
     });
   });
 
+  it("surfaces structured executor error messages in Main Chat instead of bare 'failed'", async () => {
+    await withTempDir(async (dir) => {
+      const home = join(dir, "home");
+      const { service, db } = TaskService.open(defaultConfig({}, home));
+      const chatStore = new ChatStore(db);
+      const chatBus = new ChatStreamBus();
+      const failingAdapter: ExecutionAdapter = {
+        id: "codex",
+        async probe() {
+          return { id: "codex", kind: "cli", available: true, capabilities: { stream: true } };
+        },
+        async spawn(req: SpawnRequest, onEvent: (ev: RunStreamEvent) => void): Promise<SpawnResult> {
+          onEvent({
+            seq: 1,
+            runId: req.runId,
+            taskId: req.taskId,
+            type: "error",
+            at: Date.now(),
+            summary: "The 'gpt-6.1-sol' model is not supported when using Codex with a ChatGPT account.",
+          });
+          return { runId: req.runId, externalId: null, status: "failed", exitCode: 1, output: "" };
+        },
+        async resume() {
+          throw new Error("unused");
+        },
+        async steer() {
+          return { accepted: false };
+        },
+        async interrupt() {
+          return { interrupted: true };
+        },
+      };
+      const registry = new ExecutorRegistry();
+      registry.register(failingAdapter);
+      await registry.probeAll();
+      try {
+        const runner = new MainChatRunner({ home, chatStore, chatBus, service, executors: registry });
+        const res = runner.send({ text: "测试模型报错提示", executorId: "codex" });
+        assert.equal(res.kind, "chat");
+        await new Promise((r) => setTimeout(r, 40));
+        const saved = chatStore.get(res.assistantMessage.messageId);
+        assert.ok(saved);
+        assert.equal(saved.status, "error");
+        assert.match(saved.content, /model is not supported/);
+        assert.match(saved.content, /切换其他模型或执行器/);
+      } finally {
+        service.close();
+      }
+    });
+  });
+
   it("exposes Chief-of-Staff MCP control tools cleanly isolated from Worker tools + serves /api/skills REST endpoints", async () => {
     await withTempDir(async (dir) => {
       const home = join(dir, "home");
