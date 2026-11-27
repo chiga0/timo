@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import type { ExecutorDescriptor, InboxItem, Proposal, RunStreamEvent, TaskDetail, TaskEvent } from "../api.js";
 import { AgentLogo, agentLabel } from "./AgentIcons.js";
-import { Markdown } from "./Markdown.js";
+import { TaskTimeline, type LocalSteerItem } from "./TaskTimeline.js";
 
 const STATUS_LABEL: Record<string, string> = {
   accepted: "已接单",
@@ -58,7 +58,9 @@ export function TaskDetailView(props: {
   const [goal, setGoal] = useState("");
   const [handoffTarget, setHandoffTarget] = useState("");
   const [steerText, setSteerText] = useState("");
-  const [steerFeedback, setSteerFeedback] = useState<string | null>(null);
+  const [localSteers, setLocalSteers] = useState<LocalSteerItem[]>([]);
+  const [showRawLog, setShowRawLog] = useState(false);
+  const [railReqExpanded, setRailReqExpanded] = useState(false);
   const logRef = useRef<HTMLDivElement | null>(null);
 
   const detail = props.detail;
@@ -72,7 +74,9 @@ export function TaskDetailView(props: {
     setConfirmDelete(false);
     setEditingTitle(false);
     setShowProof(false);
-    setSteerFeedback(null);
+    setLocalSteers([]);
+    setShowRawLog(false);
+    setRailReqExpanded(false);
   }, [detail?.taskId]);
 
   useEffect(() => {
@@ -125,8 +129,9 @@ export function TaskDetailView(props: {
     const msg = steerText.trim();
     if (!msg) return;
     setSteerText("");
+    const id = `steer-${Date.now()}`;
     void props.onSteer(detail.taskId, msg).then((res) => {
-      setSteerFeedback(res.accepted ? "纠偏指令已送达当前运行" : `未送达：${res.reason ?? "执行器不支持实时纠偏"}`);
+      setLocalSteers((prev) => [...prev, { id, text: msg, at: Date.now(), accepted: res.accepted, reason: res.reason }]);
     });
   };
 
@@ -397,35 +402,12 @@ export function TaskDetailView(props: {
 
           {/* Main 2-Column Task Detail Grid */}
           <div className="task-page-grid">
-            {/* Primary Left Column: Final Conclusion + Live Execution Stream + Steer */}
+            {/* Primary Left Column: Codex-style Chat Timeline (auto-collapsed tools + Markdown conclusion + Steer) */}
             <div className="task-page-main stack" style={{ gap: 14 }}>
-              {assistantText ? (
-                <section className="card">
-                  <header className="card-head">
-                    <span>最终结论</span>
-                    <button type="button" className="btn-link" onClick={copyConclusion}>
-                      {copiedConclusion ? "已复制全文" : "复制 Markdown"}
-                    </button>
-                  </header>
-                  <div className="card-body task-conclusion-full">
-                    <Markdown content={assistantText} />
-                  </div>
-                </section>
-              ) : detail.status === "failed" && detail.failureReason && !blocked ? (
-                <section className="card task-banner-card is-error">
-                  <header className="card-head">
-                    <span>失败原因</span>
-                  </header>
-                  <div className="card-body small" style={{ color: "var(--error)" }}>
-                    {detail.failureReason}
-                  </div>
-                </section>
-              ) : null}
-
               <section className="card">
                 <header className="card-head">
                   <span className="row" style={{ gap: 7 }}>
-                    <span>实时执行进展</span>
+                    <span>执行进展与结论</span>
                     {isRunning && (
                       <span className="row small muted" style={{ gap: 5, fontWeight: 400 }}>
                         <span className="dot dot-warning dot-pulse" />
@@ -450,13 +432,29 @@ export function TaskDetailView(props: {
                     ) : props.activeRunId ? (
                       <span className="mono muted small">{props.activeRunId}</span>
                     ) : null}
+                    <div className="seg">
+                      <button
+                        type="button"
+                        className={!showRawLog ? "active" : ""}
+                        onClick={() => setShowRawLog(false)}
+                      >
+                        对话视图
+                      </button>
+                      <button
+                        type="button"
+                        className={showRawLog ? "active" : ""}
+                        onClick={() => setShowRawLog(true)}
+                      >
+                        实时流
+                      </button>
+                    </div>
                   </div>
                 </header>
-                <div className="card-body stack" style={{ gap: 10 }}>
-                  <div className="task-event-log" ref={logRef}>
-                    {props.activeRunId ? (
-                      props.runEvents.length === 0 ? (
-                        <div className="empty-box">{isRunning ? "等待执行器输出实时步骤…" : "该次运行无结构化步骤记录"}</div>
+                <div className="card-body stack" style={{ gap: 12 }}>
+                  {showRawLog ? (
+                    <div className="task-event-log" ref={logRef}>
+                      {props.runEvents.length === 0 ? (
+                        <div className="empty-box">{isRunning ? "等待执行器输出实时步骤…" : "暂无原始事件"}</div>
                       ) : (
                         props.runEvents.map((ev) => (
                           <div key={`${ev.runId}:${ev.seq}`} className="event-line" style={{ alignItems: "flex-start" }}>
@@ -468,21 +466,25 @@ export function TaskDetailView(props: {
                             </span>
                           </div>
                         ))
-                      )
-                    ) : props.events.length === 0 ? (
-                      <div className="empty-box">暂无执行事件</div>
-                    ) : (
-                      props.events.map((event) => (
-                        <div key={event.eventId} className="event-line">
-                          <span className="seq mono">{String(event.seq).padStart(2, "0")}</span>
-                          <span className="mono">{event.type}</span>
-                          <span className="muted mono" style={{ marginLeft: "auto", fontSize: 10 }}>
-                            {new Date(event.createdAt).toLocaleTimeString()}
-                          </span>
-                        </div>
-                      ))
-                    )}
-                  </div>
+                      )}
+                    </div>
+                  ) : (
+                    <div className="task-timeline-flow" ref={logRef}>
+                      <TaskTimeline
+                        requestText={detail.requestText}
+                        status={detail.status}
+                        isRunning={isRunning}
+                        assistantText={assistantText}
+                        failureReason={!blocked ? detail.failureReason : null}
+                        runEvents={props.runEvents}
+                        taskEvents={props.events}
+                        localSteers={localSteers}
+                        hasActiveRun={Boolean(props.activeRunId)}
+                        onCopyConclusion={assistantText ? copyConclusion : undefined}
+                        copiedConclusion={copiedConclusion}
+                      />
+                    </div>
+                  )}
 
                   {!isTerminal && (
                     <div className="task-steer-bar">
@@ -509,7 +511,6 @@ export function TaskDetailView(props: {
                       </button>
                     </div>
                   )}
-                  {steerFeedback && <div className="muted mono small">{steerFeedback}</div>}
                 </div>
               </section>
             </div>
@@ -522,11 +523,27 @@ export function TaskDetailView(props: {
                   <span className="mono muted small">v{detail.briefVersion}</span>
                 </header>
                 <div className="card-body stack" style={{ gap: 10 }}>
-                  {detail.requestText && (
-                    <div className="card-box small" style={{ wordBreak: "break-word", whiteSpace: "pre-wrap" }}>
-                      {detail.requestText}
-                    </div>
-                  )}
+                  {detail.requestText && (() => {
+                    const req = detail.requestText.trim();
+                    const isLong = req.length > 160 || req.split("\n").length > 4;
+                    return (
+                      <div className="card-box small stack" style={{ gap: 6, wordBreak: "break-word" }}>
+                        <div className={isLong && !railReqExpanded ? "rail-req-clamped" : ""} style={{ whiteSpace: "pre-wrap" }}>
+                          {req}
+                        </div>
+                        {isLong && (
+                          <button
+                            type="button"
+                            className="btn-link"
+                            style={{ alignSelf: "flex-start" }}
+                            onClick={() => setRailReqExpanded((v) => !v)}
+                          >
+                            {railReqExpanded ? "收起需求 ⌃" : "查看全部需求 ⌄"}
+                          </button>
+                        )}
+                      </div>
+                    );
+                  })()}
                   <dl className="kv">
                     <dt>状态</dt>
                     <dd>{STATUS_LABEL[detail.status] ?? detail.status}</dd>

@@ -255,8 +255,13 @@ export class PiAdapter implements ExecutionAdapter {
       }
       const text = texts.join("\n").trim();
       if (text !== "") {
-        if (role === "assistant") events.push({ type: "thinking", summary: text });
-        else events.push({ type: "status", summary: `[${role}] ${text}` });
+        if (role === "assistant") {
+          events.push({ type: "thinking", summary: text, data: { fullText: text } });
+        } else if (role === "toolResult" || role === "tool") {
+          events.push({ type: "tool_result", summary: text, data: { fullText: text } });
+        } else if (role !== "user") {
+          events.push({ type: "status", summary: `[${role}] ${text}` });
+        }
       }
       if (events.length === 0) return null;
       return { events, finalText: role === "assistant" && text !== "" ? text : undefined };
