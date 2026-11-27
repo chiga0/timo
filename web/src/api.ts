@@ -121,6 +121,13 @@ export interface TaskProgressFrame {
   at: number;
 }
 
+export interface ChatStepFrame {
+  messageId: string;
+  type: string;
+  summary: string;
+  at: number;
+}
+
 export interface RepoDeliveryState {
   name: string;
   sourcePath: string;
@@ -844,6 +851,7 @@ export function subscribeChatStream(
   handlers: {
     onMessage?: (msg: ChatMessage) => void;
     onDelta?: (delta: { messageId: string; delta: string; content: string }) => void;
+    onStep?: (step: ChatStepFrame) => void;
     onDone?: (msg: ChatMessage) => void;
     onTaskProgress?: (frame: TaskProgressFrame) => void;
   },
@@ -866,6 +874,13 @@ export function subscribeChatStream(
     socket.addEventListener("chat_delta", (ev) => {
       try {
         handlers.onDelta?.(JSON.parse((ev as MessageEvent<string>).data) as { messageId: string; delta: string; content: string });
+      } catch {
+        // ignore
+      }
+    });
+    socket.addEventListener("chat_step", (ev) => {
+      try {
+        handlers.onStep?.(JSON.parse((ev as MessageEvent<string>).data) as ChatStepFrame);
       } catch {
         // ignore
       }

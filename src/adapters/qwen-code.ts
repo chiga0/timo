@@ -50,6 +50,7 @@ interface KnownSession {
   taskId: string;
   model?: string;
   mcpGatewayUrl?: string;
+  timeoutMs?: number;
 }
 
 const EDIT_TOOL_NAMES = new Set([
@@ -132,6 +133,7 @@ export class QwenCodeAdapter implements ExecutionAdapter {
         prompt: followUpPrompt,
         model: known.model,
         mcpGatewayUrl: known.mcpGatewayUrl,
+        timeoutMs: known.timeoutMs,
       },
       known.sessionId,
       onEvent,
@@ -205,6 +207,7 @@ export class QwenCodeAdapter implements ExecutionAdapter {
     }
 
     const workerEnv = buildIsolatedWorkerEnv(process.env, {
+      QWEN_CODE_SUPPRESS_YOLO_WARNING: "1",
       ...(request.mcpGatewayUrl ? { TIMO_MCP_GATEWAY_URL: request.mcpGatewayUrl } : {}),
       ...(request.env ?? {}),
     });
@@ -283,6 +286,7 @@ export class QwenCodeAdapter implements ExecutionAdapter {
                 taskId: request.taskId,
                 model: request.model,
                 mcpGatewayUrl: request.mcpGatewayUrl,
+                timeoutMs: request.timeoutMs,
               });
             }
             if (parsed.finalText !== undefined) output = parsed.finalText;
@@ -326,7 +330,12 @@ export class QwenCodeAdapter implements ExecutionAdapter {
     }
 
     const exitCode = child.exitCode;
-    const status = run.timedOut
+    const cleanedStderr = sanitizeQwenStderr(stderrTail);
+    const hitWallClock =
+      run.timedOut ||
+      /wall-clock budget .* exceeded|--max-wall-time/i.test(resultError ?? "") ||
+      /wall-clock budget .* exceeded|--max-wall-time/i.test(cleanedStderr);
+    const status = hitWallClock
       ? "timed_out"
       : run.interrupted
         ? "interrupted"
@@ -334,7 +343,8 @@ export class QwenCodeAdapter implements ExecutionAdapter {
           ? "succeeded"
           : "failed";
     if (status !== "succeeded") {
-      const detail = resultError ?? (stderrTail.trim() !== "" ? stderrTail.trim() : `qwen-code exited with ${exitCode ?? "signal"}`);
+      const detail =
+        resultError ?? (cleanedStderr !== "" ? cleanedStderr : `qwen-code exited with ${exitCode ?? "signal"}`);
       emit("error", detail);
     }
     emit("status", `qwen-code ${status}`);
@@ -477,6 +487,13 @@ export class QwenCodeAdapter implements ExecutionAdapter {
     }, 2_000);
     escalate.unref?.();
   }
+}
+
+function sanitizeQwenStderr(raw: string): string {
+  return raw
+    .replace(/Warning:\s*running headless with --yolo[\s\S]*?silence this notice\.?/gi, "")
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
 function formatToolCallSummary(name: string, input: unknown): string {

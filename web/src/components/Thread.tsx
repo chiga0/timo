@@ -1,5 +1,12 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { readSessionToken, type ChatMessage, type InboxItem, type TaskProgressFrame, type TaskSummary } from "../api.js";
+import {
+  readSessionToken,
+  type ChatMessage,
+  type ChatStepFrame,
+  type InboxItem,
+  type TaskProgressFrame,
+  type TaskSummary,
+} from "../api.js";
 import { AgentLogo, agentLabel } from "./AgentIcons.js";
 import { Markdown } from "./Markdown.js";
 import {
@@ -43,6 +50,7 @@ export function Thread(props: {
   tasks: TaskSummary[];
   inbox: InboxItem[];
   liveProgress: Record<string, TaskProgressFrame>;
+  chatSteps?: Record<string, ChatStepFrame[]>;
   scrollTrigger?: number;
   onQuickPrompt: (text: string) => void;
   onOpenTask: (taskId: string) => void;
@@ -226,6 +234,9 @@ export function Thread(props: {
             // Never render a zombie blinking caret on an older message superseded by a newer user turn.
             const hasNewerUserTurn = props.messages.slice(msgIdx + 1).some((m) => m.role === "user");
             const isActivelyStreaming = msg.status === "streaming" && !hasNewerUserTurn;
+            const steps = props.chatSteps?.[msg.messageId] ?? [];
+            const isInterrupted = !isActivelyStreaming && (msg.status === "error" || msg.content.includes("生成中断"));
+            const prevUserPrompt = [...props.messages.slice(0, msgIdx)].reverse().find((m) => m.role === "user")?.content.trim() ?? "";
 
             return (
               <div key={msg.messageId} className="msg-assistant">
@@ -249,6 +260,9 @@ export function Thread(props: {
                     </button>
                   )}
                 </div>
+                {steps.length > 0 && (
+                  <ChatStepsToggle steps={steps} streaming={isActivelyStreaming} />
+                )}
                 <div className="msg-assistant-body">
                   {msg.content ? (
                     <>
@@ -258,10 +272,32 @@ export function Thread(props: {
                   ) : isActivelyStreaming ? (
                     <div className="thinking-line">
                       <span className="dot dot-warning dot-pulse" />
-                      <span className="muted">思考中…</span>
+                      <span className="muted">
+                        {steps.length > 0 ? `正在处理：${steps[steps.length - 1]!.summary.slice(0, 72)}…` : "思考中…"}
+                      </span>
                     </div>
                   ) : (
                     <span className="muted">已完成</span>
+                  )}
+                  {isInterrupted && !hasNewerUserTurn && (
+                    <div className="msg-retry-bar">
+                      <button
+                        type="button"
+                        className="btn btn-primary btn-sm"
+                        onClick={() => props.onQuickPrompt("请接着上一条被中断的进度继续完成，直接给出完整最终结论，不要重复已做过的步骤。")}
+                      >
+                        接着继续完成
+                      </button>
+                      {prevUserPrompt && (
+                        <button
+                          type="button"
+                          className="btn btn-sm"
+                          onClick={() => props.onQuickPrompt(prevUserPrompt)}
+                        >
+                          重新执行
+                        </button>
+                      )}
+                    </div>
                   )}
                 </div>
               </div>
@@ -275,6 +311,46 @@ export function Thread(props: {
         active={isStreaming}
         onClick={() => scrollToBottom("smooth")}
       />
+    </div>
+  );
+}
+
+function ChatStepsToggle(props: { steps: ChatStepFrame[]; streaming: boolean }): React.JSX.Element {
+  const [open, setOpen] = useState(false);
+  const latest = props.steps[props.steps.length - 1]!;
+  const latestShort = latest.summary.replace(/\s+/g, " ").trim().slice(0, 64);
+  return (
+    <div className="chat-steps-wrap">
+      <button
+        type="button"
+        className="tl-group-toggle"
+        aria-expanded={open}
+        onClick={() => setOpen((v) => !v)}
+      >
+        <span className="tl-group-icon" aria-hidden="true">
+          {props.streaming ? <span className="dot dot-warning dot-pulse" /> : "◎"}
+        </span>
+        <span className="tl-group-title">
+          {props.streaming
+            ? `正在执行（已完成 ${props.steps.length} 步）· ${latestShort}`
+            : `已执行 ${props.steps.length} 步操作`}
+        </span>
+        <span className="tl-chevron" aria-hidden="true">
+          {open ? "⌄" : "›"}
+        </span>
+      </button>
+      {open && (
+        <div className="tl-steps">
+          {props.steps.map((s, idx) => (
+            <div key={`${s.at}-${idx}`} className="tl-step-row">
+              <span className="tl-step-icon mono" aria-hidden="true">
+                {s.type === "patch" ? "✎" : s.type === "status" ? "•" : ">_"}
+              </span>
+              <span className="tl-step-label mono">{s.summary}</span>
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   );
 }

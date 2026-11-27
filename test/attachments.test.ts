@@ -188,4 +188,81 @@ describe("Chat Attachments: storage, safety, persistence and prompt injection", 
       }
     });
   });
+
+  it("streams live chat_step tool progress and auto-resumes Main Chat once on wall-clock timeout", async () => {
+    await withTempDir(async (dir) => {
+      const { service, db } = TaskService.open(defaultConfig({}, dir));
+      const chatStore = new ChatStore(db);
+      const chatBus = new ChatStreamBus();
+      const observedSteps: Array<{ type: string; summary: string }> = [];
+      let doneContent = "";
+      let doneStatus = "";
+      chatBus.subscribe((frame) => {
+        if (frame.event === "chat_step") observedSteps.push({ type: frame.data.type, summary: frame.data.summary });
+        if (frame.event === "chat_done") {
+          doneContent = frame.data.content;
+          doneStatus = frame.data.status;
+        }
+      });
+
+      let resumedCalls = 0;
+      const resumableAdapter: ExecutionAdapter = {
+        id: "resumable-exec",
+        probe: async () => ({
+          id: "resumable-exec",
+          kind: "cli",
+          available: true,
+          capabilities: { streaming: true, resume: true, steer: true, mcpGateway: false, handoff: false, structuredOutput: false },
+        }),
+        spawn: async (req, onEvent) => {
+          onEvent({ seq: 1, runId: req.runId, taskId: req.taskId, type: "tool_call", at: Date.now(), summary: "bash(git diff --stat)" });
+          onEvent({ seq: 2, runId: req.runId, taskId: req.taskId, type: "text_delta", at: Date.now(), summary: "已完成第一阶段审查。" });
+          onEvent({
+            seq: 3,
+            runId: req.runId,
+            taskId: req.taskId,
+            type: "error",
+            at: Date.now(),
+            summary: "Warning: running headless with --yolo and no sandbox. or set QWEN_CODE_SUPPRESS_YOLO_WARNING=1 to silence this notice. Run aborted: wall-clock budget of 120s exceeded (--max-wall-time).",
+          });
+          return { runId: req.runId, externalId: "sess-123", status: "timed_out", exitCode: 1, output: "" };
+        },
+        resume: async (runId, onEvent) => {
+          resumedCalls += 1;
+          onEvent({ seq: 4, runId, taskId: "chat:resume", type: "tool_call", at: Date.now(), summary: "read(final-check.ts)" });
+          onEvent({ seq: 5, runId, taskId: "chat:resume", type: "text_delta", at: Date.now(), summary: "最终结论：全部校验通过。" });
+          return { runId: `${runId}-resume`, externalId: "sess-123", status: "succeeded", exitCode: 0, output: "最终结论：全部校验通过。" };
+        },
+        steer: async () => ({ accepted: false }),
+        interrupt: async () => ({ interrupted: true }),
+      };
+
+      const executors = new ExecutorRegistry();
+      executors.register(resumableAdapter);
+      await executors.probeAll();
+
+      const chatRunner = new MainChatRunner({
+        home: dir,
+        chatStore,
+        chatBus,
+        service,
+        executors,
+        chatTimeoutMs: 600_000,
+      });
+
+      try {
+        chatRunner.send({ text: "帮我深度评审这个 85 文件的 MR", executorId: "resumable-exec" });
+        await new Promise((r) => setTimeout(r, 80));
+        assert.equal(resumedCalls, 1, "should automatically resume once on timeout");
+        assert.equal(doneStatus, "done");
+        assert.match(doneContent, /已完成第一阶段审查/);
+        assert.match(doneContent, /最终结论：全部校验通过/);
+        assert.ok(observedSteps.some((s) => s.summary.includes("git diff --stat")));
+        assert.ok(observedSteps.some((s) => s.summary.includes("自动续接")));
+        assert.ok(observedSteps.some((s) => s.summary.includes("final-check.ts")));
+      } finally {
+        service.close();
+      }
+    });
+  });
 });

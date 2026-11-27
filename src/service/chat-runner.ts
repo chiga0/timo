@@ -52,6 +52,8 @@ export class MainChatRunner {
       skillRegistry?: SkillRegistry;
       attachments?: AttachmentStore;
       mcpGateway?: CapabilityMcpGateway;
+      /** Per-turn wall-clock timeout in ms for Main Chat (default 10 minutes so deep reviews finish cleanly). */
+      chatTimeoutMs?: number;
       log?: (line: string) => void;
     },
   ) {}
@@ -274,10 +276,23 @@ export class MainChatRunner {
     const handleEvent = (event: RunStreamEvent) => {
       if (!this.activeTurns.has(messageId)) return;
       if (event.type === "error" && event.summary.trim() !== "") {
-        const msg = event.summary.trim();
+        const msg = event.summary
+          .replace(/Warning:\s*running headless with --yolo[\s\S]*?silence this notice\.?/gi, "")
+          .trim();
+        if (!msg) return;
         lastError = msg;
         if (!firstStructuredError && !/^Reading additional input from stdin/i.test(msg)) {
           firstStructuredError = msg;
+        }
+        return;
+      }
+      if (event.type === "tool_call" || event.type === "patch") {
+        const summary = event.summary.trim();
+        if (summary) {
+          this.deps.chatBus.publish({
+            event: "chat_step",
+            data: { messageId, type: event.type, summary, at: event.at },
+          });
         }
         return;
       }
@@ -309,8 +324,12 @@ export class MainChatRunner {
       }
     };
 
+    const envTimeout = Number(process.env.TIMO_CHAT_TIMEOUT_MS);
+    const chatTimeoutMs =
+      this.deps.chatTimeoutMs ?? (Number.isFinite(envTimeout) && envTimeout >= 10_000 ? envTimeout : 600_000);
+
     try {
-      const result = await adapter.spawn(
+      let result = await adapter.spawn(
         {
           taskId: `chat:${messageId}`,
           runId,
@@ -318,24 +337,67 @@ export class MainChatRunner {
           prompt,
           model,
           mcpGatewayUrl: chiefToken?.url,
-          timeoutMs: 120_000,
+          timeoutMs: chatTimeoutMs,
         },
         handleEvent,
       );
       if (!this.activeTurns.has(messageId)) return;
+
+      // Chief-of-Staff self-healing: if a long deep-analysis/review turn hit its wall-clock
+      // budget right before finishing and the runtime supports native session resume,
+      // automatically resume ONCE instead of leaving the user stranded mid-sentence.
+      let autoResumed = false;
+      const hitTimeout =
+        result.status === "timed_out" || /wall-clock budget .* exceeded|--max-wall-time/i.test(firstStructuredError || lastError);
+      if (hitTimeout && adapterDesc?.capabilities?.resume && result.externalId) {
+        autoResumed = true;
+        this.deps.log?.(`chat turn ${messageId} hit wall-clock budget; auto-resuming session ${result.externalId}`);
+        this.deps.chatBus.publish({
+          event: "chat_step",
+          data: {
+            messageId,
+            type: "status",
+            summary: "耗时较长，正在自动续接上次会话进度继续完成…",
+            at: Date.now(),
+          },
+        });
+        firstStructuredError = "";
+        lastError = "";
+        const resumeRunId = `${runId}-resume`;
+        this.activeTurns.set(messageId, { executorId: adapter.id, runId: resumeRunId });
+        const beforeResumeLen = accumulated.length;
+        if (accumulated.trim() !== "") {
+          accumulated = `${accumulated.trimEnd()}\n\n`;
+        }
+        try {
+          result = await adapter.resume(runId, handleEvent);
+          // If resume returned final output without emitting deltas, append it cleanly.
+          if (result.output?.trim() && accumulated.length <= beforeResumeLen + 2) {
+            accumulated = `${accumulated}${result.output.trim()}`;
+          }
+        } catch (resumeErr) {
+          lastError = resumeErr instanceof Error ? resumeErr.message : String(resumeErr);
+        }
+        if (!this.activeTurns.has(messageId)) return;
+      }
+
       const errDetail = firstStructuredError || lastError;
       if (result.status !== "succeeded" && result.status !== "interrupted") {
         this.deps.log?.(`chat turn ${result.status} (${adapter.id}, ${messageId}): ${errDetail || `exit=${result.exitCode}`}`);
       }
+      const friendlyErr =
+        result.status === "timed_out"
+          ? `执行超过单轮耗时上限（${Math.round(chatTimeoutMs / 1000)}s），可点击下方「接着继续完成」延续上下文。`
+          : errDetail;
       const finalContent =
         result.status === "succeeded"
-          ? (result.output?.trim() || accumulated.trim() || "已完成处理。")
+          ? (autoResumed ? accumulated.trim() || result.output?.trim() : result.output?.trim() || accumulated.trim()) || "已完成处理。"
           : result.status === "interrupted"
             ? (accumulated.trim() || "（已停止生成）")
             : accumulated.trim()
-              ? `${accumulated.trim()}\n\n> 生成中断（${result.status}${errDetail ? `：${errDetail}` : ""}）`
-              : errDetail
-                ? `执行器 \`${adapter.id}\` 调用失败（${result.status}）：\n\n> ${errDetail}\n\n可在输入框左下角切换其他模型或执行器后重试。`
+              ? `${accumulated.trim()}\n\n> 生成中断（${result.status}${friendlyErr ? `：${friendlyErr}` : ""}）`
+              : friendlyErr
+                ? `执行器 \`${adapter.id}\` 调用失败（${result.status}）：\n\n> ${friendlyErr}\n\n可点击下方「重新执行」或切换其他模型或执行器后重试。`
                 : `执行器 \`${adapter.id}\` 返回异常状态：${result.status}`;
       const updated = this.deps.chatStore.update(messageId, {
         content: finalContent,

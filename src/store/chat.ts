@@ -161,6 +161,7 @@ export class ChatStore {
 export type ChatStreamFrame =
   | { event: "chat_message"; data: ChatMessage }
   | { event: "chat_delta"; data: { messageId: string; delta: string; content: string } }
+  | { event: "chat_step"; data: { messageId: string; type: string; summary: string; at: number } }
   | { event: "chat_done"; data: ChatMessage }
   | { event: "task_progress"; data: { taskId: string; runId: string; type: string; summary: string; at: number } };
 

@@ -8,6 +8,7 @@ import {
   subscribeRunStream,
   type ChatContextSummary,
   type ChatMessage,
+  type ChatStepFrame,
   type EfficiencyMetricsSnapshot,
   type ExecutorDescriptor,
   type ExecutorProviderCatalog,
@@ -64,6 +65,7 @@ export interface WorkbenchState {
   tasks: TaskSummary[];
   inbox: InboxItem[];
   liveProgress: Record<string, TaskProgressFrame>;
+  chatSteps: Record<string, ChatStepFrame[]>;
   policy: PolicySnapshot | null;
   executors: ExecutorDescriptor[];
   executorProviders: Record<string, ExecutorProviderCatalog>;
@@ -102,6 +104,7 @@ export function App(): React.JSX.Element {
     tasks: [],
     inbox: [],
     liveProgress: {},
+    chatSteps: {},
     policy: null,
     executors: [],
     executorProviders: {},
@@ -241,6 +244,18 @@ export function App(): React.JSX.Element {
             m.messageId === messageId ? { ...m, content, status: "streaming" } : m,
           ),
         }));
+      },
+      onStep: (step) => {
+        setState((previous) => {
+          const prev = previous.chatSteps[step.messageId] ?? [];
+          return {
+            ...previous,
+            chatSteps: {
+              ...previous.chatSteps,
+              [step.messageId]: [...prev, step].slice(-80),
+            },
+          };
+        });
       },
       onDone: (msg) => {
         setState((previous) => ({
@@ -732,6 +747,7 @@ export function App(): React.JSX.Element {
                   tasks={state.tasks}
                   inbox={state.inbox}
                   liveProgress={state.liveProgress}
+                  chatSteps={state.chatSteps}
                   scrollTrigger={sendScrollTrigger}
                   onQuickPrompt={handleQuickPrompt}
                   onOpenTask={(taskId) => void openTask(taskId)}

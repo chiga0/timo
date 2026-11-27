@@ -329,6 +329,14 @@ export function Composer(props: {
           <div className="compose-row">
             <textarea
               id="composer-input"
+              name="timo_chat_prompt"
+              autoComplete="off"
+              autoCorrect="off"
+              spellCheck={false}
+              data-1p-ignore="true"
+              data-lpignore="true"
+              data-bwignore="true"
+              data-form-type="other"
               value={text}
               placeholder={
                 mode === "repo_delivery"
@@ -573,6 +581,9 @@ export function Composer(props: {
                   <select
                     aria-label="工作区范围"
                     className="repo-select"
+                    autoComplete="off"
+                    data-1p-ignore="true"
+                    data-lpignore="true"
                     value={selectedFolderId}
                     onChange={(event) => {
                       if (event.target.value === "__add__") {
