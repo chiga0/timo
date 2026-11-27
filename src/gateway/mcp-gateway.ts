@@ -59,6 +59,8 @@ export interface CapabilityMcpGatewayOptions {
   port?: number;
   /** Real platform credentials held strictly inside the gateway process. */
   credentials?: Record<string, string | undefined>;
+  /** Dynamic credentials resolver (overrides static credentials on every tool call). */
+  credentialsProvider?: () => Record<string, string | undefined>;
   onError?: (error: unknown) => void;
 }
 
@@ -300,7 +302,7 @@ export class CapabilityMcpGateway {
           generation: scope.generation,
           nonce: scope.nonce,
           service: this.options.service,
-          credentials: this.credentials,
+          credentials: this.options.credentialsProvider ? this.options.credentialsProvider() : this.credentials,
         });
         return {
           isError: result.isError === true,

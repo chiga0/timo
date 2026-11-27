@@ -10,6 +10,9 @@ import {
 } from "../platform/adapter.js";
 import type { StepOutcome, VerificationContext, VerificationStep } from "../verify/pipeline.js";
 import { toIso } from "../util.js";
+import type { SettingsStore, WorkspaceFolderConfig } from "../settings.js";
+import type { WorkspaceManager } from "../workspace/manager.js";
+import { inspectLocalFolder } from "../workspace/inspect.js";
 
 export interface PlatformToolsDeps {
   store: TaskStore;
@@ -260,6 +263,84 @@ export function registerPlatformTools(gateway: CapabilityMcpGateway, deps: Platf
     },
     handler: async (args) => {
       return { data: { deployed: true, releaseId: String(args.releaseId ?? "") } };
+    },
+  });
+}
+
+/**
+ * Registers Timo-managed workspace & worktree MCP tools so agents can inspect
+ * directory rules, register required folders automatically, and inspect managed
+ * worktrees without touching raw user working copies.
+ */
+export function registerWorkspaceTools(
+  gateway: CapabilityMcpGateway,
+  deps: { settingsStore: SettingsStore; workspaces: WorkspaceManager },
+): void {
+  gateway.registerTool({
+    name: "timo_workspace_list",
+    description: "List all registered workspace folders and the user's directory & operation rules.",
+    requiredAction: "read_worktree",
+    inputSchema: { type: "object", properties: {} },
+    handler: async () => {
+      const settings = deps.settingsStore.load();
+      return {
+        data: {
+          workspaceRules: settings.workspaceRules ?? "",
+          folders: settings.folders ?? [],
+        },
+      };
+    },
+  });
+
+  gateway.registerTool({
+    name: "timo_workspace_register_folder",
+    description: "Inspect a local folder path and register it into Timo's managed workspace.",
+    requiredAction: "write_worktree",
+    inputSchema: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: "Absolute local directory path" },
+        description: { type: "string", description: "Optional note describing the folder's role" },
+      },
+      required: ["path"],
+    },
+    handler: async (args) => {
+      const rawPath = typeof args.path === "string" ? args.path.trim() : "";
+      if (!rawPath) return { isError: true, data: { code: "INVALID_INPUT", message: "path is required" } };
+      const inspected = inspectLocalFolder(rawPath);
+      if (!inspected.exists || !inspected.isDirectory) {
+        return { isError: true, data: { code: "NOT_FOUND", message: `folder does not exist: ${rawPath}` } };
+      }
+      const settings = deps.settingsStore.load();
+      const existing = settings.folders ?? [];
+      const already = existing.find((f) => f.path.replace(/\/+$/, "") === inspected.path);
+      if (already) {
+        return { data: { added: false, folder: already } };
+      }
+      const item: WorkspaceFolderConfig = {
+        id: inspected.name.toLowerCase().replace(/[^a-z0-9._-]+/g, "-") || `dir-${Date.now()}`,
+        name: inspected.name,
+        path: inspected.path,
+        kind: inspected.kind,
+        ...(inspected.baseRef ? { baseRef: inspected.baseRef } : {}),
+        ...(inspected.detectedCheckCommand ? { checkCommand: inspected.detectedCheckCommand } : {}),
+        ...(inspected.remoteHost ? { remoteHost: inspected.remoteHost } : {}),
+        ...(inspected.remoteRepo ? { remoteRepo: inspected.remoteRepo } : {}),
+        ...(typeof args.description === "string" && args.description.trim() ? { description: args.description.trim() } : {}),
+      };
+      const saved = deps.settingsStore.save({ ...settings, folders: [...existing, item] });
+      const stored = (saved.folders ?? []).find((f) => f.path === item.path) ?? item;
+      return { data: { added: true, folder: stored } };
+    },
+  });
+
+  gateway.registerTool({
+    name: "timo_worktree_list",
+    description: "List all Timo-managed isolated task worktrees currently on disk.",
+    requiredAction: "read_worktree",
+    inputSchema: { type: "object", properties: {} },
+    handler: async () => {
+      return { data: { worktrees: deps.workspaces.listWorkspaces() } };
     },
   });
 }

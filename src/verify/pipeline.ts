@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, lstatSync, mkdtempSync, readdirSync, rmSync, symlinkSync, unlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { verifyCandidate, SSE_VERIFIER_VERSION } from "../sse/contract.js";
@@ -287,6 +287,7 @@ async function verifyCommandCheck(
   const baseRoot = context.verifyTmpRoot ?? tmpdir();
   const isolatedRoot = mkdtempSync(join(baseRoot, "timo-verify-"));
   const checkedOut: Array<{ sourcePath: string; targetDir: string }> = [];
+  const linkedDeps: string[] = [];
   const boundCommits: Record<string, string> = {};
   const startedAt = Date.now();
 
@@ -296,6 +297,10 @@ async function verifyCommandCheck(
       const targetDir = targetRepos.length === 1 && !step.combo ? join(isolatedRoot, "repo") : join(isolatedRoot, repo.name);
       context.workspaces.materializeCleanCheckout(repo.sourcePath, repo.headSha, targetDir);
       checkedOut.push({ sourcePath: repo.sourcePath, targetDir });
+      // Link existing read-only dependency caches (node_modules) from the source
+      // checkout so `tsc` / `npm test` / `vitest` work in clean checkouts without
+      // mutating the source repo or polluting git status.
+      linkedDeps.push(...linkNodeModules(repo.sourcePath, targetDir));
       boundCommits[repo.name] = repo.headSha;
       if (targetRepos.length === 1 && !step.combo) runCwd = targetDir;
     }
@@ -360,11 +365,49 @@ async function verifyCommandCheck(
       findings: [{ code: "checkout_failed", detail: error instanceof Error ? error.message : String(error) }],
     };
   } finally {
+    for (const linkPath of linkedDeps) {
+      try {
+        if (lstatSync(linkPath).isSymbolicLink()) unlinkSync(linkPath);
+      } catch {
+        // already removed
+      }
+    }
     for (const item of checkedOut) {
       context.workspaces.cleanupCheckout(item.sourcePath, item.targetDir);
     }
     rmSync(isolatedRoot, { recursive: true, force: true });
   }
+}
+
+function linkNodeModules(sourceRoot: string, targetRoot: string): string[] {
+  const created: string[] = [];
+  const tryLink = (src: string, dst: string) => {
+    if (!existsSync(src) || existsSync(dst)) return;
+    try {
+      symlinkSync(src, dst, "dir");
+      created.push(dst);
+    } catch {
+      // ignore permission/symlink errors
+    }
+  };
+  tryLink(join(sourceRoot, "node_modules"), join(targetRoot, "node_modules"));
+  // Also link 1-level monorepo/sub-app node_modules (e.g. web/node_modules, packages/*/node_modules)
+  for (const container of [".", "packages", "apps"]) {
+    const srcParent = container === "." ? sourceRoot : join(sourceRoot, container);
+    const dstParent = container === "." ? targetRoot : join(targetRoot, container);
+    if (!existsSync(srcParent) || !existsSync(dstParent)) continue;
+    try {
+      for (const entry of readdirSync(srcParent, { withFileTypes: true })) {
+        if (!entry.isDirectory() || entry.name === "node_modules" || entry.name.startsWith(".")) continue;
+        const dstSub = join(dstParent, entry.name);
+        if (!existsSync(dstSub)) continue;
+        tryLink(join(srcParent, entry.name, "node_modules"), join(dstSub, "node_modules"));
+      }
+    } catch {
+      // ignore unreadable directories
+    }
+  }
+  return created;
 }
 
 async function verifyPlatformMr(

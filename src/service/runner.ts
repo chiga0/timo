@@ -24,6 +24,8 @@ import {
   type VerificationContext,
 } from "../verify/pipeline.js";
 import type { RepoDeliveryState } from "../config.js";
+import type { SettingsStore } from "../settings.js";
+import { assembleTaskContext, formatAssembledContext } from "../knowledge/context.js";
 
 const NON_RUNNABLE_WAIT_REASONS: ReadonlySet<string> = new Set([
   "needs_human_decision",
@@ -68,6 +70,8 @@ export interface RunnerOptions {
   ciPollIntervalMs?: number;
   /** Enables second-level Chief-of-Staff Watchdog triage on `watchdog_signal`. */
   enableWatchdogTriage?: boolean;
+  /** Optional user settings & knowledge base store (`TIMO_HOME/settings.json`). */
+  settingsStore?: SettingsStore;
   log: (line: string) => void;
 }
 
@@ -211,8 +215,8 @@ export class TaskRunner {
       this.unsubscribes.push(this.options.bus.on("task_stopping", wake));
       this.unsubscribes.push(
         this.options.bus.on("run_observed", (event) => {
-          const payload = event.payload as { authorization?: { approved?: boolean }; handoff?: unknown } | null;
-          if (payload?.authorization?.approved === true || payload?.handoff) wake();
+          const payload = event.payload as { authorization?: { approved?: boolean }; handoff?: unknown; retry?: unknown } | null;
+          if (payload?.authorization?.approved === true || payload?.handoff || payload?.retry) wake();
         }),
       );
       if (this.triage) {
@@ -228,13 +232,22 @@ export class TaskRunner {
     schedule(0);
   }
 
-  async stop(): Promise<void> {
+  async stop(timeoutMs = 3_000): Promise<void> {
     this.closed = true;
     for (const unsub of this.unsubscribes.splice(0)) unsub();
     if (this.timer) clearTimeout(this.timer);
     this.timer = null;
-    while (this.running || this.inflight.size > 0) {
-      await Promise.allSettled([...this.inflight]);
+    // Interrupt all active adapter child processes immediately so shutdown never blocks on long runs.
+    const liveTaskIds = [...this.liveRuns.keys()];
+    await Promise.allSettled(liveTaskIds.map((taskId) => this.interruptTask(taskId)));
+    const deadline = Date.now() + timeoutMs;
+    while ((this.running || this.inflight.size > 0) && Date.now() < deadline) {
+      const remaining = Math.max(10, deadline - Date.now());
+      await Promise.race([
+        Promise.allSettled([...this.inflight]),
+        new Promise((resolve) => setTimeout(resolve, Math.min(remaining, 100))),
+      ]);
+      if (this.inflight.size === 0 && !this.running) break;
       await new Promise((resolve) => setTimeout(resolve, 10));
     }
   }
@@ -884,6 +897,11 @@ export class TaskRunner {
       };
 
       let spawnResult;
+      const configuredModel = this.options.settingsStore?.load().assistant.executorModels[adapter.id];
+      const resolvedModel =
+        execution?.model && execution.model !== "pending" && execution.model !== "default"
+          ? execution.model
+          : configuredModel || undefined;
       try {
         spawnResult = await adapter.spawn(
           {
@@ -891,7 +909,7 @@ export class TaskRunner {
             runId,
             cwd,
             prompt: currentPrompt,
-            model: execution?.model && execution.model !== "pending" && execution.model !== "default" ? execution.model : undefined,
+            model: resolvedModel,
             timeoutMs: this.options.runDeadlineMs,
             mcpGatewayUrl,
           },
@@ -927,6 +945,12 @@ export class TaskRunner {
           reason: `executor_${spawnResult.status}`,
           detail: `executor ${adapter.id} ended with ${spawnResult.status} (exitCode=${spawnResult.exitCode ?? "null"})`,
         });
+        return;
+      }
+
+      // Zero-repo conversational / read-only assistant turn.
+      if (task.kind === "assistant_chat") {
+        service.completeAssistantChat(taskId, runId, spawnResult.output ?? "", generation);
         return;
       }
 
@@ -976,6 +1000,7 @@ export class TaskRunner {
         service.recordPipelineVerification(taskId, runId, outcome, {
           ciPollDelayMs: this.options.ciPollIntervalMs ?? 2_000,
           expectedGeneration: generation,
+          assistantText: spawnResult.output,
         });
         if (outcome.status === "waiting_external") {
           store.setOperationStatus(operation.operationId, "done", { waiting: "waiting_external_ci", runId }, now());
@@ -1054,6 +1079,18 @@ export class TaskRunner {
         logText: input ? new TextDecoder().decode(input) : "",
       });
     }
+    if (view.task.kind === "assistant_chat") {
+      const settingsBlock = this.options.settingsStore
+        ? formatAssembledContext(assembleTaskContext(this.options.settingsStore.load(), []))
+        : "";
+      return [
+        settingsBlock,
+        `User Request: ${view.brief.goal}`,
+        "Respond directly, concisely, and helpfully in the user's language. Do NOT modify any local repositories unless explicitly asked; you may use MCP workspace tools if the user asks to inspect or register folders.",
+      ]
+        .filter(Boolean)
+        .join("\n\n");
+    }
     const repoLines = (workspace?.repos ?? []).map(
       (repo) => `- ${repo.name}: path=${repo.worktreePath} branch=${repo.branch} baseRef=${repo.baseRef} baseSha=${repo.baseSha}`,
     );
@@ -1062,7 +1099,16 @@ export class TaskRunner {
     const capsuleBlock = capsule
       ? `[Handoff Capsule g${capsule.fromGeneration} -> g${capsule.toGeneration} (${capsule.fromExecutor} -> ${capsule.toExecutor})]\n${serializeHandoffCapsule(capsule)}`
       : "";
+    const settingsBlock = this.options.settingsStore
+      ? formatAssembledContext(
+          assembleTaskContext(
+            this.options.settingsStore.load(),
+            view.task.repos.map((r) => r.sourcePath),
+          ),
+        )
+      : "";
     return [
+      settingsBlock,
       `Task ${taskId} (Brief v${view.briefVersion}, Generation g${generation})`,
       `Goal: ${view.brief.goal}`,
       `Must:\n${view.brief.must.map((m) => `- ${m}`).join("\n")}`,
@@ -1152,11 +1198,12 @@ export class TaskRunner {
       return;
     }
     const now = toIso(new Date());
+    const gen = store.executionFor(taskId)?.generation ?? 1;
     this.options.writer.commit({
       taskId,
       type: "task_failed",
       payload: { reason: input.reason, detail: input.detail },
-      options: { idempotencyKey: `failed:${input.reason}`, now },
+      options: { idempotencyKey: `failed:g${gen}:${input.reason}`, now },
       project: () => {
         store.setFailure(taskId, input.detail, now);
         store.setStatus(taskId, "failed", null, now);

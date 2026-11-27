@@ -281,6 +281,36 @@ const MIGRATIONS: ReadonlyArray<{ id: string; sql: string }> = [
       CREATE UNIQUE INDEX IF NOT EXISTS operations_key_uniq ON operations (operation_key) WHERE operation_key IS NOT NULL;
     `,
   },
+  {
+    // Task management: allow user-defined title overrides and soft-archiving
+    // tasks out of the default active list.
+    id: "0008-task-management",
+    sql: `
+      ALTER TABLE tasks ADD COLUMN title_override TEXT;
+      ALTER TABLE tasks ADD COLUMN archived_at TEXT;
+      CREATE INDEX IF NOT EXISTS tasks_archived_idx ON tasks (archived_at, created_at DESC);
+    `,
+  },
+  {
+    // Main Chat persistence: global user <-> Timo conversation decoupled from
+    // background tasks, plus cleanup of non-actionable completed inbox items.
+    id: "0009-main-chat",
+    sql: `
+      CREATE TABLE chat_messages (
+        message_id TEXT PRIMARY KEY,
+        role TEXT NOT NULL,
+        content TEXT NOT NULL DEFAULT '',
+        task_id TEXT,
+        executor_id TEXT,
+        model TEXT,
+        status TEXT NOT NULL DEFAULT 'done',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS chat_messages_created ON chat_messages (created_at);
+      DELETE FROM inbox_items WHERE decision_key = 'delivery_verified';
+    `,
+  },
 ];
 
 export interface MigrationResult {

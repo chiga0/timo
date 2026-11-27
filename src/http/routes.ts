@@ -10,8 +10,14 @@ import type { TypedEventBus } from "../events/bus.js";
 import type { TaskEvent } from "../events/types.js";
 import type { ExecutorRegistry, RunStreamEvent } from "../adapters/execution.js";
 import type { RunStreamStore } from "../workspace/run-stream.js";
-import type { RepoRequest } from "../workspace/manager.js";
+import type { RepoRequest, WorkspaceManager } from "../workspace/manager.js";
 import type { VerificationPlan } from "../verify/pipeline.js";
+import type { SettingsStore } from "../settings.js";
+import { EnterpriseGitPlatformAdapter } from "../platform/adapter.js";
+import { discoverExecutorProviders, type ExecutorProviderCatalog } from "../adapters/providers.js";
+import { inspectLocalFolder, pickNativeFolder, probeLocalPlatformAuth, scanWorkspaceRoot, selectFoldersForRequest } from "../workspace/inspect.js";
+import type { ChatStore, ChatStreamBus, ChatStreamFrame } from "../store/chat.js";
+import type { MainChatRunner } from "../service/chat-runner.js";
 
 export interface ApiDeps {
   service: TaskService;
@@ -26,8 +32,20 @@ export interface ApiDeps {
   executors?: ExecutorRegistry;
   /** Live run stream store (Step 3.2). */
   runStreams?: RunStreamStore;
+  /** Workspace, assistant, knowledge & isolated credential settings store. */
+  settingsStore?: SettingsStore;
+  /** Autonomous multi-repo worktree manager for inspection & managed cleanup. */
+  workspaces?: WorkspaceManager;
+  /** Gateway token revocation hook when force-deleting an active task. */
+  mcpGateway?: { revoke(taskId: string, generation?: number): void };
+  /** Interrupts an in-flight run (used on force-delete). */
+  interruptActive?: (taskId: string) => Promise<void>;
   /** Live steering hook into the runner (Step 3.2). */
   steer?: (taskId: string, message: string) => Promise<{ accepted: boolean; runId: string | null; reason?: string }>;
+  /** Fixed Main Chat store, SSE bus, and runner. */
+  chatStore?: ChatStore;
+  chatBus?: ChatStreamBus;
+  chatRunner?: MainChatRunner;
   /** Operation reconciliation hook (Step 4.2). */
   reconcileOperation?: (operationId: string) => Promise<unknown>;
   /** Operator resolution for effect_unknown (Step 5.2). */
@@ -69,6 +87,222 @@ export function registerApi(router: Router, deps: ApiDeps): void {
     body: { executors: deps.executors?.snapshot() ?? [] },
   }));
 
+  let cachedProviders: { at: number; data: Record<string, ExecutorProviderCatalog> } | null = null;
+  router.add("GET", "/api/executors/providers", (context) => {
+    const force = context.query.get("refresh") === "1";
+    const now = Date.now();
+    if (force || !cachedProviders || now - cachedProviders.at > 60_000) {
+      cachedProviders = { at: now, data: discoverExecutorProviders() };
+    }
+    return { body: { providers: cachedProviders.data } };
+  });
+
+  // ---- Workspace Settings, Knowledge Base & Isolated Credentials ----
+
+  router.add("GET", "/api/settings", () => {
+    if (!deps.settingsStore) {
+      throw new RouteError(501, "unsupported", "settings store is not configured");
+    }
+    const settings = deps.settingsStore.load();
+    const inspectedFolders = Object.fromEntries(
+      (settings.folders ?? []).map((f) => [f.id, inspectLocalFolder(f.path)]),
+    );
+    return {
+      body: {
+        settings,
+        paths: deps.settingsStore.inspectPaths(settings),
+        folderMeta: inspectedFolders,
+        localAuth: probeLocalPlatformAuth(Object.values(inspectedFolders)),
+        credentials: deps.settingsStore.listCredentialStatuses(),
+      },
+    };
+  });
+
+  router.add("PUT", "/api/settings", (context) => {
+    if (!deps.settingsStore) {
+      throw new RouteError(501, "unsupported", "settings store is not configured");
+    }
+    const saved = deps.settingsStore.save(context.body);
+    const inspectedFolders = Object.fromEntries(
+      (saved.folders ?? []).map((f) => [f.id, inspectLocalFolder(f.path)]),
+    );
+    return {
+      body: {
+        settings: saved,
+        paths: deps.settingsStore.inspectPaths(saved),
+        folderMeta: inspectedFolders,
+        localAuth: probeLocalPlatformAuth(Object.values(inspectedFolders)),
+        credentials: deps.settingsStore.listCredentialStatuses(),
+      },
+    };
+  });
+
+  router.add("POST", "/api/fs/pick-folder", async () => {
+    const picked = await pickNativeFolder();
+    if (picked.cancelled || !picked.path) {
+      return { body: { cancelled: true, ...(picked.error ? { error: picked.error } : {}) } };
+    }
+    return { body: { cancelled: false, folder: inspectLocalFolder(picked.path) } };
+  });
+
+  router.add("POST", "/api/fs/inspect-folder", (context) => {
+    const body = asRecord(context.body);
+    const path = requireString(body.path, "path");
+    return { body: { folder: inspectLocalFolder(path) } };
+  });
+
+  router.add("POST", "/api/workspace/scan-root", async (context) => {
+    const body = asRecord(context.body);
+    let rootPath = optionalString(body.path);
+    if (!rootPath) {
+      const picked = await pickNativeFolder();
+      if (picked.cancelled || !picked.path) {
+        return { body: { cancelled: true, folders: [], ...(picked.error ? { error: picked.error } : {}) } };
+      }
+      rootPath = picked.path;
+    }
+    const discovered = scanWorkspaceRoot(rootPath, 2, 40);
+    return { body: { cancelled: false, rootPath, folders: discovered } };
+  });
+
+  router.add("GET", "/api/workspaces", () => {
+    if (!deps.workspaces) {
+      return { body: { worktrees: [] } };
+    }
+    const items = deps.workspaces.listWorkspaces().map((ws) => {
+      let taskStatus = "unknown";
+      let taskTitle = ws.taskId.slice(0, 8);
+      try {
+        const task = deps.service.getTask(ws.taskId);
+        taskStatus = task.status;
+        taskTitle = task.title ?? taskTitle;
+      } catch {
+        // orphaned worktree from a cleared DB
+      }
+      return { ...ws, taskStatus, taskTitle };
+    });
+    return { body: { worktrees: items } };
+  });
+
+  router.add("POST", "/api/workspaces/cleanup", (context) => {
+    if (!deps.workspaces) {
+      return { body: { removed: 0, skipped: 0, details: [] } };
+    }
+    const body = asRecord(context.body);
+    const force = body.force === true;
+    const targetTaskId = optionalString(body.taskId);
+    const targetGen = typeof body.generation === "number" ? body.generation : undefined;
+
+    if (targetTaskId) {
+      const gen = targetGen ?? 1;
+      try {
+        const res = deps.workspaces.teardown(targetTaskId, gen, { force });
+        return { body: { removed: res.removed ? 1 : 0, skipped: res.removed ? 0 : 1, details: [{ taskId: targetTaskId, generation: gen, ...res }] } };
+      } catch (error) {
+        throw new RouteError(409, "dirty_workspace", error instanceof Error ? error.message : String(error));
+      }
+    }
+
+    // Reclaim all worktrees belonging to terminal (or unknown/orphaned) tasks.
+    const terminalStatuses = new Set(["completed", "failed", "stopped", "unknown"]);
+    const all = deps.workspaces.listWorkspaces();
+    let removed = 0;
+    let skipped = 0;
+    const details: Array<{ taskId: string; generation: number; removed: boolean; reason?: string }> = [];
+    for (const ws of all) {
+      let status = "unknown";
+      try {
+        status = deps.service.getTask(ws.taskId).status;
+      } catch {
+        // orphaned
+      }
+      if (!terminalStatuses.has(status)) {
+        skipped += 1;
+        details.push({ taskId: ws.taskId, generation: ws.generation, removed: false, reason: `task_${status}` });
+        continue;
+      }
+      try {
+        const res = deps.workspaces.teardown(ws.taskId, ws.generation, { force });
+        if (res.removed) removed += 1;
+        else skipped += 1;
+        details.push({ taskId: ws.taskId, generation: ws.generation, ...res });
+      } catch (error) {
+        skipped += 1;
+        details.push({ taskId: ws.taskId, generation: ws.generation, removed: false, reason: error instanceof Error ? error.message : String(error) });
+      }
+    }
+    return { body: { removed, skipped, details } };
+  });
+
+  router.add("GET", "/api/credentials", () => {
+    if (!deps.settingsStore) {
+      throw new RouteError(501, "unsupported", "settings store is not configured");
+    }
+    return { body: { credentials: deps.settingsStore.listCredentialStatuses() } };
+  });
+
+  router.add("PUT", "/api/credentials", (context) => {
+    if (!deps.settingsStore) {
+      throw new RouteError(501, "unsupported", "settings store is not configured");
+    }
+    const body = asRecord(context.body);
+    const key = requireString(body.key, "key");
+    const value = typeof body.value === "string" ? body.value : "";
+    try {
+      const status = deps.settingsStore.setCredential(key, value);
+      return { body: { credential: status, credentials: deps.settingsStore.listCredentialStatuses() } };
+    } catch (error) {
+      throw new RouteError(400, "invalid_input", error instanceof Error ? error.message : String(error));
+    }
+  });
+
+  router.add("POST", "/api/connections/:id/test", async (context) => {
+    if (!deps.settingsStore) {
+      throw new RouteError(501, "unsupported", "settings store is not configured");
+    }
+    const settings = deps.settingsStore.load();
+    const conn = settings.connections.find((c) => c.id === context.params.id);
+    if (!conn) {
+      throw new RouteError(404, "not_found", `connection ${context.params.id} not found`);
+    }
+    const credentials = deps.settingsStore.resolveGatewayCredentials();
+    if (conn.kind === "enterprise_git" || conn.kind === "gitlab") {
+      const adapter = new EnterpriseGitPlatformAdapter({
+        baseUrl: conn.baseUrl,
+        apiPath: conn.apiPath,
+        authHeader: conn.authHeader,
+        credentialKey: conn.credentialKey,
+      });
+      const result = await adapter.testConnection(credentials);
+      return { body: { connectionId: conn.id, ...result } };
+    }
+    // Generic HTTP reachability check for GitHub / log / service endpoints.
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 8_000);
+    timer.unref?.();
+    try {
+      const res = await fetch(conn.baseUrl, { method: "HEAD", signal: controller.signal });
+      return {
+        body: {
+          connectionId: conn.id,
+          ok: res.status < 500,
+          status: res.status,
+          message: `端点可达（HTTP ${res.status}）`,
+        },
+      };
+    } catch (error) {
+      return {
+        body: {
+          connectionId: conn.id,
+          ok: false,
+          message: `连接失败：${error instanceof Error ? error.message : String(error)}`,
+        },
+      };
+    } finally {
+      clearTimeout(timer);
+    }
+  });
+
   router.add("GET", "/api/metrics", (context) => {
     const limit = parsePositiveInt(context.query.get("limit"), 200);
     return { body: deps.service.efficiencyMetrics(limit) };
@@ -82,25 +316,137 @@ export function registerApi(router: Router, deps: ApiDeps): void {
   router.add("GET", "/api/tasks", (context) => {
     const limit = parsePositiveInt(context.query.get("limit"), 200);
     const status = context.query.get("status") ?? undefined;
-    return { body: { tasks: deps.service.listTasks(limit, status) } };
+    const rawArchived = context.query.get("archived");
+    const archived = rawArchived === "all" || rawArchived === "only" || rawArchived === "exclude" ? rawArchived : "exclude";
+    const tasks = deps.service.listTasks(limit, status, { archived }).map((t) => {
+      const live = deps.runStreams?.latestProgress(t.taskId);
+      return live ? { ...t, liveSummary: live.summary, liveType: live.type, liveAt: live.at } : t;
+    });
+    return { body: { tasks } };
+  });
+
+  // ---- Fixed Main Chat (User <-> Timo) + Live SSE Stream ----
+
+  router.add("GET", "/api/chat", (context) => {
+    if (!deps.chatStore) return { body: { messages: [] } };
+    const limit = parsePositiveInt(context.query.get("limit"), 200);
+    return { body: { messages: deps.chatStore.list(limit) } };
+  });
+
+  router.add("POST", "/api/chat/send", (context) => {
+    if (!deps.chatRunner) {
+      throw new RouteError(501, "unsupported", "main chat runner is not configured");
+    }
+    const body = asRecord(context.body);
+    const text = requireString(body.text, "text");
+    const mode = body.mode === "sse_log" || body.mode === "repo_delivery" || body.mode === "auto" ? body.mode : "auto";
+    const result = withMappedErrors(() =>
+      deps.chatRunner!.send({
+        text,
+        mode,
+        executorId: optionalString(body.executorId),
+        model: optionalString(body.model),
+        sourcePath: optionalString(body.sourcePath),
+        baseRef: optionalString(body.baseRef),
+        checkCommand: optionalString(body.checkCommand),
+        maxRepairRounds: typeof body.maxRepairRounds === "number" ? body.maxRepairRounds : undefined,
+      }),
+    );
+    return { status: 201, body: result };
+  });
+
+  router.add("POST", "/api/chat/stop", async (context) => {
+    if (!deps.chatRunner) return { body: { stopped: 0 } };
+    const body = asRecord(context.body);
+    const result = await deps.chatRunner.stop(optionalString(body.messageId));
+    return { body: result };
+  });
+
+  router.add("DELETE", "/api/chat", async () => {
+    if (deps.chatRunner) await deps.chatRunner.stop();
+    deps.chatStore?.clear();
+    return { body: { cleared: true } };
+  });
+
+  router.add("GET", "/api/chat/stream", () => {
+    return {
+      stream: async (res, signal) => {
+        await streamChatFrames(deps.chatBus, res, signal, heartbeatMs);
+      },
+    };
   });
 
   router.add("POST", "/api/tasks", (context) => {
     const body = asRecord(context.body);
     const requestId = requireString(body.requestId, "requestId");
-    const kind = body.kind === "repo_delivery" || Array.isArray(body.repos) ? "repo_delivery" : "sse_log";
+    const kind =
+      body.kind === "assistant_chat"
+        ? "assistant_chat"
+        : body.kind === "repo_delivery" || Array.isArray(body.repos)
+          ? "repo_delivery"
+          : "sse_log";
+    if (kind === "assistant_chat") {
+      const userSettings = deps.settingsStore?.load();
+      const created = withMappedErrors(() =>
+        deps.service.createTask({
+          requestId,
+          kind: "assistant_chat",
+          requestText: typeof body.requestText === "string" ? body.requestText : undefined,
+          executorId: typeof body.executorId === "string" ? body.executorId : userSettings?.assistant.defaultExecutor,
+          model: typeof body.model === "string" ? body.model : undefined,
+        }),
+      );
+      return { status: 201, body: { taskId: created.taskId, status: created.status, reused: created.reused } };
+    }
     if (kind === "repo_delivery") {
-      const repos = Array.isArray(body.repos) ? (body.repos as RepoRequest[]) : [];
+      const userSettings = deps.settingsStore?.load();
+      const requestText = typeof body.requestText === "string" ? body.requestText : "";
+      let repos: RepoRequest[] = Array.isArray(body.repos) ? (body.repos as RepoRequest[]) : [];
+      let verificationPlan = body.verificationPlan as VerificationPlan | undefined;
+      if (repos.length === 0) {
+        const matched = selectFoldersForRequest(requestText, userSettings?.folders ?? []);
+        if (matched.length > 0) {
+          repos = matched.map((f) => {
+            const inspected = inspectLocalFolder(f.path);
+            return {
+              sourcePath: f.path,
+              baseRef: f.baseRef || inspected.baseRef || "main",
+              name: f.name,
+            };
+          });
+          if (!verificationPlan) {
+            const steps = matched
+              .map((f) => ({ repo: f.name, cmd: f.checkCommand || inspectLocalFolder(f.path).detectedCheckCommand }))
+              .filter((s): s is { repo: string; cmd: string } => Boolean(s.cmd))
+              .map((s) => ({ type: "command_check" as const, name: `verify-${s.repo}`, command: s.cmd, repo: s.repo }));
+            verificationPlan = { version: "auto-workspace-v1", steps };
+          }
+        } else {
+          // No specific repo was referenced or pinned: handle cleanly as an
+          // assistant conversation without creating unnecessary worktrees or running tests!
+          const created = withMappedErrors(() =>
+            deps.service.createTask({
+              requestId,
+              kind: "assistant_chat",
+              requestText: requestText || undefined,
+              executorId: typeof body.executorId === "string" ? body.executorId : userSettings?.assistant.defaultExecutor,
+              model: typeof body.model === "string" ? body.model : undefined,
+            }),
+          );
+          return { status: 201, body: { taskId: created.taskId, status: created.status, reused: created.reused } };
+        }
+      }
       const created = withMappedErrors(() =>
         deps.service.createTask({
           requestId,
           kind: "repo_delivery",
-          requestText: typeof body.requestText === "string" ? body.requestText : undefined,
-          executorId: typeof body.executorId === "string" ? body.executorId : undefined,
+          requestText: requestText || undefined,
+          executorId: typeof body.executorId === "string" ? body.executorId : userSettings?.assistant.defaultExecutor,
           model: typeof body.model === "string" ? body.model : undefined,
           repos,
-          verificationPlan: body.verificationPlan as VerificationPlan | undefined,
-          maxRepairRounds: typeof body.maxRepairRounds === "number" ? body.maxRepairRounds : undefined,
+          verificationPlan,
+          maxRepairRounds:
+            typeof body.maxRepairRounds === "number" ? body.maxRepairRounds : userSettings?.assistant.defaultMaxRepairRounds,
         }),
       );
       return { status: 201, body: { taskId: created.taskId, status: created.status, reused: created.reused } };
@@ -122,6 +468,43 @@ export function registerApi(router: Router, deps: ApiDeps): void {
   router.add("GET", "/api/tasks/:id", (context) => {
     const taskId = context.params.id!;
     return { body: withMappedErrors(() => deps.service.getTask(taskId)) };
+  });
+
+  router.add("PATCH", "/api/tasks/:id", (context) => {
+    const taskId = context.params.id!;
+    const body = asRecord(context.body);
+    const patch: { title?: string | null; archived?: boolean } = {};
+    if ("title" in body) {
+      if (body.title !== null && typeof body.title !== "string") {
+        throw new RouteError(400, "invalid_input", "title must be a string or null");
+      }
+      patch.title = body.title;
+    }
+    if ("archived" in body) {
+      if (typeof body.archived !== "boolean") {
+        throw new RouteError(400, "invalid_input", "archived must be a boolean");
+      }
+      patch.archived = body.archived;
+    }
+    return { body: withMappedErrors(() => deps.service.updateTask(taskId, patch)) };
+  });
+
+  router.add("DELETE", "/api/tasks/:id", async (context) => {
+    const taskId = context.params.id!;
+    const body = asRecord(context.body);
+    const force = context.query.get("force") === "1" || context.query.get("force") === "true" || body.force === true;
+    try {
+      const result = await deps.service.deleteTask(taskId, {
+        force,
+        workspaces: deps.workspaces,
+        runStreams: deps.runStreams,
+        mcpGateway: deps.mcpGateway,
+        interruptActive: deps.interruptActive,
+      });
+      return { body: result };
+    } catch (error) {
+      throw toRouteError(error);
+    }
   });
 
   router.add("GET", "/api/tasks/:id/events", (context) => {
@@ -178,11 +561,32 @@ export function registerApi(router: Router, deps: ApiDeps): void {
     return { status: 202, body: { taskId, status: result.status } };
   });
 
+  router.add("POST", "/api/tasks/:id/retry", (context) => {
+    const taskId = context.params.id!;
+    const body = asRecord(context.body);
+    const result = withMappedErrors(() =>
+      deps.service.retryTask(taskId, {
+        executorId: optionalString(body.executorId),
+        model: optionalString(body.model),
+      }),
+    );
+    return { status: 202, body: result };
+  });
+
   // ---- Step 2.1: standing policy, attention firewall, two-phase proposals ----
 
   router.add("GET", "/api/inbox", () => ({
     body: { items: deps.service.listInbox() },
   }));
+
+  router.add("POST", "/api/inbox/:taskId/:decisionKey/dismiss", (context) => {
+    const taskId = context.params.taskId!;
+    const rawKey = context.params.decisionKey!;
+    if (rawKey !== "decision_required" && rawKey !== "delivery_verified" && rawKey !== "task_blocked_final") {
+      throw new RouteError(400, "invalid_input", `unknown decisionKey: ${rawKey}`);
+    }
+    return { body: withMappedErrors(() => deps.service.dismissInboxItem(taskId, rawKey)) };
+  });
 
   router.add("GET", "/api/policy", () => ({
     body: withMappedErrors(() => deps.service.policySnapshot()),
@@ -350,6 +754,40 @@ export function registerApi(router: Router, deps: ApiDeps): void {
       throw toRouteError(error);
     }
   });
+}
+
+async function streamChatFrames(
+  chatBus: ChatStreamBus | undefined,
+  res: import("node:http").ServerResponse,
+  signal: AbortSignal,
+  heartbeatMs: number,
+): Promise<void> {
+  res.writeHead(200, SSE_HEADERS);
+  res.flushHeaders?.();
+  if (!chatBus) {
+    res.end();
+    return;
+  }
+  const write = (frame: ChatStreamFrame) => {
+    if (signal.aborted || res.writableEnded) return;
+    res.write(`event: ${frame.event}\ndata: ${JSON.stringify(frame.data)}\n\n`);
+  };
+  const unsubscribe = chatBus.subscribe(write);
+  const heartbeat = setInterval(() => {
+    if (signal.aborted || res.writableEnded) return;
+    res.write(`: heartbeat ${Date.now()}\n\n`);
+  }, heartbeatMs);
+  heartbeat.unref?.();
+  try {
+    await new Promise<void>((resolve) => {
+      signal.addEventListener("abort", () => resolve(), { once: true });
+      res.on("close", () => resolve());
+    });
+  } finally {
+    clearInterval(heartbeat);
+    unsubscribe();
+    if (!res.writableEnded) res.end();
+  }
 }
 
 async function streamRunEvents(

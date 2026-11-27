@@ -331,3 +331,270 @@ export class GhPlatformAdapter implements PlatformAdapter {
     return { repo: input.repo, mrId: input.mrId, headSha: parsed.headRefOid, status: overall, checks };
   }
 }
+
+export interface EnterpriseGitOptions {
+  baseUrl: string;
+  /** REST API path prefix, e.g. `/api/v4` or `/api/v3` (default `/api/v4`). */
+  apiPath?: string;
+  /** Header carrying the private token, e.g. `PRIVATE-TOKEN` or `Authorization`. */
+  authHeader?: string;
+  /** Logical key inside `credentials`, e.g. `ENTERPRISE_GIT_TOKEN`. */
+  credentialKey?: string;
+  timeoutMs?: number;
+  fetchImpl?: typeof fetch;
+}
+
+/**
+ * Generic Enterprise Git / GitLab-compatible REST platform adapter (works with
+ * self-hosted GitLab and internal enterprise Git platforms speaking standard
+ * Git protocol + v3/v4 REST APIs). Credentials remain strictly inside the
+ * gateway process and are never leaked to Worker subprocesses.
+ */
+export class EnterpriseGitPlatformAdapter implements PlatformAdapter {
+  private readonly baseUrl: string;
+  private readonly apiPath: string;
+  private readonly authHeader: string;
+  private readonly credentialKey: string;
+  private readonly timeoutMs: number;
+  private readonly fetchImpl: typeof fetch;
+
+  constructor(options: EnterpriseGitOptions) {
+    this.baseUrl = options.baseUrl.replace(/\/+$/, "");
+    this.apiPath = (options.apiPath ?? "/api/v4").replace(/\/+$/, "");
+    this.authHeader = options.authHeader ?? "PRIVATE-TOKEN";
+    this.credentialKey = options.credentialKey ?? "ENTERPRISE_GIT_TOKEN";
+    this.timeoutMs = options.timeoutMs ?? 20_000;
+    this.fetchImpl = options.fetchImpl ?? fetch;
+  }
+
+  private headersFor(credentials?: Record<string, string | undefined>): Record<string, string> {
+    const token =
+      credentials?.[this.credentialKey] ??
+      credentials?.ENTERPRISE_GIT_TOKEN ??
+      credentials?.GITLAB_TOKEN;
+    const headers: Record<string, string> = {
+      accept: "application/json",
+      "content-type": "application/json",
+    };
+    if (token) {
+      headers[this.authHeader] =
+        this.authHeader.toLowerCase() === "authorization" && !/^Bearer\s+/i.test(token) ? `Bearer ${token}` : token;
+    }
+    return headers;
+  }
+
+  private async requestJson<T>(
+    method: string,
+    path: string,
+    credentials?: Record<string, string | undefined>,
+    body?: unknown,
+    treatTimeoutAsUnknown = false,
+  ): Promise<T> {
+    const url = `${this.baseUrl}${this.apiPath}${path}`;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), this.timeoutMs);
+    timer.unref?.();
+    try {
+      const response = await this.fetchImpl(url, {
+        method,
+        headers: this.headersFor(credentials),
+        body: body === undefined ? undefined : JSON.stringify(body),
+        signal: controller.signal,
+      });
+      const text = await response.text();
+      if (!response.ok) {
+        throw new PlatformRejectedError(
+          `enterprise_git_${response.status}`,
+          `${method} ${path} failed (${response.status}): ${text.slice(0, 240)}`,
+        );
+      }
+      return (text === "" ? {} : JSON.parse(text)) as T;
+    } catch (error) {
+      if (error instanceof PlatformRejectedError || error instanceof PlatformEffectUnknownError) throw error;
+      const message = error instanceof Error ? error.message : String(error);
+      if (treatTimeoutAsUnknown || /abort|ETIMEDOUT|ECONNRESET|socket hang up|timed out|fetch failed/i.test(message)) {
+        throw new PlatformEffectUnknownError(message);
+      }
+      throw new PlatformRejectedError("enterprise_git_network", message);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  async readLogs(): Promise<LogQueryResult> {
+    throw new PlatformRejectedError("unsupported", "enterprise git adapter does not provide application log reads");
+  }
+
+  async createOrUpdateMr(input: CreateMrInput, credentials?: Record<string, string | undefined>): Promise<MrReceipt> {
+    const existing = await this.findMrByOperationKey(input.repo, input.clientRequestId, credentials);
+    if (existing) {
+      return { ...existing, headSha: input.headSha };
+    }
+    const encoded = encodeURIComponent(input.repo);
+    const marker = `<!-- timo-op:${input.clientRequestId} -->`;
+    const created = await this.requestJson<{
+      iid?: number;
+      id?: number;
+      web_url?: string;
+      source_branch?: string;
+      target_branch?: string;
+      sha?: string;
+    }>(
+      "POST",
+      `/projects/${encoded}/merge_requests`,
+      credentials,
+      {
+        source_branch: input.branch,
+        target_branch: input.baseRef,
+        title: input.title,
+        description: `${input.body}\n\n${marker}`,
+      },
+      true,
+    );
+    const mrId = String(created.iid ?? created.id ?? "");
+    return {
+      mrId: mrId || input.branch,
+      repo: input.repo,
+      url: created.web_url ?? `${this.baseUrl}/${input.repo}/merge_requests/${mrId}`,
+      branch: created.source_branch ?? input.branch,
+      baseRef: created.target_branch ?? input.baseRef,
+      headSha: created.sha ?? input.headSha,
+      clientRequestId: input.clientRequestId,
+    };
+  }
+
+  async findMrByOperationKey(
+    repo: string,
+    clientRequestId: string,
+    credentials?: Record<string, string | undefined>,
+  ): Promise<MrReceipt | null> {
+    const encoded = encodeURIComponent(repo);
+    const marker = `timo-op:${clientRequestId}`;
+    try {
+      const list = await this.requestJson<
+        Array<{ iid?: number; id?: number; web_url?: string; source_branch?: string; target_branch?: string; sha?: string; description?: string }>
+      >("GET", `/projects/${encoded}/merge_requests?state=opened&search=${encodeURIComponent(marker)}`, credentials);
+      const match = (Array.isArray(list) ? list : []).find((mr) => (mr.description ?? "").includes(marker));
+      if (!match) return null;
+      const mrId = String(match.iid ?? match.id ?? "");
+      return {
+        mrId,
+        repo,
+        url: match.web_url ?? `${this.baseUrl}/${repo}/merge_requests/${mrId}`,
+        branch: match.source_branch ?? "",
+        baseRef: match.target_branch ?? "",
+        headSha: match.sha ?? "",
+        clientRequestId,
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  async getCiStatus(
+    input: { repo: string; mrId: string; expectedHeadSha: string },
+    credentials?: Record<string, string | undefined>,
+  ): Promise<CiStatusResult> {
+    const encoded = encodeURIComponent(input.repo);
+    const mr = await this.requestJson<{
+      sha?: string;
+      head_pipeline?: { status?: string };
+      pipeline?: { status?: string };
+    }>("GET", `/projects/${encoded}/merge_requests/${encodeURIComponent(input.mrId)}`, credentials);
+    const headSha = mr.sha || input.expectedHeadSha;
+    let statuses: Array<{ name?: string; status?: string }> = [];
+    try {
+      const rawStatuses = await this.requestJson<Array<{ name?: string; status?: string }>>(
+        "GET",
+        `/projects/${encoded}/repository/commits/${encodeURIComponent(headSha)}/statuses`,
+        credentials,
+      );
+      if (Array.isArray(rawStatuses)) statuses = rawStatuses;
+    } catch {
+      // Some enterprise Git instances only expose pipeline status on the MR object.
+    }
+
+    const mapStatus = (raw?: string): CiCheck["status"] => {
+      const s = (raw ?? "").toLowerCase();
+      if (s === "success" || s === "passed" || s === "skipped") return "passed";
+      if (s === "failed" || s === "canceled" || s === "cancelled") return "failed";
+      if (s === "running") return "in_progress";
+      return "queued";
+    };
+
+    const checks: CiCheck[] =
+      statuses.length > 0
+        ? statuses.map((item) => ({ name: item.name ?? "ci", status: mapStatus(item.status) }))
+        : mr.head_pipeline?.status || mr.pipeline?.status
+          ? [{ name: "pipeline", status: mapStatus(mr.head_pipeline?.status ?? mr.pipeline?.status) }]
+          : [];
+
+    const overall: CiStatusResult["status"] = checks.some((c) => c.status === "failed")
+      ? "failed"
+      : checks.length > 0 && checks.every((c) => c.status === "passed")
+        ? "passed"
+        : "pending";
+    return { repo: input.repo, mrId: input.mrId, headSha, status: overall, checks };
+  }
+
+  /** Lightweight connectivity probe for the Settings UI (never returns secrets). */
+  async testConnection(credentials?: Record<string, string | undefined>): Promise<{ ok: boolean; status?: number; message: string }> {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), Math.min(this.timeoutMs, 8_000));
+    timer.unref?.();
+    try {
+      const probeUrl = `${this.baseUrl}${this.apiPath}/user`;
+      const res = await this.fetchImpl(probeUrl, { method: "GET", headers: this.headersFor(credentials), signal: controller.signal });
+      if (res.ok) return { ok: true, status: res.status, message: `连接正常（HTTP ${res.status}）` };
+      if (res.status === 401 || res.status === 403) {
+        return { ok: false, status: res.status, message: `可达但认证失败（HTTP ${res.status}），请检查凭证 ${this.credentialKey}` };
+      }
+      // Fallback: check root URL reachability for platforms with custom API paths.
+      const rootRes = await this.fetchImpl(this.baseUrl, { method: "HEAD", signal: controller.signal });
+      return {
+        ok: rootRes.status < 500,
+        status: rootRes.status,
+        message: `主机可达（HTTP ${rootRes.status}），API ${this.apiPath}/user 返回 ${res.status}`,
+      };
+    } catch (error) {
+      return { ok: false, message: `连接失败：${error instanceof Error ? error.message : String(error)}` };
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+}
+
+/**
+ * Dynamic platform router that selects the matching `EnterpriseGitPlatformAdapter`
+ * or `GhPlatformAdapter` per repository according to live `TimoUserSettings`.
+ */
+export class DynamicPlatformAdapter implements PlatformAdapter {
+  private readonly github = new GhPlatformAdapter();
+
+  constructor(
+    private readonly resolvePlatformForRepo: (repo: string) => PlatformAdapter | null,
+  ) {}
+
+  private pick(repo: string): PlatformAdapter {
+    return this.resolvePlatformForRepo(repo) ?? this.github;
+  }
+
+  readLogs(_query: LogQuery, _credentials?: Record<string, string | undefined>): Promise<LogQueryResult> {
+    return this.github.readLogs();
+  }
+
+  createOrUpdateMr(input: CreateMrInput, credentials?: Record<string, string | undefined>): Promise<MrReceipt> {
+    return this.pick(input.repo).createOrUpdateMr(input, credentials);
+  }
+
+  findMrByOperationKey(repo: string, clientRequestId: string, credentials?: Record<string, string | undefined>): Promise<MrReceipt | null> {
+    return this.pick(repo).findMrByOperationKey(repo, clientRequestId, credentials);
+  }
+
+  getCiStatus(
+    input: { repo: string; mrId: string; expectedHeadSha: string },
+    credentials?: Record<string, string | undefined>,
+  ): Promise<CiStatusResult> {
+    return this.pick(input.repo).getCiStatus(input, credentials);
+  }
+}

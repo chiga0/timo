@@ -1,0 +1,344 @@
+import { mkdirSync } from "node:fs";
+import { join } from "node:path";
+import type { ExecutorRegistry, RunStreamEvent } from "../adapters/execution.js";
+import type { SettingsStore } from "../settings.js";
+import type { ChatMessage, ChatStore, ChatStreamBus } from "../store/chat.js";
+import type { TaskService } from "./task-service.js";
+import type { VerificationPlan } from "../verify/pipeline.js";
+import { inspectLocalFolder, selectFoldersForRequest } from "../workspace/inspect.js";
+import { newId, toIso } from "../util.js";
+
+export interface SendChatInput {
+  text: string;
+  executorId?: string;
+  model?: string;
+  mode?: "auto" | "repo_delivery" | "sse_log";
+  sourcePath?: string;
+  baseRef?: string;
+  checkCommand?: string;
+  maxRepairRounds?: number;
+}
+
+export type SendChatResult =
+  | { kind: "chat"; userMessage: ChatMessage; assistantMessage: ChatMessage }
+  | { kind: "task"; userMessage: ChatMessage; taskCardMessage: ChatMessage; taskId: string };
+
+/**
+ * Orchestrates the fixed global Main Chat (`User <-> Timo Chief of Staff`).
+ *
+ * - Conversational questions, brainstorming, and status queries stream directly
+ *   via a native `ExecutionAdapter` (never building a custom Agent Loop and
+ *   never creating junk rows in `tasks`).
+ * - Engineering requests that explicitly target a workspace repository (or
+ *   log diagnosis) delegate a background `Task` via `TaskService` and insert a
+ *   single live-updating `task_card` into Main Chat.
+ */
+export class MainChatRunner {
+  private readonly activeTurns = new Map<string, { executorId: string; runId: string }>();
+
+  constructor(
+    private readonly deps: {
+      home: string;
+      chatStore: ChatStore;
+      chatBus: ChatStreamBus;
+      service: TaskService;
+      executors?: ExecutorRegistry;
+      settingsStore?: SettingsStore;
+      log?: (line: string) => void;
+    },
+  ) {}
+
+  send(input: SendChatInput): SendChatResult {
+    const text = input.text.trim();
+    if (!text) throw new Error("message text is required");
+
+    const settings = this.deps.settingsStore?.load();
+    const chosenExecutor = input.executorId?.trim() || settings?.assistant.defaultExecutor || "qwen-code";
+    const chosenModel = input.model?.trim() || settings?.assistant.executorModels[chosenExecutor] || undefined;
+
+    const userMessage = this.deps.chatStore.append({
+      role: "user",
+      content: text,
+      executorId: chosenExecutor,
+      model: chosenModel ?? null,
+      status: "done",
+    });
+    this.deps.chatBus.publish({ event: "chat_message", data: userMessage });
+
+    // Decide cleanly: delegate background Task OR reply directly in Main Chat.
+    if (input.mode === "sse_log") {
+      const created = this.deps.service.createTask({
+        requestId: `chat-log-${newId()}`,
+        kind: "sse_log",
+        log: new TextEncoder().encode(text),
+        requestText: text,
+        executorId: chosenExecutor,
+      });
+      const taskCardMessage = this.deps.chatStore.append({
+        role: "task_card",
+        content: text,
+        taskId: created.taskId,
+        executorId: chosenExecutor,
+        model: chosenModel ?? null,
+        status: "done",
+      });
+      this.deps.chatBus.publish({ event: "chat_message", data: taskCardMessage });
+      return { kind: "task", userMessage, taskCardMessage, taskId: created.taskId };
+    }
+
+    const explicitSource = input.sourcePath?.trim() ?? "";
+    const matchedFolders = explicitSource ? [] : selectFoldersForRequest(text, settings?.folders ?? []);
+    if (explicitSource || matchedFolders.length > 0) {
+      const repos = explicitSource
+        ? [
+            {
+              sourcePath: explicitSource,
+              baseRef: input.baseRef?.trim() || inspectLocalFolder(explicitSource).baseRef || "main",
+              name: explicitSource.replace(/\/+$/, "").split("/").at(-1) || "repo",
+            },
+          ]
+        : matchedFolders.map((f) => {
+            const inspected = inspectLocalFolder(f.path);
+            return {
+              sourcePath: f.path,
+              baseRef: f.baseRef || inspected.baseRef || "main",
+              name: f.name,
+            };
+          });
+
+      const checkCmd = input.checkCommand?.trim() ?? "";
+      let verificationPlan: VerificationPlan;
+      if (checkCmd) {
+        verificationPlan = {
+          version: "web-check-v1",
+          steps: [{ type: "command_check", name: "verify", command: checkCmd, ...(repos.length === 1 ? { repo: repos[0]!.name } : {}) }],
+        };
+      } else if (explicitSource) {
+        const detected = inspectLocalFolder(explicitSource).detectedCheckCommand;
+        verificationPlan = {
+          version: "auto-workspace-v1",
+          steps: detected ? [{ type: "command_check", name: `verify-${repos[0]!.name}`, command: detected, repo: repos[0]!.name }] : [],
+        };
+      } else {
+        const steps = matchedFolders
+          .map((f) => ({ repo: f.name, cmd: f.checkCommand || inspectLocalFolder(f.path).detectedCheckCommand }))
+          .filter((s): s is { repo: string; cmd: string } => Boolean(s.cmd))
+          .map((s) => ({ type: "command_check" as const, name: `verify-${s.repo}`, command: s.cmd, repo: s.repo }));
+        verificationPlan = { version: "auto-workspace-v1", steps };
+      }
+
+      const created = this.deps.service.createTask({
+        requestId: `chat-task-${newId()}`,
+        kind: "repo_delivery",
+        requestText: text,
+        executorId: chosenExecutor,
+        model: chosenModel,
+        repos,
+        verificationPlan,
+        maxRepairRounds: input.maxRepairRounds ?? settings?.assistant.defaultMaxRepairRounds ?? 2,
+      });
+      const taskCardMessage = this.deps.chatStore.append({
+        role: "task_card",
+        content: text,
+        taskId: created.taskId,
+        executorId: chosenExecutor,
+        model: chosenModel ?? null,
+        status: "done",
+      });
+      this.deps.chatBus.publish({ event: "chat_message", data: taskCardMessage });
+      return { kind: "task", userMessage, taskCardMessage, taskId: created.taskId };
+    }
+
+    // Conversational / Chief-of-Staff direct streaming reply (ZERO tasks created!).
+    const assistantMessage = this.deps.chatStore.append({
+      role: "assistant",
+      content: "",
+      executorId: chosenExecutor,
+      model: chosenModel ?? null,
+      status: "streaming",
+    });
+    this.deps.chatBus.publish({ event: "chat_message", data: assistantMessage });
+    void this.runStreamingTurn(assistantMessage.messageId, text, chosenExecutor, chosenModel);
+    return { kind: "chat", userMessage, assistantMessage };
+  }
+
+  async stop(messageId?: string): Promise<{ stopped: number }> {
+    const targets = messageId
+      ? [...this.activeTurns.entries()].filter(([id]) => id === messageId)
+      : [...this.activeTurns.entries()];
+    let stopped = 0;
+    for (const [id, turn] of targets) {
+      try {
+        if (this.deps.executors?.has(turn.executorId)) {
+          await this.deps.executors.require(turn.executorId).interrupt(turn.runId);
+          stopped += 1;
+        }
+      } catch {
+        // ignore interrupt errors
+      }
+      const existing = this.deps.chatStore.get(id);
+      if (existing && existing.status === "streaming") {
+        const updated = this.deps.chatStore.update(id, {
+          content: existing.content || "（已停止生成）",
+          status: "done",
+          now: toIso(new Date()),
+        });
+        if (updated) this.deps.chatBus.publish({ event: "chat_done", data: updated });
+      }
+      this.activeTurns.delete(id);
+    }
+    return { stopped };
+  }
+
+  private async runStreamingTurn(messageId: string, userText: string, executorId: string, model?: string): Promise<void> {
+    if (!this.deps.executors || !this.deps.executors.has(executorId)) {
+      const updated = this.deps.chatStore.update(messageId, {
+        content: `执行器 \`${executorId}\` 不可用，请在设置中检查代理状态或切换其他代理。`,
+        status: "error",
+      });
+      if (updated) this.deps.chatBus.publish({ event: "chat_done", data: updated });
+      return;
+    }
+
+    let adapter;
+    try {
+      adapter = this.deps.executors.require(executorId);
+    } catch (error) {
+      const updated = this.deps.chatStore.update(messageId, {
+        content: `执行器 \`${executorId}\` 未就绪：${error instanceof Error ? error.message : String(error)}`,
+        status: "error",
+      });
+      if (updated) this.deps.chatBus.publish({ event: "chat_done", data: updated });
+      return;
+    }
+
+    const runId = `chat-${messageId.slice(0, 8)}-${newId().slice(0, 6)}`;
+    const chatCwd = join(this.deps.home, "chat-cwd");
+    mkdirSync(chatCwd, { recursive: true, mode: 0o700 });
+    const prompt = this.buildChatPrompt(userText, messageId);
+
+    this.activeTurns.set(messageId, { executorId: adapter.id, runId });
+    let accumulated = "";
+    let lastPersistAt = 0;
+
+    const handleEvent = (event: RunStreamEvent) => {
+      if (!this.activeTurns.has(messageId)) return;
+      if (event.type === "text_delta" && event.summary.length > 0) {
+        accumulated += event.summary;
+        this.deps.chatBus.publish({
+          event: "chat_delta",
+          data: { messageId, delta: event.summary, content: accumulated },
+        });
+        const nowMs = Date.now();
+        if (nowMs - lastPersistAt > 600) {
+          lastPersistAt = nowMs;
+          this.deps.chatStore.update(messageId, { content: accumulated, status: "streaming" });
+        }
+      } else if (event.type === "thinking" && accumulated === "" && event.summary.trim() !== "") {
+        // Fallback for adapters that emit full assistant text only on message completion
+        // (e.g. codex/opencode without token-level deltas).
+        const data = event.data as { fullText?: string } | undefined;
+        if (data?.fullText) {
+          const delta = data.fullText.slice(accumulated.length);
+          if (delta) {
+            accumulated = data.fullText;
+            this.deps.chatBus.publish({
+              event: "chat_delta",
+              data: { messageId, delta, content: accumulated },
+            });
+          }
+        }
+      }
+    };
+
+    try {
+      const result = await adapter.spawn(
+        {
+          taskId: `chat:${messageId}`,
+          runId,
+          cwd: chatCwd,
+          prompt,
+          model,
+          timeoutMs: 120_000,
+        },
+        handleEvent,
+      );
+      if (!this.activeTurns.has(messageId)) return;
+      const finalContent =
+        result.status === "succeeded"
+          ? (result.output?.trim() || accumulated.trim() || "已完成处理。")
+          : result.status === "interrupted"
+            ? (accumulated.trim() || "（已停止生成）")
+            : accumulated.trim()
+              ? `${accumulated.trim()}\n\n> 生成中断（${result.status}）`
+              : `执行器 \`${adapter.id}\` 返回异常状态：${result.status}`;
+      const updated = this.deps.chatStore.update(messageId, {
+        content: finalContent,
+        status: result.status === "succeeded" || result.status === "interrupted" ? "done" : "error",
+      });
+      if (updated) this.deps.chatBus.publish({ event: "chat_done", data: updated });
+    } catch (error) {
+      this.deps.log?.(`chat turn error (${messageId}): ${error instanceof Error ? error.message : String(error)}`);
+      const updated = this.deps.chatStore.update(messageId, {
+        content: accumulated.trim() || `调用 \`${adapter.id}\` 失败：${error instanceof Error ? error.message : String(error)}`,
+        status: "error",
+      });
+      if (updated) this.deps.chatBus.publish({ event: "chat_done", data: updated });
+    } finally {
+      this.activeTurns.delete(messageId);
+    }
+  }
+
+  private buildChatPrompt(userText: string, currentAssistantMsgId: string): string {
+    const settings = this.deps.settingsStore?.load();
+    const sections: string[] = [
+      "你是 Timo（提莫），用户的本地个人研发总助理（Chief of Staff）。",
+      "当前处于「主对话」会话中：请用简洁、清晰的中文 Markdown 直接回答用户问题；不要擅自修改代码仓库或运行破坏性命令。",
+      "当用户明确提到某个工作区仓库需要开发、修改或修复代码时，系统会自动为其创建后台独立 Worktree 交付任务；否则你只需直接给出高质量回答或建议。",
+    ];
+
+    if (settings?.assistant.systemPrompt?.trim()) {
+      sections.push(`## 用户全局偏好\n${settings.assistant.systemPrompt.trim()}`);
+    }
+    if (settings?.workspaceRules?.trim()) {
+      sections.push(`## 工作区规则\n${settings.workspaceRules.trim()}`);
+    }
+
+    const folders = settings?.folders ?? [];
+    if (folders.length > 0) {
+      sections.push(
+        `## 已配置工作区目录（${folders.length} 个）\n` +
+          folders.map((f) => `- ${f.name} (${f.kind === "docs" ? "文档/资料" : `Git · ${f.baseRef || "main"}`}): ${f.path}`).join("\n"),
+      );
+    }
+
+    const activeTasks = this.deps.service.listTasks(15, undefined, { archived: "exclude" });
+    const inbox = this.deps.service.listInbox();
+    if (activeTasks.length > 0 || inbox.length > 0) {
+      const taskLines = activeTasks.slice(0, 8).map((t) => `- [${t.status}] ${t.title}${t.repoNames.length > 0 ? ` (${t.repoNames.join(", ")})` : ""}`);
+      const inboxLines = inbox.slice(0, 5).map((i) => `- [${i.decisionKey}] ${i.title}: ${i.summary}`);
+      sections.push(
+        `## 当前后台任务与待处理概览\n` +
+          (inboxLines.length > 0 ? `待我处理（${inbox.length}）：\n${inboxLines.join("\n")}\n` : "待我处理：0\n") +
+          (taskLines.length > 0 ? `近期任务：\n${taskLines.join("\n")}` : "暂无后台任务"),
+      );
+    }
+
+    // Recent multi-turn Main Chat memory (last 8 messages before the current turn).
+    const history = this.deps.chatStore
+      .list(24)
+      .filter((m) => m.messageId !== currentAssistantMsgId && m.role !== "task_card" && m.content.trim() !== "")
+      .slice(-9, -1);
+    if (history.length > 0) {
+      sections.push(
+        "## 最近主对话上下文\n" +
+          history
+            .map((m) => `${m.role === "user" ? "用户" : "Timo"}: ${m.content.slice(0, 400)}`)
+            .join("\n"),
+      );
+    }
+
+    sections.push(`## 用户最新消息\n${userText}`);
+    return sections.join("\n\n");
+  }
+}

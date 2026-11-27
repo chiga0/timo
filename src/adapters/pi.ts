@@ -102,7 +102,8 @@ export class PiAdapter implements ExecutionAdapter {
     let seq = 0;
     const emit = (type: RunStreamEventType, summary: string, data?: unknown) => {
       seq += 1;
-      onEvent({ seq, runId: request.runId, taskId: request.taskId, type, at: Date.now(), summary: this.clip(summary), data });
+      const normalized = type === "text_delta" ? summary : this.clip(summary);
+      onEvent({ seq, runId: request.runId, taskId: request.taskId, type, at: Date.now(), summary: normalized, data });
     };
     emit("status", "executor started");
 
@@ -210,7 +211,14 @@ export class PiAdapter implements ExecutionAdapter {
     }
     if (type === "agent_start") return { events: [{ type: "status", summary: "agent started" }] };
     if (type === "agent_settled") return { events: [{ type: "status", summary: "agent settled" }] };
-    if (type === "message_update" || type === "agent_end" || type === "turn_end" || type === "turn_start") return null;
+    if (type === "message_update") {
+      const sub = record.assistantMessageEvent as Record<string, unknown> | undefined;
+      if (sub?.type === "text_delta" && typeof sub.delta === "string" && sub.delta.length > 0) {
+        return { events: [{ type: "text_delta", summary: sub.delta, data: { delta: sub.delta } }] };
+      }
+      return null;
+    }
+    if (type === "agent_end" || type === "turn_end" || type === "turn_start") return null;
     if (type === "message" || type === "message_end") {
       const message = record.message as Record<string, unknown> | undefined;
       const role = typeof message?.role === "string" ? message.role : "assistant";

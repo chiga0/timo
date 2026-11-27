@@ -19,7 +19,7 @@ export interface ServiceConfig {
 /** Re-exported so the service config and the adapter share one config type. */
 export type T3RuntimeConfig = T3Config;
 
-export type TaskKind = "sse_log" | "repo_delivery";
+export type TaskKind = "sse_log" | "repo_delivery" | "assistant_chat";
 
 export interface CreateTaskRequest {
   requestId: string;
@@ -66,6 +66,12 @@ export interface RepoDeliveryState {
 
 export interface GetTaskResponse {
   taskId: string;
+  /** Short human-readable title derived from the task's requestText / brief goal or user override. */
+  title?: string;
+  /** ISO timestamp when the task was archived, or null if active. */
+  archivedAt?: string | null;
+  /** Full latest request text submitted for this task. */
+  requestText?: string;
   kind?: TaskKind;
   executorId?: string | null;
   status: string;

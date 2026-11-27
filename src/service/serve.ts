@@ -4,7 +4,7 @@ import { constants } from "node:fs";
 import type { ServiceConfig, T3RuntimeConfig } from "../config.js";
 import { defaultConfig } from "../config.js";
 import { ensureHome, resolveHome } from "../home.js";
-import { loadPolicyFile, resolveT3Config } from "../settings.js";
+import { loadPolicyFile, resolveT3Config, SettingsStore } from "../settings.js";
 import { TaskService } from "./task-service.js";
 import { TaskStore } from "../store/tasks.js";
 import { ArtifactStore } from "../store/artifacts.js";
@@ -18,9 +18,17 @@ import { OpenCodeAdapter } from "../adapters/opencode.js";
 import { T3ExecutionAdapter } from "../adapters/t3-adapter.js";
 import { WorkspaceManager } from "../workspace/manager.js";
 import { RunStreamStore } from "../workspace/run-stream.js";
+import { ChatStore, ChatStreamBus } from "../store/chat.js";
+import { MainChatRunner } from "./chat-runner.js";
 import { CapabilityMcpGateway } from "../gateway/mcp-gateway.js";
-import { createPlatformMrVerifier, reconcileMrOperation, registerPlatformTools, resolveMrOperation } from "../gateway/tools.js";
-import { GhPlatformAdapter } from "../platform/adapter.js";
+import {
+  createPlatformMrVerifier,
+  reconcileMrOperation,
+  registerPlatformTools,
+  registerWorkspaceTools,
+  resolveMrOperation,
+} from "../gateway/tools.js";
+import { DynamicPlatformAdapter, EnterpriseGitPlatformAdapter } from "../platform/adapter.js";
 import { acquireServiceLock, ServiceUnavailableError } from "../ipc.js";
 import { Router, newSessionToken, startListener, type RunningListener } from "../http/server.js";
 import { registerWeb, resolveWebDir } from "../http/web.js";
@@ -56,6 +64,17 @@ export async function serve(): Promise<void> {
   const artifacts = ArtifactStore.create(home);
   const workspaces = new WorkspaceManager({ home: join(home, "workspaces") });
   const runStreams = new RunStreamStore(home);
+  const chatStore = new ChatStore(db);
+  const chatBus = new ChatStreamBus();
+  // Forward meaningful live worker progress to Main Chat so embedded Task Cards
+  // update in real time with a single clean status line (never raw token spam).
+  runStreams.subscribeAll((event) => {
+    if (event.type === "text_delta" || event.summary.trim() === "") return;
+    chatBus.publish({
+      event: "task_progress",
+      data: { taskId: event.taskId, runId: event.runId, type: event.type, summary: event.summary, at: event.at },
+    });
+  });
   const executors = new ExecutorRegistry();
   // Register the 4 resident native CLI agents: pi, qwen-code, codex, opencode (+ optional t3).
   executors.register(new PiAdapter());
@@ -68,22 +87,49 @@ export async function serve(): Promise<void> {
   const probed = await executors.probeAll();
   log(`executors probed: ${probed.map((e) => `${e.id}=${e.available ? "ready" : "unavailable"}`).join(", ")}`);
 
+  // Workspace, assistant, knowledge base & isolated credentials store.
+  const settingsStore = new SettingsStore(home, env);
+  const chatRunner = new MainChatRunner({
+    home,
+    chatStore,
+    chatBus,
+    service,
+    executors,
+    settingsStore,
+    log,
+  });
+
   // Local Capability MCP Gateway (Step 4.1 + 4.2): holds platform credentials
   // strictly inside the gateway process, never exposed to Worker subprocesses.
-  const platform = new GhPlatformAdapter();
-  const gatewayCredentials: Record<string, string | undefined> = {
-    GH_TOKEN: env.GH_TOKEN,
-    GITHUB_TOKEN: env.GITHUB_TOKEN,
-    A1_TOKEN: env.A1_TOKEN,
-  };
+  const platform = new DynamicPlatformAdapter((repo) => {
+    const userSettings = settingsStore.load();
+    const matchedProject = userSettings.projects.find((p) => p.remoteRepo === repo || p.name === repo);
+    const matchedFolder = (userSettings.folders ?? []).find((f) => f.remoteRepo === repo || f.name === repo);
+    const conn =
+      (matchedProject?.platformId ? userSettings.connections.find((c) => c.id === matchedProject.platformId) : undefined) ??
+      (matchedFolder?.remoteHost
+        ? userSettings.connections.find((c) => c.baseUrl.includes(matchedFolder.remoteHost!))
+        : undefined) ??
+      userSettings.connections.find((c) => c.kind === "enterprise_git" || c.kind === "gitlab");
+    if (conn && (conn.kind === "enterprise_git" || conn.kind === "gitlab")) {
+      return new EnterpriseGitPlatformAdapter({
+        baseUrl: conn.baseUrl,
+        apiPath: conn.apiPath,
+        authHeader: conn.authHeader,
+        credentialKey: conn.credentialKey,
+      });
+    }
+    return null;
+  });
   const mcpPort = Number(env.TIMO_MCP_PORT);
   const mcpGateway = new CapabilityMcpGateway({
     service,
     port: Number.isInteger(mcpPort) && mcpPort > 0 ? mcpPort : 0,
-    credentials: gatewayCredentials,
+    credentialsProvider: () => settingsStore.resolveGatewayCredentials(),
     onError: (error) => log(`mcp gateway: ${String(error)}`),
   });
   registerPlatformTools(mcpGateway, { store, service, platform });
+  registerWorkspaceTools(mcpGateway, { settingsStore, workspaces });
   const mcpBound = await mcpGateway.start();
   log(`capability mcp gateway listening on http://${mcpBound.host}:${mcpBound.port}/mcp/:taskId/:generation/:nonce`);
 
@@ -103,8 +149,9 @@ export async function serve(): Promise<void> {
     workspaces,
     verifiers: service.verifiers,
     mcpGateway,
-    platformVerifier: createPlatformMrVerifier({ store, service, platform, credentials: gatewayCredentials }),
+    platformVerifier: createPlatformMrVerifier({ store, service, platform, credentials: settingsStore.resolveGatewayCredentials() }),
     enableWatchdogTriage: true,
+    settingsStore,
     log,
   });
 
@@ -117,9 +164,16 @@ export async function serve(): Promise<void> {
     t3Configured: t3 !== null,
     executors,
     runStreams,
+    settingsStore,
+    workspaces,
+    mcpGateway,
+    chatStore,
+    chatBus,
+    chatRunner,
+    interruptActive: (id: string) => runner.interruptTask(id),
     steer: (taskId: string, message: string) => runner.steerTask(taskId, message),
     reconcileOperation: (operationId: string) =>
-      reconcileMrOperation(operationId, { store, service, platform, credentials: gatewayCredentials }),
+      reconcileMrOperation(operationId, { store, service, platform, credentials: settingsStore.resolveGatewayCredentials() }),
     resolveOperation: (
       operationId: string,
       input: { resolution: "confirmed_exists" | "confirmed_absent"; mrId?: string; url?: string; headSha?: string; reason?: string },
@@ -180,15 +234,33 @@ export async function serve(): Promise<void> {
 
   let closing = false;
   const shutdown = async (signal: string) => {
-    if (closing) return;
+    if (closing) {
+      log(`received second ${signal}, forcing immediate exit`);
+      try { lock.release(); } catch { /* ignore */ }
+      process.exit(130);
+    }
     closing = true;
-    log(`received ${signal}, stopping`);
-    await runner.stop();
-    await mcpGateway.close().catch(() => undefined);
-    for (const listener of listeners.reverse()) await listener.close().catch(() => undefined);
-    lock.release();
-    service.close();
-    closeSync(logFd);
+    log(`received ${signal}, stopping (press Ctrl+C again to force exit)`);
+    const forceTimer = setTimeout(() => {
+      log("shutdown timed out after 3.5s, forcing exit");
+      try { lock.release(); } catch { /* ignore */ }
+      process.exit(130);
+    }, 3_500);
+    forceTimer.unref?.();
+
+    const withTimeout = <T>(promise: Promise<T>, ms: number) =>
+      Promise.race([promise.catch(() => undefined), new Promise<void>((resolve) => setTimeout(resolve, ms))]);
+
+    await withTimeout(chatRunner.stop(), 1_000);
+    await withTimeout(runner.stop(2_500), 2_800);
+    await withTimeout(mcpGateway.close(), 500);
+    for (const listener of listeners.reverse()) {
+      await withTimeout(listener.close(), 500);
+    }
+    clearTimeout(forceTimer);
+    try { lock.release(); } catch { /* ignore */ }
+    try { service.close(); } catch { /* ignore */ }
+    try { closeSync(logFd); } catch { /* ignore */ }
     process.exit(0);
   };
   process.on("SIGINT", () => void shutdown("SIGINT"));

@@ -50,6 +50,7 @@ export interface TaskResult {
   boundCommits?: Record<string, string>;
   steps?: unknown[];
   productionDeployed?: boolean;
+  assistantText?: string;
 }
 
 export interface TaskRow {
@@ -69,6 +70,8 @@ export interface TaskRow {
   repos: RepoDeliveryState[];
   verificationPlan: VerificationPlan | null;
   maxRepairRounds: number;
+  titleOverride: string | null;
+  archivedAt: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -153,6 +156,8 @@ interface TaskDbRow {
   repos_json?: string | null;
   verification_plan_json?: string | null;
   max_repair_rounds?: number | null;
+  title_override?: string | null;
+  archived_at?: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -175,6 +180,8 @@ function toTaskRow(row: TaskDbRow): TaskRow {
     repos: row.repos_json ? (JSON.parse(row.repos_json) as RepoDeliveryState[]) : [],
     verificationPlan: row.verification_plan_json ? (JSON.parse(row.verification_plan_json) as VerificationPlan) : null,
     maxRepairRounds: typeof row.max_repair_rounds === "number" ? row.max_repair_rounds : 2,
+    titleOverride: row.title_override ?? null,
+    archivedAt: row.archived_at ?? null,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
@@ -314,7 +321,7 @@ export class TaskStore {
     this.db.prepare("UPDATE tasks SET status = ?, waiting_reason = ?, updated_at = ? WHERE task_id = ?").run(status, waitingReason, now, taskId);
   }
 
-  setFailure(taskId: string, reason: string, now: string): void {
+  setFailure(taskId: string, reason: string | null, now: string): void {
     this.db.prepare("UPDATE tasks SET failure_reason = ?, updated_at = ? WHERE task_id = ?").run(reason, now, taskId);
   }
 
@@ -701,12 +708,75 @@ export class TaskStore {
     return row?.request_text ?? "";
   }
 
-  /** All tasks, newest first, with the fields the task list needs. */
-  listTasks(limit = 200, status?: string): TaskRow[] {
-    const rows = status
-      ? (this.db.prepare("SELECT * FROM tasks WHERE status = ? ORDER BY created_at DESC LIMIT ?").all(status, limit) as TaskDbRow[])
-      : (this.db.prepare("SELECT * FROM tasks ORDER BY created_at DESC LIMIT ?").all(limit) as TaskDbRow[]);
+  /** All tasks, newest first, with optional status and archive filtering. */
+  listTasks(limit = 200, status?: string, options?: { archived?: "exclude" | "only" | "all" }): TaskRow[] {
+    const archivedMode = options?.archived ?? "exclude";
+    const clauses: string[] = [];
+    const params: Array<string | number> = [];
+    if (status) {
+      clauses.push("status = ?");
+      params.push(status);
+    }
+    if (archivedMode === "exclude") {
+      clauses.push("archived_at IS NULL");
+    } else if (archivedMode === "only") {
+      clauses.push("archived_at IS NOT NULL");
+    }
+    const where = clauses.length > 0 ? `WHERE ${clauses.join(" AND ")}` : "";
+    params.push(limit);
+    const rows = this.db.prepare(`SELECT * FROM tasks ${where} ORDER BY created_at DESC LIMIT ?`).all(...params) as TaskDbRow[];
     return rows.map(toTaskRow);
+  }
+
+  /** Updates mutable task management metadata (title override and/or archive state). */
+  updateTaskMeta(taskId: string, patch: { titleOverride?: string | null; archivedAt?: string | null; now: string }): TaskRow | undefined {
+    const sets: string[] = [];
+    const params: Array<string | null> = [];
+    if ("titleOverride" in patch) {
+      sets.push("title_override = ?");
+      params.push(patch.titleOverride ?? null);
+    }
+    if ("archivedAt" in patch) {
+      sets.push("archived_at = ?");
+      params.push(patch.archivedAt ?? null);
+    }
+    if (sets.length > 0) {
+      sets.push("updated_at = ?");
+      params.push(patch.now);
+      params.push(taskId);
+      this.db.prepare(`UPDATE tasks SET ${sets.join(", ")} WHERE task_id = ?`).run(...params);
+    }
+    return this.get(taskId);
+  }
+
+  /** Permanently deletes a task and all its dependent rows in one transaction. */
+  deleteTask(taskId: string): boolean {
+    return this.db.transaction(() => {
+      const exists = this.db.prepare("SELECT 1 FROM tasks WHERE task_id = ?").get(taskId);
+      if (!exists) return false;
+      this.db.prepare("DELETE FROM verifications WHERE candidate_id IN (SELECT candidate_id FROM candidates WHERE task_id = ?)").run(taskId);
+      this.db.prepare("DELETE FROM candidates WHERE task_id = ?").run(taskId);
+      this.db.prepare("DELETE FROM attempts WHERE operation_id IN (SELECT operation_id FROM operations WHERE task_id = ?)").run(taskId);
+      this.db.prepare("DELETE FROM operations WHERE task_id = ?").run(taskId);
+      this.db.prepare("DELETE FROM run_references WHERE task_id = ?").run(taskId);
+      this.db.prepare("DELETE FROM executions WHERE task_id = ?").run(taskId);
+      this.db.prepare("DELETE FROM brief_revisions WHERE task_id = ?").run(taskId);
+      this.db.prepare("DELETE FROM authorization_snapshots WHERE task_id = ?").run(taskId);
+      this.db.prepare("DELETE FROM evidence WHERE task_id = ?").run(taskId);
+      this.db.prepare("DELETE FROM notifications WHERE task_id = ?").run(taskId);
+      this.db.prepare("DELETE FROM task_events WHERE task_id = ?").run(taskId);
+      this.db.prepare("DELETE FROM outbox_jobs WHERE task_id = ?").run(taskId);
+      this.db.prepare("DELETE FROM inbox_items WHERE task_id = ?").run(taskId);
+      this.db.prepare("DELETE FROM proposals WHERE task_id = ?").run(taskId);
+      this.db.prepare("DELETE FROM authorization_audit WHERE task_id = ?").run(taskId);
+      try {
+        this.db.prepare("DELETE FROM chat_messages WHERE task_id = ?").run(taskId);
+      } catch {
+        // Older test DBs before migration 0009
+      }
+      this.db.prepare("DELETE FROM tasks WHERE task_id = ?").run(taskId);
+      return true;
+    });
   }
 
   /** Marks every non-terminal execution generation as revoked for a stopped task. */

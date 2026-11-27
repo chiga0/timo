@@ -1,225 +1,308 @@
-import type { InboxItem, Proposal, TaskDetail, TaskEvent } from "../api.js";
+import { useEffect, useRef } from "react";
+import type { ChatMessage, InboxItem, TaskProgressFrame, TaskSummary } from "../api.js";
+import { AgentLogo, agentLabel } from "./AgentIcons.js";
+import { Markdown } from "./Markdown.js";
 
-const EVENT_LABEL: Record<string, string> = {
-  task_created: "已接单",
-  dispatch_started: "开始派发",
-  run_observed: "观测到运行",
-  task_waiting: "进入等待",
-  verification_recorded: "记录验收",
-  task_completed: "验收通过",
-  task_failed: "任务失败",
-  task_amended: "约定已更新",
-  task_stopping: "请求停止",
-  task_stopped: "已停止",
-  watchdog_signal: "看门狗告警",
-  decision_required: "需要你决定",
+const STATUS_LABEL: Record<string, string> = {
+  accepted: "已接单",
+  running: "执行中",
+  waiting: "等待中",
+  verifying: "验收中",
+  stopping: "停止中",
+  stopped: "已停止",
+  completed: "已完成",
+  failed: "失败",
 };
 
+const STARTER_PROMPTS = [
+  "介绍一下我当前工作区有哪些目录，以及你能帮我做什么？",
+  "帮我汇总一下当前有没有待处理或卡住的后台任务",
+  "我想重构一个模块，先帮我列一份工程交付检查清单",
+];
+
 /**
- * Main conversation column. Only attention-worthy facts become cards: process
- * telemetry stays in the live stream tab. The thread is an immutable timeline,
- * so replaying from `afterSeq` renders the same content.
+ * Fixed global Main Chat (`User <-> Timo Chief of Staff`).
+ *
+ * - Never bound to a single Task: casual Q&A streams directly as Markdown here.
+ * - Delegated engineering tasks appear inline as a single compact, live-updating
+ *   Task Card (merging status + live progress + quick actions in one place).
  */
 export function Thread(props: {
-  detail: TaskDetail | null;
-  events: TaskEvent[];
-  proposals: Proposal[];
+  messages: ChatMessage[];
+  tasks: TaskSummary[];
   inbox: InboxItem[];
-  connection: "open" | "reconnecting" | "closed";
-  tab: "thread" | "live";
-  onResolve: (taskId: string, action: string, approved: boolean) => void;
-  onConfirmProposal: (proposalId: string) => void;
-  onCancelProposal: (proposalId: string) => void;
+  liveProgress: Record<string, TaskProgressFrame>;
+  selectedTaskId: string | null;
+  onQuickPrompt: (text: string) => void;
+  onSelectTask: (taskId: string) => void;
+  onStopChat: (messageId: string) => void;
+  onStopTask: (taskId: string) => void;
+  onRetryTask: (taskId: string) => void;
+  onResolveDecision: (taskId: string, action: string, approved: boolean) => void;
+  onDismissInbox: (taskId: string, decisionKey: string) => void;
 }): React.JSX.Element {
-  const cards = props.events.filter((event) => isAttentionWorthy(event.type));
-  const pendingDecision = props.inbox.find((item) => item.taskId === props.detail?.taskId && item.decisionKey === "decision_required");
+  const scrollRef = useRef<HTMLDivElement | null>(null);
+  const taskById = new Map(props.tasks.map((t) => [t.taskId, t]));
+  const inboxByTaskId = new Map<string, InboxItem[]>();
+  for (const item of props.inbox) {
+    const arr = inboxByTaskId.get(item.taskId) ?? [];
+    arr.push(item);
+    inboxByTaskId.set(item.taskId, arr);
+  }
+
+  const lastMsg = props.messages.at(-1);
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 160;
+    if (nearBottom || lastMsg?.status === "streaming") {
+      el.scrollTop = el.scrollHeight;
+    }
+  }, [props.messages.length, lastMsg?.content.length]);
 
   return (
-    <>
-      <div className="ctx-bar">
-        <span className="ctx-chip">
-          <span className={connectionDot(props.connection)} />
-          {props.connection === "open" ? "实时已连接" : props.connection === "reconnecting" ? "重连中" : "未连接"}
-        </span>
-        {props.detail && (
-          <span className="ctx-chip mono">
-            {props.detail.taskId.slice(0, 8)} · {props.detail.status}
-            {props.detail.waitingReason ? ` · ${props.detail.waitingReason}` : ""}
-          </span>
-        )}
-        <span className="muted small" style={{ marginLeft: "auto" }}>
-          {props.tab === "live" ? "正在查看该任务的完整归一化事件流" : "注意力防火墙已开启 · 过程噪音不刷屏"}
-        </span>
-      </div>
-
-      <div className="thread">
-        <div className="thread-inner">
-          {!props.detail ? (
-            <div className="empty-box">在下方输入框交办一件事，或从左侧选择任务</div>
-          ) : props.tab === "live" ? (
-            <div className="stack">
-              <div className="muted small">归一化运行事件流（共 {props.events.length} 条）</div>
-              {props.events.length === 0 ? (
-                <div className="empty-box">暂无运行事件</div>
-              ) : (
-                props.events.map((event) => (
-                  <article key={event.eventId} className="card">
-                    <header className="card-head">
-                      <span className="mono">
-                        #{event.seq} · {EVENT_LABEL[event.type] ?? event.type} ({event.type})
-                      </span>
-                      <span className="mono muted small">{new Date(event.createdAt).toLocaleTimeString()}</span>
-                    </header>
-                    <div className="card-body small">
-                      <pre className="card-box mono" style={{ margin: 0, whiteSpace: "pre-wrap" }}>
-                        {compact(asRecord(event.payload))}
-                      </pre>
-                    </div>
-                  </article>
-                ))
-              )}
-            </div>
-          ) : (
-            <>
-              {props.proposals.map((proposal) => (
-                <article key={proposal.proposalId} className="card">
-                  <header className="card-head">
-                    <span>变更确认卡 · Amendment Diff</span>
-                    <span className="mono muted small">基于 v{proposal.expectedBriefVersion}</span>
-                  </header>
-                  <div className="card-body stack small">
-                    <div className="card-box mono stack">
-                      {proposal.change.diff.map((line, index) => (
-                        <div key={index}>
-                          <div className="muted">- {line.field}: {line.before}</div>
-                          <div>+ {line.field}: {line.after}</div>
-                        </div>
-                      ))}
-                    </div>
-                    <div className="card-actions" style={{ marginLeft: 0 }}>
-                      <button type="button" className="btn btn-primary btn-sm" onClick={() => props.onConfirmProposal(proposal.proposalId)}>
-                        确认生效
-                      </button>
-                      <button type="button" className="btn btn-outline-muted btn-sm" onClick={() => props.onCancelProposal(proposal.proposalId)}>
-                        取消
-                      </button>
-                    </div>
-                  </div>
-                </article>
+    <div className="thread" ref={scrollRef}>
+      <div className="thread-inner">
+        {props.messages.length === 0 ? (
+          <div className="welcome">
+            <div className="welcome-mark">T</div>
+            <h1 className="welcome-title">我是 Timo，一切交给我，除了隐私。</h1>
+            <div className="starter-row">
+              {STARTER_PROMPTS.map((prompt) => (
+                <button
+                  key={prompt}
+                  type="button"
+                  className="starter-chip"
+                  onClick={() => props.onQuickPrompt(prompt)}
+                >
+                  {prompt}
+                </button>
               ))}
+            </div>
+          </div>
+        ) : (
+          props.messages.map((msg) => {
+            if (msg.role === "user") {
+              return (
+                <div key={msg.messageId} className="msg-user-wrap">
+                  <div className="msg-user">{msg.content}</div>
+                </div>
+              );
+            }
 
-              {cards.length === 0 ? (
-                <div className="empty-box">暂无需要关注的事件；过程日志可切至「实时运行流」或右侧检查器查看</div>
-              ) : (
-                cards.map((event) => (
-                  <EventCard
-                    key={event.eventId}
-                    event={event}
-                    detail={props.detail}
-                    pendingDecision={pendingDecision}
-                    onResolve={props.onResolve}
-                  />
-                ))
-              )}
-            </>
-          )}
-        </div>
+            if (msg.role === "task_card" && msg.taskId) {
+              const task = taskById.get(msg.taskId);
+              const taskInbox = inboxByTaskId.get(msg.taskId) ?? [];
+              const live = props.liveProgress[msg.taskId];
+              return (
+                <InlineTaskCard
+                  key={msg.messageId}
+                  message={msg}
+                  task={task}
+                  inboxItems={taskInbox}
+                  live={live}
+                  selected={props.selectedTaskId === msg.taskId}
+                  onSelect={() => props.onSelectTask(msg.taskId!)}
+                  onStop={() => props.onStopTask(msg.taskId!)}
+                  onRetry={() => props.onRetryTask(msg.taskId!)}
+                  onResolve={(action, approved) => props.onResolveDecision(msg.taskId!, action, approved)}
+                  onDismiss={(key) => props.onDismissInbox(msg.taskId!, key)}
+                />
+              );
+            }
+
+            return (
+              <div key={msg.messageId} className="msg-assistant">
+                <div className="msg-assistant-head">
+                  <span className="msg-avatar">T</span>
+                  <span className="msg-assistant-name">Timo</span>
+                  {msg.executorId && (
+                    <span className="msg-agent-tag">
+                      <AgentLogo id={msg.executorId} size={12} />
+                      <span>{agentLabel(msg.executorId)}</span>
+                    </span>
+                  )}
+                  {msg.status === "streaming" && (
+                    <button
+                      type="button"
+                      className="btn-link"
+                      style={{ marginLeft: "auto" }}
+                      onClick={() => props.onStopChat(msg.messageId)}
+                    >
+                      停止生成
+                    </button>
+                  )}
+                </div>
+                <div className="msg-assistant-body">
+                  {msg.content ? (
+                    <>
+                      <Markdown content={msg.content} />
+                      {msg.status === "streaming" && <span className="stream-caret" aria-hidden="true" />}
+                    </>
+                  ) : msg.status === "streaming" ? (
+                    <div className="thinking-line">
+                      <span className="dot dot-warning dot-pulse" />
+                      <span className="muted">思考中…</span>
+                    </div>
+                  ) : (
+                    <span className="muted">已完成</span>
+                  )}
+                </div>
+              </div>
+            );
+          })
+        )}
       </div>
-    </>
+    </div>
   );
 }
 
-function EventCard(props: {
-  event: TaskEvent;
-  detail: TaskDetail | null;
-  pendingDecision?: InboxItem;
-  onResolve: (taskId: string, action: string, approved: boolean) => void;
+function InlineTaskCard(props: {
+  message: ChatMessage;
+  task?: TaskSummary;
+  inboxItems: InboxItem[];
+  live?: TaskProgressFrame;
+  selected: boolean;
+  onSelect: () => void;
+  onStop: () => void;
+  onRetry: () => void;
+  onResolve: (action: string, approved: boolean) => void;
+  onDismiss: (decisionKey: string) => void;
 }): React.JSX.Element {
-  const payload = asRecord(props.event.payload);
-  const label = EVENT_LABEL[props.event.type] ?? props.event.type;
+  const task = props.task;
+  const status = task?.status ?? "accepted";
+  const isRunning = status === "accepted" || status === "running" || status === "verifying";
+  const canStop = isRunning || status === "waiting";
+  const canRetry = status === "failed" || status === "stopped";
+  const decision = props.inboxItems.find((i) => i.decisionKey === "decision_required");
+  const blocked = props.inboxItems.find((i) => i.decisionKey === "task_blocked_final");
+  const title = task?.title || props.message.content.split("\n")[0]?.slice(0, 48) || "后台任务";
+  const execId = task?.executorId || props.message.executorId;
 
-  if (props.event.type === "task_completed") {
-    const result = (payload.result ?? props.detail?.result) as Record<string, unknown> | null;
-    return (
-      <article className="card">
-        <header className="card-head">
-          <span>交付已验证</span>
-          <span className="mono muted small">seq {props.event.seq}</span>
-        </header>
-        <div className="card-body stack">
-          <div className="card-grid2">
-            <div className="card-box mono">verdict: {String(result?.verdict ?? "-")}</div>
-            <div className="card-box mono">verifier: {String(result?.verifierVersion ?? "-")}</div>
-          </div>
-          {Array.isArray(result?.incidents) && result.incidents.length > 0 && (
-            <div className="card-box mono">
-              {(result.incidents as Array<{ connectionId: string; disconnectLine: number; reconnectLine: number | null }>)
-                .map((incident) => `${incident.connectionId} 断连@${incident.disconnectLine} → 恢复@${incident.reconnectLine ?? "无"}`)
-                .join("；")}
-            </div>
-          )}
-        </div>
-      </article>
-    );
-  }
-
-  if (props.event.type === "decision_required") {
-    const action = typeof payload.action === "string" ? payload.action : props.pendingDecision?.action ?? null;
-    const canAct = Boolean(action && props.detail && props.pendingDecision && props.detail.waitingReason === "needs_human_decision");
-    return (
-      <article className="card">
-        <header className="card-head">
-          <span>红线审批</span>
-          <span className="mono muted small">seq {props.event.seq}</span>
-        </header>
-        <div className="card-body stack small">
-          <div className="card-box mono">{action ?? "-"}</div>
-          <div className="muted">{String(payload.reason ?? "")}</div>
-          {canAct && action && props.detail ? (
-            <div className="card-actions" style={{ marginLeft: 0 }}>
-              <button type="button" className="btn btn-primary btn-sm" onClick={() => props.onResolve(props.detail!.taskId, action, true)}>
-                批准并原地恢复
-              </button>
-              <button type="button" className="btn btn-outline-muted btn-sm" onClick={() => props.onResolve(props.detail!.taskId, action, false)}>
-                拒绝
-              </button>
-            </div>
-          ) : (
-            <div className="muted">该决策已处理或已关闭</div>
-          )}
-        </div>
-      </article>
-    );
-  }
+  const liveLine = buildLiveLine(task, props.live, decision, blocked);
 
   return (
-    <article className="card">
-      <header className="card-head">
-        <span>{label}</span>
-        <span className="mono muted small">seq {props.event.seq}</span>
-      </header>
-      <div className="card-body small">
-        <div className="muted mono">{compact(payload)}</div>
+    <article
+      className={props.selected ? "live-task-card selected" : "live-task-card"}
+      onClick={props.onSelect}
+      role="button"
+      tabIndex={0}
+      onKeyDown={(e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          props.onSelect();
+        }
+      }}
+    >
+      <div className="live-task-head">
+        <span className={statusDot(status, isRunning)} />
+        <span className="live-task-title">{title}</span>
+        {execId && (
+          <span className="live-task-meta">
+            <AgentLogo id={execId} size={12} />
+            <span>{agentLabel(execId)}</span>
+          </span>
+        )}
+        <span className={`status-pill status-${status}`}>
+          {STATUS_LABEL[status] ?? status}
+        </span>
+      </div>
+
+      <div className="live-task-body">
+        <span className={status === "failed" ? "live-task-line is-error" : "live-task-line"}>
+          {liveLine}
+        </span>
+      </div>
+
+      <div className="live-task-foot" onClick={(e) => e.stopPropagation()}>
+        {decision && decision.action && task?.waitingReason === "needs_human_decision" ? (
+          <>
+            <button type="button" className="btn btn-primary btn-sm" onClick={() => props.onResolve(decision.action!, true)}>
+              批准并恢复
+            </button>
+            <button type="button" className="btn btn-outline-muted btn-sm" onClick={() => props.onResolve(decision.action!, false)}>
+              拒绝
+            </button>
+            <button type="button" className="btn btn-danger btn-sm" onClick={props.onStop}>
+              停止
+            </button>
+          </>
+        ) : (
+          <>
+            {canRetry && (
+              <button type="button" className="btn btn-primary btn-sm" onClick={props.onRetry}>
+                重试任务
+              </button>
+            )}
+            {blocked && (
+              <button type="button" className="btn btn-outline-muted btn-sm" onClick={() => props.onDismiss(blocked.decisionKey)}>
+                移出待处理
+              </button>
+            )}
+            {canStop && (
+              <button type="button" className="btn btn-danger btn-sm" onClick={props.onStop}>
+                停止任务
+              </button>
+            )}
+          </>
+        )}
+        <button type="button" className="btn-link" style={{ marginLeft: "auto" }} onClick={props.onSelect}>
+          查看详情 →
+        </button>
       </div>
     </article>
   );
 }
 
-function asRecord(value: unknown): Record<string, unknown> {
-  return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
+function buildLiveLine(
+  task: TaskSummary | undefined,
+  live: TaskProgressFrame | undefined,
+  decision: InboxItem | undefined,
+  blocked: InboxItem | undefined,
+): string {
+  if (!task) return "任务记录已删除或同步中…";
+  if (decision && task.waitingReason === "needs_human_decision") {
+    return `等待批准：${decision.action ?? decision.title} — ${decision.summary}`;
+  }
+  if (task.status === "failed") {
+    const raw = blocked?.summary || live?.summary || "执行未通过，点击「查看详情」排查原因";
+    return raw.length > 120 ? `${raw.slice(0, 119)}…` : raw;
+  }
+  if (task.status === "completed") {
+    const repos = task.repoNames && task.repoNames.length > 0 ? ` · ${task.repoNames.join("、")}` : "";
+    return `已完成交付并通过独立验收${repos}`;
+  }
+  if (task.status === "stopped") {
+    return "已停止，可随时点击「重试任务」重新执行";
+  }
+  if (task.status === "verifying") {
+    return "代码已提交，正在隔离环境中运行独立验收…";
+  }
+  const latest = live?.summary || task.liveSummary;
+  if (latest) {
+    return formatProgressText(live?.type || task.liveType || "status", latest);
+  }
+  const repos = task.repoNames && task.repoNames.length > 0 ? `（工作区：${task.repoNames.join("、")}）` : "";
+  return `正在准备执行环境${repos}…`;
 }
 
-function isAttentionWorthy(type: string): boolean {
-  return type === "task_created" || type === "task_completed" || type === "task_failed" || type === "decision_required" || type === "task_stopped";
+function formatProgressText(type: string, summary: string): string {
+  const clean = summary.replace(/\s+/g, " ").trim();
+  const clipped = clean.length > 110 ? `${clean.slice(0, 109)}…` : clean;
+  if (type === "tool_call") return `正在执行 ${clipped}`;
+  if (type === "patch") return `已改动 ${clipped}`;
+  if (type === "error") return `遇到异常：${clipped}`;
+  return clipped;
 }
 
-function compact(payload: Record<string, unknown>): string {
-  const text = JSON.stringify(payload);
-  return text.length > 220 ? `${text.slice(0, 220)}…` : text;
-}
-
-function connectionDot(connection: "open" | "reconnecting" | "closed"): string {
-  if (connection === "open") return "dot dot-success";
-  if (connection === "reconnecting") return "dot dot-warning";
-  return "dot dot-error";
+function statusDot(status: string, pulse = false): string {
+  const base =
+    status === "completed"
+      ? "dot dot-success"
+      : status === "failed"
+        ? "dot dot-error"
+        : status === "waiting" || status === "running" || status === "verifying" || status === "accepted"
+          ? "dot dot-warning"
+          : "dot";
+  return pulse ? `${base} dot-pulse` : base;
 }

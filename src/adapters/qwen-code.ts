@@ -180,6 +180,7 @@ export class QwenCodeAdapter implements ExecutionAdapter {
       "stream-json",
       "-o",
       "stream-json",
+      "--include-partial-messages",
       "--approval-mode",
       this.approvalMode,
     ];
@@ -228,7 +229,8 @@ export class QwenCodeAdapter implements ExecutionAdapter {
     let seq = 0;
     const emit = (type: RunStreamEventType, summary: string, data?: unknown) => {
       seq += 1;
-      onEvent({ seq, runId: request.runId, taskId: request.taskId, type, at: Date.now(), summary: this.clip(summary), data });
+      const normalized = type === "text_delta" ? summary : this.clip(summary);
+      onEvent({ seq, runId: request.runId, taskId: request.taskId, type, at: Date.now(), summary: normalized, data });
     };
     emit("status", resumeSessionId ? `qwen-code resuming session ${resumeSessionId}` : "qwen-code started");
 
@@ -397,6 +399,15 @@ export class QwenCodeAdapter implements ExecutionAdapter {
 
     if (type === "stream_event") {
       const inner = record.event as Record<string, unknown> | undefined;
+      if (inner?.type === "content_block_delta") {
+        const delta = inner.delta as Record<string, unknown> | undefined;
+        if (delta?.type === "text_delta" && typeof delta.text === "string" && delta.text.length > 0) {
+          return { sessionId, events: [{ type: "text_delta", summary: delta.text, data: { delta: delta.text } }] };
+        }
+        if (delta?.type === "thinking_delta" && typeof delta.thinking === "string" && delta.thinking.trim() !== "") {
+          return { sessionId, events: [{ type: "thinking", summary: delta.thinking }] };
+        }
+      }
       if (inner?.type === "tool_progress") {
         const content = inner.content as Record<string, unknown> | undefined;
         const text = typeof content?.output === "string" ? content.output : JSON.stringify(content ?? "");

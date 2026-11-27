@@ -1,4 +1,4 @@
-import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import type { RunStreamEvent } from "../adapters/execution.js";
 
@@ -10,8 +10,18 @@ import type { RunStreamEvent } from "../adapters/execution.js";
  * never reach the main conversation, the inbox, or the business event ledger
  * (docs/architecture.md "写入通道物理隔离").
  */
+export interface LatestTaskProgress {
+  taskId: string;
+  runId: string;
+  type: RunStreamEvent["type"];
+  summary: string;
+  at: number;
+}
+
 export class RunStreamStore {
   private readonly listeners = new Map<string, Set<(event: RunStreamEvent) => void>>();
+  private readonly globalListeners = new Set<(event: RunStreamEvent) => void>();
+  private readonly latestByTask = new Map<string, LatestTaskProgress>();
 
   constructor(private readonly home: string) {}
 
@@ -23,6 +33,15 @@ export class RunStreamStore {
     const path = this.pathFor(event.taskId, event.runId);
     mkdirSync(join(this.home, "runs", sanitize(event.taskId)), { recursive: true, mode: 0o700 });
     appendFileSync(path, `${JSON.stringify(event)}\n`, { mode: 0o600 });
+    if (event.type !== "text_delta" && event.summary.trim() !== "") {
+      this.latestByTask.set(event.taskId, {
+        taskId: event.taskId,
+        runId: event.runId,
+        type: event.type,
+        summary: event.summary,
+        at: event.at,
+      });
+    }
     const key = streamKey(event.taskId, event.runId);
     const subs = this.listeners.get(key);
     if (subs) {
@@ -34,6 +53,26 @@ export class RunStreamStore {
         }
       }
     }
+    for (const listener of [...this.globalListeners]) {
+      try {
+        listener(event);
+      } catch {
+        // Ignore broken global subscriber.
+      }
+    }
+  }
+
+  /** Subscribes to every live run stream event across all tasks (for compact task card updates). */
+  subscribeAll(listener: (event: RunStreamEvent) => void): () => void {
+    this.globalListeners.add(listener);
+    return () => {
+      this.globalListeners.delete(listener);
+    };
+  }
+
+  /** Latest non-empty progress summary observed for a task. */
+  latestProgress(taskId: string): LatestTaskProgress | undefined {
+    return this.latestByTask.get(taskId);
   }
 
   /** Subscribes to live events appended for one `(taskId, runId)` stream. */
@@ -79,6 +118,14 @@ export class RunStreamStore {
       .map((name) => name.slice(0, -".ndjson".length))
       .sort()
       .reverse();
+  }
+
+  /** Removes all persisted run stream files for a deleted task. */
+  removeTask(taskId: string): void {
+    const dir = join(this.home, "runs", sanitize(taskId));
+    if (existsSync(dir)) {
+      rmSync(dir, { recursive: true, force: true });
+    }
   }
 }
 

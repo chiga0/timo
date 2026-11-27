@@ -101,10 +101,10 @@ test("red-line pause stays paused during runner passes and resumes only after ap
       await new Promise((resolve) => setTimeout(resolve, 20));
     }
     assert.equal(service.getTask(created.taskId).status, "completed");
-    // The decision_required card is cleared and replaced by the final delivery_verified card.
+    // The decision_required card is cleared on completion; completed deliveries
+    // never require manual confirmation in "待我处理" (Inbox).
     const afterInbox = service.listInbox();
-    assert.equal(afterInbox.some((item) => item.decisionKey === "decision_required"), false);
-    assert.equal(afterInbox.some((item) => item.decisionKey === "delivery_verified"), true);
+    assert.equal(afterInbox.length, 0);
   } finally {
     await runner.stop();
     service.close();

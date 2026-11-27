@@ -281,16 +281,15 @@ test("Step 3.2: live run stream writes NDJSON + SSE and updates watchdog without
     assert.ok(h.store.getEvidence<string>(created.taskId, "lastActivityAt"));
     assert.deepEqual(h.store.getEvidence<string[]>(created.taskId, "changedFiles"), ["app.mjs"]);
 
-    // Strict channel isolation: ZERO live telemetry in task_events; inbox only
-    // contains the single final attention-worthy `task_completed` card.
+    // Strict channel isolation: ZERO live telemetry in task_events; completed
+    // delivery does not leave an actionable todo in Inbox.
     const ledgerEvents = h.writer.ledger.forTask(created.taskId, 0, 500);
     assert.equal(
       ledgerEvents.some((e) => ["tool_call", "thinking", "patch"].includes(e.type)),
       false,
     );
     const inboxItems = h.service.listInbox();
-    assert.equal(inboxItems.length, 1);
-    assert.equal(inboxItems[0]!.decisionKey, "delivery_verified");
+    assert.equal(inboxItems.length, 0);
   } finally {
     await server.close();
     await h.dispose();

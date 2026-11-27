@@ -124,6 +124,9 @@ export class TaskService {
       if (event.type === "task_completed" || event.type === "task_failed" || event.type === "task_stopped") {
         this.inboxStore.resolve(event.taskId, "decision_required");
       }
+      if (event.type === "task_completed" || event.type === "task_stopped") {
+        this.inboxStore.resolve(event.taskId, "task_blocked_final");
+      }
       this.inboxStore.project(event);
     });
   }
@@ -134,10 +137,16 @@ export class TaskService {
   }
 
   /** Current policy plus where it came from, for the auth-health panel. */
-  policySnapshot(): { source: string; summary: string; warning?: string } {
+  policySnapshot(): {
+    source: string;
+    summary: string;
+    warning?: string;
+    policy: StandingPolicy;
+  } {
     return {
       source: this.loadedPolicy.source,
       summary: describePolicy(this.loadedPolicy.policy),
+      policy: this.loadedPolicy.policy,
       ...(this.loadedPolicy.warning ? { warning: this.loadedPolicy.warning } : {}),
     };
   }
@@ -180,7 +189,15 @@ export class TaskService {
       throw new InvalidInputError("--request-id must be a non-empty single-line string of at most 200 characters");
     }
 
-    const kind: TaskKind = request.kind ?? (request.repos && request.repos.length > 0 ? "repo_delivery" : "sse_log");
+    const kind: TaskKind =
+      request.kind === "assistant_chat"
+        ? "assistant_chat"
+        : request.kind === "repo_delivery" || (request.repos && request.repos.length > 0)
+          ? "repo_delivery"
+          : "sse_log";
+    if (kind === "assistant_chat") {
+      return this.createAssistantChatTask(requestId, request);
+    }
     if (kind === "repo_delivery") {
       return this.createRepoDeliveryTask(requestId, request);
     }
@@ -396,13 +413,130 @@ export class TaskService {
     return { taskId, status: this.store.get(taskId)!.status, reused: false };
   }
 
+  private createAssistantChatTask(requestId: string, request: CreateTaskRequest): CreateTaskResponse & { reused: boolean } {
+    const requestText = request.requestText?.trim() ?? "";
+    if (requestText === "") {
+      throw new InvalidInputError("assistant_chat tasks require a non-empty requestText");
+    }
+    const defaultExecutor = request.executorId ?? "qwen-code";
+    const specBytes = Buffer.from(
+      stableJson({ kind: "assistant_chat", requestText, executorId: defaultExecutor }),
+      "utf8",
+    );
+    const inputDigest = sha256Hex(specBytes);
+    const requestDigest = sha256Hex(Buffer.from(stableJson({ requestId, inputDigest, requestText }), "utf8"));
+
+    const existing = this.store.findByRequestId(requestId);
+    if (existing) {
+      if (existing.requestDigest !== requestDigest) {
+        throw new RequestConflictError(`request id ${requestId} was already used with different content`);
+      }
+      return { taskId: existing.taskId, status: existing.status, reused: true };
+    }
+
+    const artifact = this.artifacts.put(new Uint8Array(specBytes));
+    const now = toIso(this.now());
+    const taskId = newId();
+
+    this.store.createTask({
+      taskId,
+      kind: "assistant_chat",
+      executorId: defaultExecutor,
+      requestId,
+      requestDigest,
+      inputDigest,
+      artifactPath: artifact.path,
+      requestText,
+      brief: {
+        goal: requestText,
+        must: ["直接、简洁地回答用户的问题或说明下一步需要确认的信息"],
+        mustNot: ["禁止未经明确指示擅自修改任何代码仓库或执行生产操作"],
+        evidence: [],
+      },
+      grants: [
+        { action: "read_worktree", resource: "*", environment: "dev", identity: "task-executor", expiresAt: null },
+        { action: "write_worktree", resource: "*", environment: "dev", identity: "task-executor", expiresAt: null },
+      ],
+      repos: [],
+      verificationPlan: null,
+      maxRepairRounds: 0,
+      environment: defaultExecutor,
+      providerInstanceId: defaultExecutor,
+      model: request.model ?? "default",
+      now,
+    });
+
+    this.writer.commit({
+      taskId,
+      type: "task_created",
+      payload: {
+        kind: "assistant_chat",
+        inputDigest,
+        requestId,
+        executorId: defaultExecutor,
+        repos: [],
+      },
+      options: {
+        idempotencyKey: "created",
+        now,
+        enqueue: [{ kind: JOB_DISPATCH, dedupeKey: "initial" }],
+      },
+    });
+
+    return { taskId, status: this.store.get(taskId)!.status, reused: false };
+  }
+
+  /** Completes a zero-repo `assistant_chat` task with the executor's reply text. */
+  completeAssistantChat(
+    taskId: string,
+    taskRunId: string,
+    assistantText: string,
+    expectedGeneration?: number,
+  ): { status: string } {
+    const view = this.store.view(taskId);
+    if (!view) throw new TaskNotFoundError(`task ${taskId} not found`);
+    if (view.task.status === "stopping" || view.task.status === "stopped") {
+      return { status: "ignored_after_stop" };
+    }
+    const currentGen = view.execution?.generation ?? 1;
+    if (expectedGeneration !== undefined && expectedGeneration !== currentGen) {
+      return { status: "ignored_stale_generation" };
+    }
+    const now = toIso(this.now());
+    const reply = assistantText.trim() || "已完成处理。";
+    const seal = {
+      verdict: "answered",
+      assistantText: reply,
+      verifierVersion: "assistant-chat-v1",
+      inputDigest: view.task.inputDigest,
+    };
+    this.writer.commit({
+      taskId,
+      type: "task_completed",
+      payload: { result: seal, runId: taskRunId },
+      options: { idempotencyKey: `chat-completed:${taskRunId}`, now },
+      project: () => {
+        this.store.setResult(taskId, seal as unknown as TaskResult, now);
+        this.store.setStatus(taskId, "completed", null, now);
+        this.store.setOperationStatus(`${taskId}:dispatch`, "done", { result: "completed", runId: taskRunId }, now);
+        this.store.enqueueNotification(taskId, "task_completed", seal, now);
+      },
+    });
+    return { status: "completed" };
+  }
+
   getTask(taskId: string): GetTaskResponse {
     const view = this.store.view(taskId);
     if (!view) throw new TaskNotFoundError(`task ${taskId} not found`);
     const { task } = view;
     const operations = this.store.listOperations(taskId);
+    const requestText = this.store.latestRequestText(taskId);
+    const title = task.titleOverride?.trim() || summarizeTaskTitle(requestText || view.brief.goal, task.kind, task.taskId);
     return {
       taskId: task.taskId,
+      title,
+      archivedAt: task.archivedAt,
+      requestText,
       kind: task.kind,
       executorId: task.executorId,
       status: task.status,
@@ -577,7 +711,7 @@ export class TaskService {
     taskId: string,
     taskRunId: string,
     outcome: PipelineOutcome,
-    options: { finalFailure?: boolean; ciPollDelayMs?: number; expectedGeneration?: number } = {},
+    options: { finalFailure?: boolean; ciPollDelayMs?: number; expectedGeneration?: number; assistantText?: string } = {},
   ): { status: string; findings: VerificationFinding[] } {
     const view = this.store.view(taskId);
     if (!view) throw new TaskNotFoundError(`task ${taskId} not found`);
@@ -626,7 +760,7 @@ export class TaskService {
 
     const seal: TaskResult | null =
       effectiveStatus === "accepted"
-        ? {
+        ? ({
             verdict: "verified",
             inputDigest: view.task.inputDigest,
             verifierVersion: outcome.verifierVersion,
@@ -640,7 +774,8 @@ export class TaskService {
               boundCommits: s.boundCommits,
             })),
             productionDeployed: false,
-          }
+            ...(options.assistantText?.trim() ? { assistantText: options.assistantText.trim() } : {}),
+          } as TaskResult)
         : null;
 
     const eventType =
@@ -788,15 +923,17 @@ export class TaskService {
     if (!canStop(status)) throw new TaskConflictError("invalid_state", `task ${taskId} cannot be stopped from ${status}`);
 
     const now = toIso(this.now());
+    const gen = view.execution?.generation ?? 1;
     this.writer.commit({
       taskId,
       type: "task_stopping",
       payload: { reason: input.reason ?? "user_requested", previousStatus: status, threadId: view.task.threadId, runId: view.task.runId },
-      options: { idempotencyKey: "stopping", now },
+      options: { idempotencyKey: `stopping:g${gen}`, now },
       project: () => {
         this.store.setStatus(taskId, "stopping", null, now);
         this.store.revokeExecutions(taskId, now);
         this.inboxStore.resolve(taskId, "decision_required", now);
+        this.inboxStore.resolve(taskId, "task_blocked_final", now);
         // Leaving this job queued would resurrect a stopped task after restart.
         this.writer.outbox.byTask(taskId).forEach((job) => {
           if (job.status === "pending" || job.status === "leased") this.writer.outbox.complete(job.jobId, now);
@@ -814,11 +951,12 @@ export class TaskService {
     if (task.status === "stopped") return { status: "stopped" };
     if (task.status !== "stopping") throw new TaskConflictError("invalid_state", `task ${taskId} is ${task.status}, not stopping`);
     const now = toIso(this.now());
+    const gen = this.store.executionFor(taskId)?.generation ?? 1;
     this.writer.commit({
       taskId,
       type: "task_stopped",
       payload: detail,
-      options: { idempotencyKey: "stopped", now },
+      options: { idempotencyKey: `stopped:g${gen}`, now },
       project: () => {
         this.store.setStatus(taskId, "stopped", null, now);
         this.store.setOperationStatus(`${taskId}:dispatch`, "failed", { reason: "stopped" }, now);
@@ -829,16 +967,186 @@ export class TaskService {
   }
 
   /** Lists tasks for the Web console and `timo list`. */
-  listTasks(limit = 200, status?: string): Array<{ taskId: string; status: TaskStatus; waitingReason: string | null; inputDigest: string; createdAt: string; updatedAt: string }> {
-    const rows = this.store.listTasks(limit, status);
-    return rows.map((task) => ({
-      taskId: task.taskId,
-      status: task.status,
-      waitingReason: task.waitingReason,
-      inputDigest: task.inputDigest,
-      createdAt: task.createdAt,
-      updatedAt: task.updatedAt,
-    }));
+  listTasks(
+    limit = 200,
+    status?: string,
+    options?: { archived?: "exclude" | "only" | "all" },
+  ): Array<{
+    taskId: string;
+    title: string;
+    archivedAt: string | null;
+    kind: TaskKind;
+    executorId: string | null;
+    repoNames: string[];
+    status: TaskStatus;
+    waitingReason: string | null;
+    inputDigest: string;
+    createdAt: string;
+    updatedAt: string;
+  }> {
+    const rows = this.store.listTasks(limit, status, options);
+    return rows.map((task) => {
+      const rawText = this.store.latestRequestText(task.taskId);
+      return {
+        taskId: task.taskId,
+        title: task.titleOverride?.trim() || summarizeTaskTitle(rawText, task.kind, task.taskId),
+        archivedAt: task.archivedAt,
+        kind: task.kind,
+        executorId: task.executorId,
+        repoNames: task.repos.map((r) => r.name),
+        status: task.status,
+        waitingReason: task.waitingReason,
+        inputDigest: task.inputDigest,
+        createdAt: task.createdAt,
+        updatedAt: task.updatedAt,
+      };
+    });
+  }
+
+  /** Renames and/or archives/unarchives a task without disturbing its execution ledger. */
+  updateTask(taskId: string, input: { title?: string | null; archived?: boolean }): GetTaskResponse {
+    const existing = this.store.get(taskId);
+    if (!existing) throw new TaskNotFoundError(`task ${taskId} not found`);
+    const now = toIso(this.now());
+    const patch: { titleOverride?: string | null; archivedAt?: string | null; now: string } = { now };
+    if (input.title !== undefined) {
+      const cleaned = input.title === null ? "" : input.title.replace(/[\r\n]+/g, " ").trim();
+      if (cleaned.length > 120) {
+        throw new InvalidInputError("title must be at most 120 characters");
+      }
+      patch.titleOverride = cleaned === "" ? null : cleaned;
+    }
+    if (typeof input.archived === "boolean") {
+      patch.archivedAt = input.archived ? (existing.archivedAt ?? now) : null;
+      if (input.archived) {
+        this.inboxStore.resolve(taskId, "task_blocked_final", now);
+        this.inboxStore.resolve(taskId, "delivery_verified", now);
+      }
+    }
+    this.store.updateTaskMeta(taskId, patch);
+    return this.getTask(taskId);
+  }
+
+  /**
+   * Explicitly retries a failed, stopped, or waiting task under a fresh
+   * execution generation (`gN -> gN+1`), clearing its blocked inbox card and
+   * enqueuing a fresh dispatch job.
+   */
+  retryTask(taskId: string, input: { executorId?: string; model?: string } = {}): { taskId: string; status: TaskStatus; generation: number } {
+    const view = this.store.view(taskId);
+    if (!view) throw new TaskNotFoundError(`task ${taskId} not found`);
+    const status = view.task.status;
+    if (status === "completed") {
+      throw new TaskConflictError("task_terminated", `task ${taskId} is already completed`);
+    }
+    if (status === "running" || status === "accepted" || status === "verifying" || status === "stopping") {
+      throw new TaskConflictError("task_active", `task ${taskId} is currently ${status}`);
+    }
+
+    const now = toIso(this.now());
+    const nextExecutor = input.executorId?.trim() || view.task.executorId || view.execution?.providerInstanceId || "qwen-code";
+    const nextModel = input.model?.trim() || view.execution?.model || "default";
+    let nextGen = (view.execution?.generation ?? 1) + 1;
+
+    this.writer.commit({
+      taskId,
+      type: "run_observed",
+      payload: {
+        retry: {
+          fromStatus: status,
+          executorId: nextExecutor,
+          toGeneration: nextGen,
+        },
+      },
+      options: {
+        idempotencyKey: `retry:g${nextGen}`,
+        now,
+        enqueue: [{ kind: JOB_DISPATCH, dedupeKey: `retry:g${nextGen}`, runAfter: now }],
+      },
+      project: () => {
+        const advanced = this.store.advanceExecutionGeneration(taskId, {
+          environment: nextExecutor,
+          providerInstanceId: nextExecutor,
+          model: nextModel,
+          now,
+        });
+        nextGen = advanced.toGeneration;
+        this.store.setFailure(taskId, null, now);
+        this.store.setStatus(taskId, "accepted", null, now);
+        this.store.setOperationStatus(`${taskId}:dispatch`, "pending", { retriedGeneration: nextGen }, now);
+        this.store.setEvidence(taskId, "attemptsUsed", 0, now);
+        this.inboxStore.resolve(taskId, "task_blocked_final", now);
+        this.inboxStore.resolve(taskId, "delivery_verified", now);
+      },
+    });
+    return { taskId, status: "accepted", generation: nextGen };
+  }
+
+  /**
+   * Dismisses an informational/blocked inbox card (`task_blocked_final` or
+   * `delivery_verified`). Red-line `decision_required` cards cannot be silently
+   * dismissed and must be explicitly approved or declined.
+   */
+  dismissInboxItem(taskId: string, decisionKey: "decision_required" | "delivery_verified" | "task_blocked_final"): { dismissed: boolean } {
+    if (decisionKey === "decision_required") {
+      throw new InvalidInputError("decision_required items must be resolved via approve/reject, not dismissed");
+    }
+    const dismissed = this.inboxStore.resolve(taskId, decisionKey, toIso(this.now()));
+    return { dismissed };
+  }
+
+  /**
+   * Permanently deletes a task and cleans up its managed worktrees and run logs.
+   * Refuses active (non-terminal) tasks unless `force: true` is passed, in which
+   * case the active run is interrupted and its gateway token revoked first.
+   */
+  async deleteTask(
+    taskId: string,
+    options: {
+      force?: boolean;
+      workspaces?: WorkspaceManager;
+      runStreams?: { removeTask(taskId: string): void };
+      mcpGateway?: { revoke(taskId: string, generation?: number): void };
+      interruptActive?: (taskId: string) => Promise<void>;
+    } = {},
+  ): Promise<{ deleted: true; taskId: string; removedWorktrees: number }> {
+    const existing = this.store.get(taskId);
+    if (!existing) throw new TaskNotFoundError(`task ${taskId} not found`);
+    if (!isTerminal(existing.status)) {
+      if (!options.force) {
+        throw new TaskConflictError("task_active", `task ${taskId} is ${existing.status}; stop it first or pass force=true to delete`);
+      }
+      options.mcpGateway?.revoke(taskId);
+      if (options.interruptActive) {
+        try {
+          await options.interruptActive(taskId);
+        } catch {
+          // Best-effort interrupt before deletion.
+        }
+      }
+    }
+
+    const deleted = this.store.deleteTask(taskId);
+    if (!deleted) throw new TaskNotFoundError(`task ${taskId} not found`);
+
+    let removedWorktrees = 0;
+    if (options.workspaces) {
+      for (const ws of options.workspaces.listWorkspaces()) {
+        if (ws.taskId !== taskId) continue;
+        try {
+          const res = options.workspaces.teardown(ws.taskId, ws.generation, { force: true });
+          if (res.removed) removedWorktrees += 1;
+        } catch {
+          // Best-effort worktree cleanup on task deletion.
+        }
+      }
+    }
+    try {
+      options.runStreams?.removeTask(taskId);
+    } catch {
+      // Best-effort run log cleanup.
+    }
+    return { deleted: true, taskId, removedWorktrees };
   }
 
   /**
@@ -1256,7 +1564,7 @@ export interface StopTaskInput {
 export class TaskConflictError extends Error {
   override readonly name = "TaskConflictError";
   constructor(
-    readonly code: "version_conflict" | "task_terminated" | "invalid_state",
+    readonly code: "version_conflict" | "task_terminated" | "invalid_state" | "task_active",
     message: string,
     readonly details?: unknown,
   ) {
@@ -1271,6 +1579,17 @@ function isValidUtf8(bytes: Uint8Array): boolean {
   } catch {
     return false;
   }
+}
+
+function summarizeTaskTitle(raw: string, kind: TaskKind, taskId: string): string {
+  const firstLine = raw
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .find((line) => line.length > 0);
+  if (!firstLine) {
+    return kind === "sse_log" ? `日志诊断 · ${taskId.slice(0, 8)}` : `开发任务 · ${taskId.slice(0, 8)}`;
+  }
+  return firstLine.length > 48 ? `${firstLine.slice(0, 47)}…` : firstLine;
 }
 
 export { RequestConflictError };

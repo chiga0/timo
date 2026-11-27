@@ -309,6 +309,65 @@ export class WorkspaceManager {
     });
   }
 
+  /** Lists all Timo-managed generation worktrees currently on disk. */
+  listWorkspaces(): Array<{
+    taskId: string;
+    generation: number;
+    root: string;
+    repos: Array<{ name: string; sourcePath: string; branch: string; baseRef: string; baseSha: string; headSha: string | null; dirty: boolean }>;
+  }> {
+    if (!existsSync(this.options.home)) return [];
+    const results: Array<{
+      taskId: string;
+      generation: number;
+      root: string;
+      repos: Array<{ name: string; sourcePath: string; branch: string; baseRef: string; baseSha: string; headSha: string | null; dirty: boolean }>;
+    }> = [];
+    let taskDirs;
+    try {
+      taskDirs = readdirSync(this.options.home, { withFileTypes: true });
+    } catch {
+      return [];
+    }
+    for (const taskDir of taskDirs) {
+      if (!taskDir.isDirectory() || taskDir.name.startsWith(".")) continue;
+      const taskPath = join(this.options.home, taskDir.name);
+      let genDirs;
+      try {
+        genDirs = readdirSync(taskPath, { withFileTypes: true });
+      } catch {
+        continue;
+      }
+      for (const genDir of genDirs) {
+        if (!genDir.isDirectory()) continue;
+        const match = /^g(\d+)$/.exec(genDir.name);
+        if (!match) continue;
+        const generation = Number(match[1]);
+        const loaded = this.load(taskDir.name, generation);
+        if (!loaded) continue;
+        const statuses = this.status(loaded);
+        results.push({
+          taskId: loaded.taskId,
+          generation: loaded.generation,
+          root: loaded.root,
+          repos: loaded.repos.map((r) => {
+            const st = statuses.find((s) => s.name === r.name);
+            return {
+              name: r.name,
+              sourcePath: r.sourcePath,
+              branch: r.branch,
+              baseRef: r.baseRef,
+              baseSha: r.baseSha,
+              headSha: st?.headSha ?? null,
+              dirty: st?.dirty ?? false,
+            };
+          }),
+        });
+      }
+    }
+    return results.sort((a, b) => a.taskId.localeCompare(b.taskId) || b.generation - a.generation);
+  }
+
   /**
    * Removes the generation directory. A dirty workspace is refused unless the
    * caller explicitly allows discarding it, because those files may be the only

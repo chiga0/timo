@@ -163,7 +163,8 @@ export class CodexAdapter implements ExecutionAdapter {
     let seq = 0;
     const emit = (type: RunStreamEventType, summary: string, data?: unknown) => {
       seq += 1;
-      onEvent({ seq, runId: request.runId, taskId: request.taskId, type, at: Date.now(), summary: this.clip(summary), data });
+      const normalized = type === "text_delta" ? summary : this.clip(summary);
+      onEvent({ seq, runId: request.runId, taskId: request.taskId, type, at: Date.now(), summary: normalized, data });
     };
     emit("status", resumeThreadId ? `codex resuming thread ${resumeThreadId}` : "codex started");
 

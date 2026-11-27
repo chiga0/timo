@@ -17,7 +17,9 @@ export interface InboxItem {
 }
 
 const KEY_BY_EVENT: Partial<Record<EventType, DecisionKey>> = {
-  task_completed: "delivery_verified",
+  // Only actionable items requiring human decision or intervention belong in
+  // "待我处理". Completed deliveries report in Main Chat and Task list without
+  // demanding manual confirmation.
   task_failed: "task_blocked_final",
   decision_required: "decision_required",
 };
@@ -126,9 +128,9 @@ function asRecord(value: unknown): Record<string, unknown> {
   return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
 }
 
-function titleFor(key: DecisionKey, type: EventType): string {
-  if (key === "delivery_verified") return "交付已验证";
-  if (key === "task_blocked_final") return `任务阻塞（${type}）`;
+function titleFor(key: DecisionKey, _type: EventType): string {
+  if (key === "delivery_verified") return "交付已完成";
+  if (key === "task_blocked_final") return "任务执行阻塞";
   return "需要你的决定";
 }
 

@@ -8,7 +8,7 @@ export function Palette(props: { tasks: TaskSummary[]; onSelect: (taskId: string
   const inputRef = useRef<HTMLInputElement>(null);
 
   const matches = props.tasks.filter((task) => {
-    const text = `${task.taskId} ${task.status} ${task.waitingReason ?? ""}`.toLowerCase();
+    const text = `${task.title ?? ""} ${task.taskId} ${task.status} ${task.waitingReason ?? ""} ${(task.repoNames ?? []).join(" ")} ${task.archivedAt ? "已归档 archived" : ""}`.toLowerCase();
     return query.trim() === "" || text.includes(query.trim().toLowerCase());
   });
 
@@ -58,8 +58,9 @@ export function Palette(props: { tasks: TaskSummary[]; onSelect: (taskId: string
               onMouseEnter={() => setIndex(position)}
               onClick={() => choose(task)}
             >
-              <span className="mono">{task.taskId.slice(0, 8)}</span>
-              <span className="muted">{task.status}</span>
+              <span>{task.title || task.taskId.slice(0, 8)}</span>
+              {task.archivedAt && <span className="badge-pill">已归档</span>}
+              <span className="muted" style={{ marginLeft: "auto" }}>{task.status}</span>
               {task.waitingReason && <span className="muted">{task.waitingReason}</span>}
             </div>
           ))}

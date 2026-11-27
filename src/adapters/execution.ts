@@ -8,7 +8,7 @@
  * runtime and `streamEvents` translates its output.
  */
 
-export type RunStreamEventType = "thinking" | "tool_call" | "tool_result" | "shell" | "patch" | "status" | "error";
+export type RunStreamEventType = "text_delta" | "thinking" | "tool_call" | "tool_result" | "shell" | "patch" | "status" | "error";
 
 /**
  * Normalised live-run event. These go to `<TIMO_HOME>/runs/<taskId>/<runId>.ndjson`
