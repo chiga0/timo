@@ -1,6 +1,7 @@
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
+import type { HandoffRepo, HandoffSnapshot } from "./handoff.js";
 
 /**
  * Autonomous multi-repo worktrees. One task owns one generation directory with
@@ -19,7 +20,15 @@ import { basename, dirname, join } from "node:path";
 export class WorkspaceError extends Error {
   override readonly name = "WorkspaceError";
   constructor(
-    readonly code: "base_ref_missing" | "repo_missing" | "not_a_repo" | "dirty_workspace" | "git_failed" | "exists",
+    readonly code:
+      | "base_ref_missing"
+      | "repo_missing"
+      | "not_a_repo"
+      | "dirty_workspace"
+      | "git_failed"
+      | "exists"
+      | "generation_missing"
+      | "invalid_generation",
     message: string,
   ) {
     super(message);
@@ -85,7 +94,134 @@ export class WorkspaceManager {
   }
 
   /**
-   * Prepares a generation directory. All repos are validated before anything is
+   * Immutable snapshot handoff `g1 → g2` (docs/architecture.md "不可变目录交接").
+   *
+   * Nothing mutable is reused: `g2` is a brand-new worktree, so a zombie
+   * process still writing into `g1` cannot reach it. Uncommitted work is frozen
+   * two ways — a patch (`diff HEAD`, staged + unstaged) that any executor can
+   * review, and a byte-level materialization (overlay of `HEAD` plus the patch)
+   * that preserves working-tree semantics without committing on the author's
+   * behalf. Untracked files are copied raw. The returned snapshot carries
+   * `baseSha` and `sourcePath` so `HandoffCapsule` survives restarts.
+   */
+  handoff(taskId: string, fromGeneration: number, toGeneration: number): HandoffSnapshot {
+    if (!Number.isInteger(toGeneration) || toGeneration <= fromGeneration) {
+      throw new WorkspaceError("invalid_generation", `handoff requires g${toGeneration} > g${fromGeneration}`);
+    }
+    const source = this.load(taskId, fromGeneration);
+    if (!source) {
+      throw new WorkspaceError("generation_missing", `workspace g${fromGeneration} for ${taskId} does not exist`);
+    }
+    const targetRoot = this.rootFor(taskId, toGeneration);
+    if (existsSync(targetRoot)) {
+      throw new WorkspaceError("exists", `workspace ${targetRoot} already exists`);
+    }
+    mkdirSync(targetRoot, { recursive: true, mode: 0o700 });
+    const prepared: PreparedRepo[] = [];
+    const repos: HandoffRepo[] = [];
+    try {
+      for (const repo of source.repos) {
+        // Freeze everything about the source repo before `g2` exists.
+        const baseSha = repo.baseSha || this.headSha(repo.worktreePath);
+        const headSha = this.headSha(repo.worktreePath);
+        const diff = this.run(["diff", "HEAD"], repo.worktreePath);
+        const diffStat = this.run(["diff", "--stat", "HEAD"], repo.worktreePath).trim();
+        const untracked = this.freezeUntracked(repo.worktreePath);
+        // Only the source's staged paths are restored in `g2`'s index; a plain
+        // `add -A` would over-promote the unstaged edits.
+        const stagedPaths = this.run(["diff", "--cached", "--name-only", "-z"], repo.worktreePath)
+          .split("\0")
+          .filter((path) => path !== "");
+
+        const worktreePath = join(targetRoot, repo.name);
+        const safeTask = taskId.replace(/[^A-Za-z0-9_-]/g, "-").slice(0, 32) || "task";
+        const branch = `timo/${safeTask}/g${toGeneration}/${repo.name}`;
+        this.run(["worktree", "add", "-b", branch, worktreePath, baseSha], repo.sourcePath);
+        this.materializeOverlay(worktreePath, diff, stagedPaths, untracked);
+        this.linkIgnoredNodeModules(repo.sourcePath, worktreePath);
+        prepared.push({
+          name: repo.name,
+          sourcePath: repo.sourcePath,
+          worktreePath,
+          branch,
+          baseRef: repo.baseRef,
+          baseSha,
+        });
+        repos.push({
+          name: repo.name,
+          sourcePath: repo.sourcePath,
+          baseSha,
+          headSha,
+          diffStat,
+          diff,
+          untracked,
+          worktreePath,
+          branch,
+        });
+      }
+      const manifest: PreparedWorkspace = { taskId, generation: toGeneration, root: targetRoot, repos: prepared };
+      writeFileSync(join(targetRoot, ".timo-workspace.json"), JSON.stringify(manifest, null, 2), { mode: 0o600 });
+      return { taskId, fromGeneration, toGeneration, frozenAt: new Date().toISOString(), repos };
+    } catch (error) {
+      for (const repo of prepared) {
+        try {
+          this.run(["worktree", "remove", "--force", repo.worktreePath], repo.sourcePath);
+        } catch {
+          // best effort during failure cleanup
+        }
+        try {
+          this.run(["branch", "-D", repo.branch], repo.sourcePath);
+        } catch {
+          // best effort during failure cleanup
+        }
+      }
+      rmSync(targetRoot, { recursive: true, force: true });
+      throw error instanceof WorkspaceError ? error : new WorkspaceError("git_failed", String(error));
+    }
+  }
+
+  /** Snapshot of untracked (non-ignored) files as raw bytes, binary-safe. */
+  private freezeUntracked(worktreePath: string): HandoffRepo["untracked"] {
+    const listed = this.run(["ls-files", "--others", "--exclude-standard", "-z"], worktreePath);
+    return listed
+      .split("\0")
+      .filter((path) => path !== "")
+      .map((path) => {
+        const absolute = join(worktreePath, path);
+        const stat = statSync(absolute);
+        if (!stat.isFile()) {
+          throw new WorkspaceError("git_failed", `untracked entry ${path} is not a regular file`);
+        }
+        return { path, contentBase64: readFileSync(absolute).toString("base64"), size: stat.size };
+      });
+  }
+
+  /**
+   * Recreates the source working tree in the fresh checkout: applies the frozen
+   * patch, restores the index so `git diff` still shows the same changes, and
+   * writes the untracked bytes.
+   */
+  private materializeOverlay(
+    worktreePath: string,
+    diff: string,
+    stagedPaths: string[],
+    untracked: HandoffRepo["untracked"],
+  ): void {
+    if (diff !== "") {
+      this.runWithInput(["apply", "--whitespace=nowarn", "-"], worktreePath, diff, false);
+      // Deleted staged files must be staged as deletions too.
+      if (stagedPaths.length > 0) {
+        this.runWithInput(["add", "-A", "--pathspec-from-file=-", "--pathspec-file-nul"], worktreePath, stagedPaths.join("\0"), false);
+      }
+    }
+    for (const file of untracked) {
+      const absolute = join(worktreePath, file.path);
+      mkdirSync(dirname(absolute), { recursive: true });
+      writeFileSync(absolute, Buffer.from(file.contentBase64, "base64"));
+    }
+  }
+
+  /** Prepares a generation directory. All repos are validated before anything is
    * created; if a later repo fails, the whole half-built directory is removed so
    * no partial workspace survives a rejected request.
    */
@@ -232,6 +368,19 @@ export class WorkspaceManager {
   }
 
   /**
+   * Runs git with `input` on stdin (patch application). The default `run` is
+   * stdin-less by design, so this goes through `execFileSync` directly and keeps
+   * the same clean environment.
+   */
+  private runWithInput(args: string[], cwd: string, input: string, ignoreFailure: boolean): void {
+    try {
+      execFileSync("git", args, { cwd, input, env: gitEnv(), stdio: ["pipe", "pipe", "pipe"] });
+    } catch (error) {
+      if (!ignoreFailure) throw new WorkspaceError("git_failed", `git ${args.join(" ")} failed: ${String(error)}`);
+    }
+  }
+
+  /**
    * Symlinks `node_modules` from the source clone when it exists and is
    * gitignored, so Node/TS repos can run `npm test` inside fresh worktrees
    * without network installs or dirtying `git status`.
@@ -341,20 +490,27 @@ function safe<T>(fn: () => T, fallback: T): T {
   }
 }
 
+/**
+ * Clean git environment: deterministic identity and no interactive prompts, so
+ * the user's own git config and hooks cannot interfere in a headless service.
+ */
+function gitEnv(): NodeJS.ProcessEnv {
+  return {
+    ...process.env,
+    GIT_AUTHOR_NAME: process.env.GIT_AUTHOR_NAME ?? "Timo",
+    GIT_AUTHOR_EMAIL: process.env.GIT_AUTHOR_EMAIL ?? "timo@localhost",
+    GIT_COMMITTER_NAME: process.env.GIT_COMMITTER_NAME ?? "Timo",
+    GIT_COMMITTER_EMAIL: process.env.GIT_COMMITTER_EMAIL ?? "timo@localhost",
+    GIT_TERMINAL_PROMPT: "0",
+  };
+}
+
 /** Runs git with a clean environment so the user's local config cannot interfere. */
 function defaultRun(args: string[], cwd: string): string {
   return execFileSync("git", args, {
     cwd,
     encoding: "utf8",
-    env: {
-      ...process.env,
-      // Deterministic commits and no interactive prompts in a headless service.
-      GIT_AUTHOR_NAME: process.env.GIT_AUTHOR_NAME ?? "Timo",
-      GIT_AUTHOR_EMAIL: process.env.GIT_AUTHOR_EMAIL ?? "timo@localhost",
-      GIT_COMMITTER_NAME: process.env.GIT_COMMITTER_NAME ?? "Timo",
-      GIT_COMMITTER_EMAIL: process.env.GIT_COMMITTER_EMAIL ?? "timo@localhost",
-      GIT_TERMINAL_PROMPT: "0",
-    },
+    env: gitEnv(),
     stdio: ["ignore", "pipe", "pipe"],
   });
 }
