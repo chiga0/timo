@@ -30,6 +30,16 @@ import { TaskDetailView } from "./components/TaskDetailView.js";
 import { Thread } from "./components/Thread.js";
 import { Topbar } from "./components/Topbar.js";
 
+function readSavedComposerSelection(): { executorId: string | null; model: string } {
+  try {
+    const exec = window.localStorage.getItem("timo_selected_executor")?.trim() || null;
+    const model = window.localStorage.getItem("timo_selected_model")?.trim() || "";
+    return { executorId: exec, model };
+  } catch {
+    return { executorId: null, model: "" };
+  }
+}
+
 function readInitialTheme(): ThemePreference {
   try {
     const saved = window.localStorage.getItem("timo_theme");
@@ -79,6 +89,11 @@ export function App(): React.JSX.Element {
   const [leftOpen, setLeftOpen] = useState(true);
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [retrying, setRetrying] = useState(false);
+  const initialSelection = useMemo(readSavedComposerSelection, []);
+  const [selectedExecutorId, setSelectedExecutorId] = useState<string>(initialSelection.executorId || "qwen-code");
+  const [selectedModel, setSelectedModel] = useState<string>(initialSelection.model);
+  const hasManualExecRef = useRef<boolean>(Boolean(initialSelection.executorId));
+  const lastSettingsDefaultRef = useRef<string | null>(null);
   const [state, setState] = useState<WorkbenchState>({
     messages: [],
     contextSummary: null,
@@ -406,12 +421,69 @@ export function App(): React.JSX.Element {
     }
   };
 
+  const handleSelectExecutor = (executorId: string) => {
+    hasManualExecRef.current = true;
+    setSelectedExecutorId(executorId);
+    try {
+      window.localStorage.setItem("timo_selected_executor", executorId);
+    } catch {
+      // ignore storage restriction
+    }
+  };
+
+  const handleSelectModel = (model: string) => {
+    setSelectedModel(model);
+    try {
+      if (model) window.localStorage.setItem("timo_selected_model", model);
+      else window.localStorage.removeItem("timo_selected_model");
+    } catch {
+      // ignore storage restriction
+    }
+  };
+
+  // Sync default executor from settings ONLY when user hasn't picked one yet
+  // OR when the user explicitly changes `defaultExecutor` in Settings.
+  useEffect(() => {
+    const def = state.settingsPayload?.settings.assistant.defaultExecutor;
+    if (!def) return;
+    if (lastSettingsDefaultRef.current === null) {
+      lastSettingsDefaultRef.current = def;
+      if (!hasManualExecRef.current) {
+        setSelectedExecutorId(def);
+      }
+      return;
+    }
+    if (def !== lastSettingsDefaultRef.current) {
+      lastSettingsDefaultRef.current = def;
+      handleSelectExecutor(def);
+      handleSelectModel("");
+    }
+  }, [state.settingsPayload?.settings.assistant.defaultExecutor]);
+
+  // Fall back gracefully only if the currently selected executor is unavailable.
+  useEffect(() => {
+    const ready = state.executors.filter((e) => e.available);
+    if (ready.length > 0 && !ready.some((e) => e.id === selectedExecutorId)) {
+      const preferred =
+        ready.find((e) => e.id === state.settingsPayload?.settings.assistant.defaultExecutor) ??
+        ready.find((e) => e.id === "qwen-code") ??
+        ready[0]!;
+      setSelectedExecutorId(preferred.id);
+    }
+  }, [state.executors, selectedExecutorId]);
+
   const handleQuickPrompt = (text: string) => {
-    const defaultExec =
+    const activeExec =
+      selectedExecutorId ||
       state.settingsPayload?.settings.assistant.defaultExecutor ||
       state.executors.find((e) => e.available)?.id ||
       "qwen-code";
-    void handleSendChat({ kind: "repo_delivery", text, executorId: defaultExec });
+    void handleSendChat({
+      kind: "repo_delivery",
+      text,
+      executorId: activeExec,
+      ...(selectedModel ? { model: selectedModel } : {}),
+    });
   };
 
   const handleRenameTask = async (taskId: string, title: string) => {
@@ -661,6 +733,10 @@ export function App(): React.JSX.Element {
                   executors={state.executors}
                   executorProviders={state.executorProviders}
                   settings={state.settingsPayload?.settings ?? null}
+                  selectedExecutorId={selectedExecutorId}
+                  selectedModel={selectedModel}
+                  onSelectExecutor={handleSelectExecutor}
+                  onSelectModel={handleSelectModel}
                   contextSummary={state.contextSummary}
                   skills={state.skillsPayload?.skills ?? []}
                   onOpenSettings={(sec) => {

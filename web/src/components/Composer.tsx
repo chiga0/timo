@@ -26,6 +26,10 @@ export function Composer(props: {
   executors: ExecutorDescriptor[];
   executorProviders?: Record<string, ExecutorProviderCatalog>;
   settings: TimoUserSettings | null;
+  selectedExecutorId: string;
+  selectedModel: string;
+  onSelectExecutor: (executorId: string) => void;
+  onSelectModel: (model: string) => void;
   contextSummary?: ChatContextSummary | null;
   skills?: SkillRecord[];
   onOpenSettings: (section?: "assistant" | "folders" | "skills" | "connections" | "appearance" | "system") => void;
@@ -53,10 +57,10 @@ export function Composer(props: {
   const [repoPath, setRepoPath] = useState("");
   const [baseRef, setBaseRef] = useState("main");
   const [checkCommand, setCheckCommand] = useState("");
-  const [executorId, setExecutorId] = useState("qwen-code");
-  const [modelOverride, setModelOverride] = useState("");
   const menuRef = useRef<HTMLDivElement | null>(null);
-  const lastDefaultExecRef = useRef<string | null>(null);
+
+  const executorId = props.selectedExecutorId;
+  const modelOverride = props.selectedModel;
 
   useEffect(() => {
     if (!agentMenuOpen) return;
@@ -71,13 +75,6 @@ export function Composer(props: {
 
   useEffect(() => {
     if (!props.settings) return;
-    const defaultExec = props.settings.assistant.defaultExecutor;
-    // Sync executor ONLY on initial load or when the user changes defaultExecutor
-    // in Settings — never overwrite a manual selection during background task polls!
-    if (defaultExec && defaultExec !== lastDefaultExecRef.current) {
-      lastDefaultExecRef.current = defaultExec;
-      setExecutorId(defaultExec);
-    }
     if (selectedFolderId !== "__auto__" && selectedFolderId !== "__custom__") {
       const match = selectableFolders.find((f) => f.id === selectedFolderId);
       if (match) {
@@ -90,17 +87,6 @@ export function Composer(props: {
       }
     }
   }, [props.settings]);
-
-  useEffect(() => {
-    const ready = props.executors.filter((e) => e.available);
-    if (ready.length > 0 && !ready.some((e) => e.id === executorId)) {
-      const preferred =
-        ready.find((e) => e.id === props.settings?.assistant.defaultExecutor) ??
-        ready.find((e) => e.id === "qwen-code") ??
-        ready[0]!;
-      setExecutorId(preferred.id);
-    }
-  }, [props.executors]);
 
   const savedModelForExecutor = props.settings?.assistant.executorModels[executorId] ?? "";
   const effectiveModel = modelOverride.trim() || savedModelForExecutor;
@@ -294,6 +280,7 @@ export function Composer(props: {
                       <div className="agent-grid">
                         {executorOptions.map((exec) => {
                           const selected = exec.id === executorId;
+                          const isDefault = exec.id === props.settings?.assistant.defaultExecutor;
                           return (
                             <button
                               key={exec.id}
@@ -301,13 +288,17 @@ export function Composer(props: {
                               disabled={!exec.available}
                               className={selected ? "agent-option active" : "agent-option"}
                               onClick={() => {
-                                setExecutorId(exec.id);
-                                setModelOverride("");
+                                props.onSelectExecutor(exec.id);
+                                props.onSelectModel("");
                               }}
                             >
                               <AgentLogo id={exec.id} size={16} />
                               <span>{agentLabel(exec.id)}</span>
-                              {!exec.available && <span className="muted small" style={{ marginLeft: "auto" }}>未就绪</span>}
+                              {!exec.available ? (
+                                <span className="muted small" style={{ marginLeft: "auto" }}>未就绪</span>
+                              ) : isDefault ? (
+                                <span className="muted small" style={{ marginLeft: "auto" }}>默认</span>
+                              ) : null}
                             </button>
                           );
                         })}
@@ -327,7 +318,7 @@ export function Composer(props: {
                                 aria-label="选择已探测模型"
                                 className="input mono"
                                 value={effectiveModel}
-                                onChange={(event) => setModelOverride(event.target.value)}
+                                onChange={(event) => props.onSelectModel(event.target.value)}
                               >
                                 <option value="">使用默认模型{catalog?.defaultModel ? ` (${catalog.defaultModel})` : ""}</option>
                                 {providers.map((prov) =>
@@ -347,7 +338,7 @@ export function Composer(props: {
                               className="input mono"
                               placeholder={savedModelForExecutor || catalog?.defaultModel || "或手动输入模型 ID"}
                               value={modelOverride}
-                              onChange={(event) => setModelOverride(event.target.value)}
+                              onChange={(event) => props.onSelectModel(event.target.value)}
                             />
                           </div>
                         );
