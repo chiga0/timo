@@ -210,7 +210,8 @@ export class PiAdapter implements ExecutionAdapter {
     }
     if (type === "agent_start") return { events: [{ type: "status", summary: "agent started" }] };
     if (type === "agent_settled") return { events: [{ type: "status", summary: "agent settled" }] };
-    if (type === "message") {
+    if (type === "message_update" || type === "agent_end" || type === "turn_end" || type === "turn_start") return null;
+    if (type === "message" || type === "message_end") {
       const message = record.message as Record<string, unknown> | undefined;
       const role = typeof message?.role === "string" ? message.role : "assistant";
       const content = Array.isArray(message?.content) ? message!.content : [];

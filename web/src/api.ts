@@ -111,6 +111,20 @@ export interface PolicySnapshot {
   warning?: string;
 }
 
+export interface EfficiencyMetricsSnapshot {
+  totalTasks: number;
+  terminalTasks: number;
+  verifiedCompletedTasks: number;
+  verifiedDeliveryRate: number | null;
+  avgDurationMs: number | null;
+  totalHandoffs: number;
+  totalHumanInterruptions: number;
+  totalSilentAutoGrants: number;
+  inboxTelemetryLeaks: number;
+  costUsd: number | null;
+  costStatus: "measured" | "unknown_unmetered";
+}
+
 /**
  * Session token plumbing. The token is read from the page URL (`?token=`) or a
  * cookie set by the server; it is kept in memory and never written to storage.
@@ -242,6 +256,10 @@ export class Api {
 
   policy(): Promise<PolicySnapshot> {
     return this.call("/api/policy");
+  }
+
+  metrics(): Promise<EfficiencyMetricsSnapshot> {
+    return this.call("/api/metrics");
   }
 
   amend(taskId: string, expectedBriefVersion: number, goal: string): Promise<{ briefVersion: number }> {

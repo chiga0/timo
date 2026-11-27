@@ -27,6 +27,7 @@ const USAGE = `用法：
                                       不可变换执行器（g1 -> g2），迁移未提交改动与预算
   timo stop TASK_ID [--reason TEXT]   停止任务并作废当前执行代次
   timo executors                      查看已探测就绪的执行器列表
+  timo metrics [TASK_ID]              查看 M4 交付与注意力防火墙效率度量
 
 退出码：0 成功，1 服务或其他错误，2 参数或日志输入无效，3 任务不存在，4 请求冲突。
 成功时 JSON 只写 stdout；诊断写 stderr。`;
@@ -56,6 +57,7 @@ async function main(argv: string[]): Promise<number> {
   if (command === "handoff") return runHandoff(rest);
   if (command === "stop") return runStop(rest);
   if (command === "executors") return emit(await call("GET", "/api/executors"));
+  if (command === "metrics") return runMetrics(rest);
   process.stderr.write(`未知命令：${command}\n\n${USAGE}\n`);
   return EXIT_INVALID_INPUT;
 }
@@ -259,6 +261,13 @@ async function runStop(args: string[]): Promise<number> {
       reason: first(parsed.flags, "reason") ?? "user_requested",
     }),
   );
+}
+
+async function runMetrics(args: string[]): Promise<number> {
+  const positional = args.filter((arg) => !arg.startsWith("--"));
+  if (positional.length > 1) return fail(EXIT_INVALID_INPUT, "timo metrics 最多接受一个 TASK_ID");
+  const path = positional.length === 1 ? `/api/tasks/${encodeURIComponent(positional[0]!)}/metrics` : "/api/metrics";
+  return emit(await call("GET", path));
 }
 
 /**

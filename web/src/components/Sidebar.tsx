@@ -1,4 +1,4 @@
-import type { ExecutorDescriptor, InboxItem, PolicySnapshot, TaskSummary } from "../api.js";
+import type { EfficiencyMetricsSnapshot, ExecutorDescriptor, InboxItem, PolicySnapshot, TaskSummary } from "../api.js";
 
 const STATUS_LABEL: Record<string, string> = {
   accepted: "已接单",
@@ -16,6 +16,7 @@ export function Sidebar(props: {
   inbox: InboxItem[];
   policy: PolicySnapshot | null;
   executors: ExecutorDescriptor[];
+  metrics: EfficiencyMetricsSnapshot | null;
   selectedId: string | null;
   onSelect: (taskId: string) => void;
 }): React.JSX.Element {
@@ -93,6 +94,31 @@ export function Sidebar(props: {
                   </span>
                 </div>
               ))}
+            </div>
+          )}
+          {props.metrics && (
+            <div className="stack" style={{ marginTop: 6, paddingTop: 6, borderTop: "1px solid var(--border)", fontSize: 11 }}>
+              <div className="muted">效率度量（S07）</div>
+              <div className="row mono">
+                <span className="muted">验收率</span>
+                <span style={{ marginLeft: "auto" }}>
+                  {props.metrics.verifiedDeliveryRate === null
+                    ? "—"
+                    : `${Math.round(props.metrics.verifiedDeliveryRate * 100)}% (${props.metrics.verifiedCompletedTasks}/${props.metrics.terminalTasks})`}
+                </span>
+              </div>
+              <div className="row mono">
+                <span className="muted">静默放行 / 打断</span>
+                <span style={{ marginLeft: "auto" }}>
+                  {props.metrics.totalSilentAutoGrants} / {props.metrics.totalHumanInterruptions}
+                </span>
+              </div>
+              <div className="row mono">
+                <span className="muted">成本</span>
+                <span style={{ marginLeft: "auto" }}>
+                  {props.metrics.costStatus === "measured" && props.metrics.costUsd !== null ? `$${props.metrics.costUsd.toFixed(4)}` : "未知（未计量）"}
+                </span>
+              </div>
             </div>
           )}
         </div>

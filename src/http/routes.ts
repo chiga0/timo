@@ -69,6 +69,16 @@ export function registerApi(router: Router, deps: ApiDeps): void {
     body: { executors: deps.executors?.snapshot() ?? [] },
   }));
 
+  router.add("GET", "/api/metrics", (context) => {
+    const limit = parsePositiveInt(context.query.get("limit"), 200);
+    return { body: deps.service.efficiencyMetrics(limit) };
+  });
+
+  router.add("GET", "/api/tasks/:id/metrics", (context) => {
+    const taskId = context.params.id!;
+    return { body: withMappedErrors(() => deps.service.taskEfficiencyMetrics(taskId)) };
+  });
+
   router.add("GET", "/api/tasks", (context) => {
     const limit = parsePositiveInt(context.query.get("limit"), 200);
     const status = context.query.get("status") ?? undefined;

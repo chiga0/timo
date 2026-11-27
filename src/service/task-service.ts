@@ -32,6 +32,7 @@ import {
 } from "../verify/pipeline.js";
 import { buildHandoffCapsule, serializeHandoffCapsule, type HandoffCapsule } from "../workspace/handoff.js";
 import type { WorkspaceManager } from "../workspace/manager.js";
+import { computeAggregateMetrics, computeTaskMetrics, type AggregateEfficiencyMetrics, type TaskEfficiencyMetrics } from "../metrics/efficiency.js";
 import { basename } from "node:path";
 
 export class TaskNotFoundError extends Error {
@@ -1041,6 +1042,18 @@ export class TaskService {
   /** Inbox projection: only the three attention-worthy classes ever appear here. */
   listInbox(): InboxItem[] {
     return this.inboxStore.list();
+  }
+
+  /** Aggregate M4/S07 efficiency metrics computed from the durable SQLite ledger. */
+  efficiencyMetrics(limit = 200): AggregateEfficiencyMetrics {
+    return computeAggregateMetrics(this.db, this.store, limit);
+  }
+
+  /** Per-task M4/S07 efficiency metrics. */
+  taskEfficiencyMetrics(taskId: string): TaskEfficiencyMetrics {
+    const metrics = computeTaskMetrics(this.db, this.store, taskId);
+    if (!metrics) throw new TaskNotFoundError(`task ${taskId} not found`);
+    return metrics;
   }
 
   /**

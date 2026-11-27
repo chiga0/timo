@@ -5,6 +5,7 @@ import {
   readSessionToken,
   subscribeEvents,
   subscribeRunStream,
+  type EfficiencyMetricsSnapshot,
   type ExecutorDescriptor,
   type InboxItem,
   type PolicySnapshot,
@@ -28,6 +29,7 @@ export interface WorkbenchState {
   inbox: InboxItem[];
   policy: PolicySnapshot | null;
   executors: ExecutorDescriptor[];
+  metrics: EfficiencyMetricsSnapshot | null;
   defaultRepoPath: string;
   selectedId: string | null;
   detail: TaskDetail | null;
@@ -52,6 +54,7 @@ export function App(): React.JSX.Element {
     inbox: [],
     policy: null,
     executors: [],
+    metrics: null,
     defaultRepoPath: "",
     selectedId: null,
     detail: null,
@@ -68,7 +71,13 @@ export function App(): React.JSX.Element {
 
   const refresh = async (selectId?: string) => {
     try {
-      const [tasks, inbox, policy, health] = await Promise.all([api.listTasks(), api.inbox(), api.policy(), api.health()]);
+      const [tasks, inbox, policy, health, metrics] = await Promise.all([
+        api.listTasks(),
+        api.inbox(),
+        api.policy(),
+        api.health(),
+        api.metrics(),
+      ]);
       const nextId = selectId ?? selectedRef.current ?? tasks.tasks[0]?.taskId ?? null;
       const [detail, events, proposalsRes, runsRes] = nextId
         ? await Promise.all([api.getTask(nextId), api.taskEvents(nextId, 0), api.listProposals(nextId), api.taskRuns(nextId)])
@@ -80,6 +89,7 @@ export function App(): React.JSX.Element {
         inbox: inbox.items,
         policy,
         executors: health.executors ?? previous.executors,
+        metrics,
         defaultRepoPath: health.defaultRepoPath ?? previous.defaultRepoPath,
         selectedId: nextId,
         detail,
@@ -220,6 +230,7 @@ export function App(): React.JSX.Element {
               inbox={state.inbox}
               policy={state.policy}
               executors={state.executors}
+              metrics={state.metrics}
               selectedId={state.selectedId}
               onSelect={(taskId) => void select(taskId)}
             />

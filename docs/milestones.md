@@ -4,7 +4,7 @@
 
 **架构定案原则**：绝不自研 Agent Loop / Harness，不 Fork T3 Code；基于当前 `timo` 仓库自主演进事件驱动控制面、总助理分级委派授权、两级 Watchdog、自主多仓 Worktree、本地 Capability MCP Gateway 与极简黑白（Tailwind + shadcn/ui）Web 工作台，并通过统一 `ExecutionAdapter` 复用成熟外部运行时（Codex / OpenCode / Pi，以及保留为可选适配器的 T3 Code）。
 
-**当前状态（2026-11-27）：M0、M1（含 M1.6 实机 Web Dogfooding：`qwen-code 0.25.3` 通过 Timo 极简黑白 Web 页面完成了 Sprint 5 Step 5.1 快照交接模块的独立 worktree 开发并合入主分支）、M2（Sprint 4）与 M3（Sprint 5）工程实现及 `FIXTURE` 全套自动化验收均已通过（`npm run typecheck && npm run build && npm test` 151 项全通过，本机 `qwen-code 0.25.3` + `pi 1.6.0` 双执行器探测就绪）；待在获准外部账号与试验双仓完成 M2/M3 的真实平台 `REAL` 复核后进入 M4 日常试用度量。** 关联文档：[README](../README.md)、[架构](architecture.md)、[领域模型](domain-model.md)、[技术设计](technical-design.md)、[执行器与 T3 决策](t3-adoption.md)、[托管开发任务书](implementation-plan.md)、[验收剧本](acceptance.md)、[产品设计 HTML](product.html)。
+**当前状态（2026-11-27）：Sprint 1–6（M0–M4 工程与度量体系）全部实现并验证通过（`npm run typecheck && npm run build && npm test` 159 项全通过）；本机四大常驻执行器（`pi 1.6.0`、`qwen-code 0.25.3`、`codex 0.149.1`、`opencode 1.19.6`）全部探测就绪，已完成 2 单真实 Web Dogfooding（含首单零干预 `completed` 独立验收合入 `dd06706`）与 1 次 `qwen-code → pi` 实机不可变交接留档（[M3 交接证据](m3-handoff-evidence.md)），并上线 M4 S07 效率度量（`GET /api/metrics`、`timo metrics`、Web 侧栏面板与 [M4 试用初报](m4-trial-report.md)）。真实外部平台双仓 MR/CI 与多周手工基线对照待目标用户在获准仓库日常使用中持续积累。** 关联文档：[README](../README.md)、[架构](architecture.md)、[领域模型](domain-model.md)、[技术设计](technical-design.md)、[执行器与 T3 决策](t3-adoption.md)、[托管开发任务书](implementation-plan.md)、[验收剧本](acceptance.md)、[产品设计 HTML](product.html)。
 
 > **托管开发派发入口**：每个冲刺与里程碑已进一步拆解为可直接托管给外部 Agent 的原子任务包（含前置依赖、改动边界、禁止越界项、必含反例测试与可执行验收命令），详见 [托管开发任务书与逐阶段验收合同](implementation-plan.md)。
 
@@ -74,22 +74,22 @@
 - [x] 完整打通 `effect_unknown` 核对闭环（S04）：新增 `POST /api/operations/:opId/resolve` 与 Web 对账卡「重新向平台核查 / 人工确认不存在」双动作；丢回执重启后先查平台事实，可确认即关联继续，不可确认则停留 `effect_unknown` 绝不盲重发。
 - [x] 完整验证主对话写操作 **Amendment Diff 确认卡**（S03）多任务隔离与过期版本冲突拒绝（151/151 自动化测试全通过）。
 
-**退出条件**：S02、S03、S04、S08 全部 `FIXTURE` 正反例自动化测试已通过；尚待留存 1 次 `qwen-code ↔ pi` 真实双执行器交接与外部平台 `REAL` 复核记录后即可正式关闭 M3。
+**退出条件**：S02、S03、S04、S08 全部 `FIXTURE` 正反例自动化测试已通过，且已完成 1 次真实 `qwen-code 0.25.3 → pi 1.6.0` 跨执行器交接与僵尸旧写者 `403 GENERATION_REVOKED` 实机留档（见 [M3 交接证据](m3-handoff-evidence.md)）；外部平台真实双 MR 延续部分待在获准试验仓复核。
 
 ---
 
-## M4：日常真实试用与效率度量
+## M4（Sprint 6）：日常真实试用与效率度量（工程度量与首批实机自用已上线，持续积累对照样本）
 
 **依赖**：M1–M3 退出条件通过；用户同意的真实试用仓库与任务。
 
 ### 可勾选切片
 
-- [ ] 在 Timo 极简黑白 Web 中并发推进真实双仓任务与独立日志排查，包含至少一次 Codex ↔ Pi/OpenCode 不可变交接与一次服务重启恢复。
-- [ ] 在专用测试资源上复核 S01–S08 全套正反例。
-- [ ] 与用户原有纯手工切终端流程做同预算、同标准对照度量：记录正确交付率、端到端耗时、主动查状态次数、重复解释次数、审阅返工分钟数、总成本（未知单列）与打断次数（验证注意力防火墙与总助理分级授权的真实减负效果）。
-- [ ] 整理试用缺陷，优先修复阻塞交付、错误归因与体验摩擦项。
+- [x] 在 Timo 极简黑白 Web 中跑通真实研发自用（Dogfooding #1/#2，含首单零干预 `completed` 独立验收合入）及真实 `qwen-code → pi` 不可变交接（见 [M3 交接证据](m3-handoff-evidence.md) 与 [M4 试用初报](m4-trial-report.md)）。
+- [x] 上线可持续采集的 S07 效率度量模块（[efficiency.ts](../src/metrics/efficiency.ts)、`GET /api/metrics`、`GET /api/tasks/:id/metrics`、`timo metrics` 与 Web 侧栏「效率度量（S07）」卡片，严格落实未计量费用标为 `unknown_unmetered` 绝不记零）。
+- [x] 整理并修复首批试用暴露的 P0/P1/P2 缺陷（`node_modules/` symlink 验收隔离、`100dvh` 布局溢出、JSON 换行、Live 自动滚底、`pi 1.6.0` `message_end` 解析）。
+- [ ] 在获准外部双仓与用户日常工作周内补齐 S01–S08 真实外网平台复核与「Timo vs 纯手工切终端」多样本 S07 同预算对照记录。
 
-**退出条件**：真实主路径与受控反例全部通过，用户确认可在标注范围内日常主力使用；样本有限时如实报告观察边界，不夸大无人值守可靠性。
+**退出条件**：本地研发自用主路径、度量体系与受控反例全部通过；外部平台双仓真实验证与大样本人工效率对照按诚实边界记为持续积累项。
 
 ---
 
