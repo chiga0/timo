@@ -19,6 +19,7 @@ import { T3ExecutionAdapter } from "../adapters/t3-adapter.js";
 import { WorkspaceManager } from "../workspace/manager.js";
 import { RunStreamStore } from "../workspace/run-stream.js";
 import { ChatStore, ChatStreamBus } from "../store/chat.js";
+import { AttachmentStore } from "../store/attachments.js";
 import { MainChatRunner } from "./chat-runner.js";
 import { SkillRegistry } from "../skills/registry.js";
 import { CapabilityMcpGateway } from "../gateway/mcp-gateway.js";
@@ -93,6 +94,7 @@ export async function serve(): Promise<void> {
   // Workspace, assistant, knowledge base, unified skills & isolated credentials store.
   const settingsStore = new SettingsStore(home, env);
   const skillRegistry = new SkillRegistry(home, env);
+  const attachments = new AttachmentStore(home);
 
   // Local Capability MCP Gateway (Step 4.1 + 4.2): holds platform credentials
   // strictly inside the gateway process, never exposed to Worker subprocesses.
@@ -136,6 +138,7 @@ export async function serve(): Promise<void> {
     executors,
     settingsStore,
     skillRegistry,
+    attachments,
     mcpGateway,
     log,
   });
@@ -199,6 +202,7 @@ export async function serve(): Promise<void> {
     workspaces,
     mcpGateway,
     chatStore,
+    attachments,
     chatBus,
     chatRunner,
     interruptActive: (id: string) => runner.interruptTask(id),
@@ -231,6 +235,7 @@ export async function serve(): Promise<void> {
         router: webRouter,
         target: { host: "127.0.0.1", port: httpPort },
         token,
+        maxBodyBytes: 24 * 1024 * 1024,
         onError: (error) => log(`loopback: ${String(error)}`),
       });
       listeners.push(loopback);

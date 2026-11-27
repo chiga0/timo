@@ -829,10 +829,173 @@ button {
 }
 
 .compose-box {
+  position: relative;
   border: 1px solid var(--border);
   border-radius: 10px;
   background: var(--card);
   box-shadow: var(--shadow-sm);
+  transition: border-color 120ms ease, background 120ms ease;
+}
+
+.compose-box.is-dragging {
+  border-color: var(--primary);
+  border-style: dashed;
+  background: var(--muted-bg);
+}
+
+.compose-drop-hint {
+  position: absolute;
+  inset: 0;
+  z-index: 10;
+  display: grid;
+  place-items: center;
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--bg) 86%, transparent);
+  color: var(--ink);
+  font-size: 13px;
+  font-weight: 600;
+  pointer-events: none;
+}
+
+.compose-attach-strip {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px 2px;
+}
+
+.compose-attach-thumb {
+  position: relative;
+  width: 52px;
+  height: 52px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  overflow: visible;
+  background: var(--muted-bg);
+  flex-shrink: 0;
+}
+
+.compose-attach-thumb img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  border-radius: 7px;
+}
+
+.compose-attach-rm {
+  position: absolute;
+  top: -6px;
+  right: -6px;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--card);
+  color: var(--ink);
+  font-size: 12px;
+  line-height: 1;
+  display: grid;
+  place-items: center;
+  box-shadow: var(--shadow-sm);
+}
+
+.compose-attach-rm:hover {
+  background: var(--error);
+  border-color: var(--error);
+  color: #fff;
+}
+
+.compose-attach-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 240px;
+  height: 30px;
+  padding: 0 8px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--muted-bg);
+  font-size: 11.5px;
+  color: var(--ink);
+}
+
+.compose-attach-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.compose-attach-chip-rm {
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  font-size: 14px;
+  line-height: 1;
+  padding: 0 2px;
+}
+
+.compose-attach-chip-rm:hover {
+  color: var(--error);
+}
+
+.compose-attach-err {
+  width: 100%;
+  font-size: 11.5px;
+  color: var(--error);
+}
+
+.msg-attach-list {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+
+.msg-attach-list:last-child {
+  margin-bottom: 0;
+}
+
+.msg-attach-img-link {
+  display: block;
+  border-radius: 8px;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  background: var(--card);
+}
+
+.msg-attach-img {
+  display: block;
+  max-width: 220px;
+  max-height: 160px;
+  object-fit: cover;
+}
+
+.msg-attach-file {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 240px;
+  padding: 5px 9px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--card);
+  color: var(--ink);
+  font-size: 11.5px;
+  text-decoration: none;
+}
+
+.msg-attach-file:hover {
+  border-color: var(--muted);
+}
+
+.msg-attach-file-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .compose-box:focus-within {

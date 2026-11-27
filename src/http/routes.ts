@@ -17,6 +17,7 @@ import { EnterpriseGitPlatformAdapter } from "../platform/adapter.js";
 import { discoverExecutorProviders, type ExecutorProviderCatalog } from "../adapters/providers.js";
 import { inspectLocalFolder, pickNativeFolder, probeLocalPlatformAuth, resolveValidBaseRef, scanWorkspaceRoot, selectFoldersForRequest } from "../workspace/inspect.js";
 import type { ChatStore, ChatStreamBus, ChatStreamFrame } from "../store/chat.js";
+import type { AttachmentStore } from "../store/attachments.js";
 import type { MainChatRunner } from "../service/chat-runner.js";
 import type { SkillRegistry } from "../skills/registry.js";
 
@@ -45,8 +46,9 @@ export interface ApiDeps {
   interruptActive?: (taskId: string) => Promise<void>;
   /** Live steering hook into the runner (Step 3.2). */
   steer?: (taskId: string, message: string) => Promise<{ accepted: boolean; runId: string | null; reason?: string }>;
-  /** Fixed Main Chat store, SSE bus, and runner. */
+  /** Fixed Main Chat store, attachments, SSE bus, and runner. */
   chatStore?: ChatStore;
+  attachments?: AttachmentStore;
   chatBus?: ChatStreamBus;
   chatRunner?: MainChatRunner;
   /** Operation reconciliation hook (Step 4.2). */
@@ -452,12 +454,66 @@ export function registerApi(router: Router, deps: ApiDeps): void {
     return { body: { ...report, skills: deps.skillRegistry.list(settings) } };
   });
 
+  router.add("POST", "/api/attachments", (context) => {
+    if (!deps.attachments) {
+      throw new RouteError(501, "unsupported", "attachment store is not configured");
+    }
+    const body = asRecord(context.body);
+    const dataBase64 = requireString(body.dataBase64, "dataBase64");
+    const attachment = withMappedErrors(() =>
+      deps.attachments!.saveBase64({
+        name: optionalString(body.name),
+        mimeType: optionalString(body.mimeType),
+        dataBase64,
+      }),
+    );
+    return { status: 201, body: { attachment } };
+  });
+
+  router.add("GET", "/api/attachments/:id", (context) => {
+    if (!deps.attachments) {
+      throw new RouteError(501, "unsupported", "attachment store is not configured");
+    }
+    const id = requireString(context.params.id, "id");
+    const found = deps.attachments.readBytes(id);
+    if (!found) {
+      throw new RouteError(404, "not_found", `attachment ${id} not found`);
+    }
+    const disposition = found.attachment.isImage
+      ? "inline"
+      : `attachment; filename*=UTF-8''${encodeURIComponent(found.attachment.name)}`;
+    return {
+      stream: async (res) => {
+        res.writeHead(200, {
+          "content-type": found.attachment.mimeType,
+          "content-length": String(found.bytes.byteLength),
+          "content-disposition": disposition,
+          "x-content-type-options": "nosniff",
+          "cache-control": "private, max-age=3600",
+        });
+        res.end(found.bytes);
+      },
+    };
+  });
+
+  router.add("DELETE", "/api/attachments/:id", (context) => {
+    if (!deps.attachments) {
+      throw new RouteError(501, "unsupported", "attachment store is not configured");
+    }
+    const id = requireString(context.params.id, "id");
+    return { body: { deleted: deps.attachments.delete(id), id } };
+  });
+
   router.add("POST", "/api/chat/send", (context) => {
     if (!deps.chatRunner) {
       throw new RouteError(501, "unsupported", "main chat runner is not configured");
     }
     const body = asRecord(context.body);
-    const text = requireString(body.text, "text");
+    const attachmentIds = optionalStringArray(body.attachmentIds);
+    const text = typeof body.text === "string" ? body.text : "";
+    if (text.trim() === "" && (!attachmentIds || attachmentIds.length === 0)) {
+      throw new RouteError(400, "invalid_input", "text or attachmentIds is required");
+    }
     const mode = body.mode === "sse_log" || body.mode === "repo_delivery" || body.mode === "auto" ? body.mode : "auto";
     const result = withMappedErrors(() =>
       deps.chatRunner!.send({
@@ -469,6 +525,7 @@ export function registerApi(router: Router, deps: ApiDeps): void {
         baseRef: optionalString(body.baseRef),
         checkCommand: optionalString(body.checkCommand),
         maxRepairRounds: typeof body.maxRepairRounds === "number" ? body.maxRepairRounds : undefined,
+        attachmentIds,
       }),
     );
     return { status: 201, body: result };

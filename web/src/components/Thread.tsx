@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import type { ChatMessage, InboxItem, TaskProgressFrame, TaskSummary } from "../api.js";
+import { readSessionToken, type ChatMessage, type InboxItem, type TaskProgressFrame, type TaskSummary } from "../api.js";
 import { AgentLogo, agentLabel } from "./AgentIcons.js";
 import { Markdown } from "./Markdown.js";
 import {
@@ -43,6 +43,7 @@ export function Thread(props: {
   tasks: TaskSummary[];
   inbox: InboxItem[];
   liveProgress: Record<string, TaskProgressFrame>;
+  scrollTrigger?: number;
   onQuickPrompt: (text: string) => void;
   onOpenTask: (taskId: string) => void;
   onStopChat: (messageId: string) => void;
@@ -70,13 +71,14 @@ export function Thread(props: {
     return !props.messages.slice(idx + 1).some((later) => later.role === "user");
   });
 
-  // Auto-snap to bottom on mount/refresh & follow new chunks only when user stays near bottom.
+  // Auto-snap to bottom on mount/refresh & whenever the user explicitly submits a new message.
   const firstMsgId = props.messages[0]?.messageId ?? "empty";
   const { showScrollButton, scrollToBottom, suspendFollow } = useAutoScroll({
     scrollRef,
     contentRef: innerRef,
     resetKey: firstMsgId === "empty" ? "empty" : "loaded",
     contentVersion: `${props.messages.length}:${lastMsg?.messageId ?? ""}:${lastMsg?.content.length ?? 0}:${lastMsg?.status ?? ""}`,
+    forceScrollTrigger: props.scrollTrigger,
   });
 
   // Build Codex-style left prompt navigation ticks (one tick per user prompt turn).
@@ -85,7 +87,11 @@ export function Thread(props: {
     for (let i = 0; i < props.messages.length; i += 1) {
       const msg = props.messages[i]!;
       if (msg.role !== "user") continue;
-      const prompt = msg.content.replace(/\s+/g, " ").trim() || "(空提问)";
+      const attachFallback =
+        msg.attachments && msg.attachments.length > 0
+          ? `[${msg.attachments.some((a) => a.isImage) ? "图片" : "附件"}] ${msg.attachments.map((a) => a.name).join("、")}`
+          : "(空提问)";
+      const prompt = msg.content.replace(/\s+/g, " ").trim() || attachFallback;
       let preview = "";
       let badge: string | undefined;
       for (let j = i + 1; j < props.messages.length; j += 1) {
@@ -149,9 +155,50 @@ export function Thread(props: {
         ) : (
           props.messages.map((msg, msgIdx) => {
             if (msg.role === "user") {
+              const atts = msg.attachments ?? [];
+              const token = readSessionToken();
+              const authUrl = (u: string) => (token ? `${u}${u.includes("?") ? "&" : "?"}token=${encodeURIComponent(token)}` : u);
               return (
                 <div key={msg.messageId} data-nav-id={msg.messageId} className="msg-user-wrap">
-                  <div className="msg-user">{msg.content}</div>
+                  <div className="msg-user">
+                    {atts.length > 0 && (
+                      <div className="msg-attach-list">
+                        {atts.map((att) =>
+                          att.isImage ? (
+                            <a
+                              key={att.id}
+                              href={authUrl(att.url)}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="msg-attach-img-link"
+                              title={`点击查看原图：${att.name}`}
+                            >
+                              <img src={authUrl(att.url)} alt={att.name} className="msg-attach-img" />
+                            </a>
+                          ) : (
+                            <a
+                              key={att.id}
+                              href={authUrl(att.url)}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="msg-attach-file"
+                              title={`点击下载：${att.name}`}
+                            >
+                              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" aria-hidden="true">
+                                <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+                                <polyline points="14 2 14 8 20 8" />
+                              </svg>
+                              <span className="msg-attach-file-name">{att.name}</span>
+                              <span className="muted mono" style={{ fontSize: 10 }}>
+                                {formatAttachmentBytes(att.sizeBytes)}
+                              </span>
+                            </a>
+                          ),
+                        )}
+                      </div>
+                    )}
+                    {msg.content && <div>{msg.content}</div>}
+                  </div>
                 </div>
               );
             }
@@ -426,4 +473,11 @@ function statusDot(status: string, pulse = false): string {
           ? "dot dot-warning"
           : "dot";
   return pulse ? `${base} dot-pulse` : base;
+}
+
+function formatAttachmentBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  const kb = bytes / 1024;
+  if (kb < 1024) return `${kb >= 100 ? Math.round(kb) : kb.toFixed(1)} KB`;
+  return `${(kb / 1024).toFixed(1)} MB`;
 }

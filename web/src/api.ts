@@ -90,6 +90,16 @@ export interface SkillsPayload {
   externalSources: ExternalSkillSource[];
 }
 
+export interface ChatAttachment {
+  id: string;
+  name: string;
+  mimeType: string;
+  sizeBytes: number;
+  isImage: boolean;
+  filePath: string;
+  url: string;
+}
+
 export interface ChatMessage {
   messageId: string;
   role: "user" | "assistant" | "task_card";
@@ -98,6 +108,7 @@ export interface ChatMessage {
   executorId: string | null;
   model: string | null;
   status: "streaming" | "done" | "error";
+  attachments?: ChatAttachment[];
   createdAt: string;
   updatedAt: string;
 }
@@ -496,6 +507,17 @@ export class Api {
     });
   }
 
+  uploadAttachment(input: { name: string; mimeType: string; dataBase64: string }): Promise<{ attachment: ChatAttachment }> {
+    return this.call("/api/attachments", {
+      method: "POST",
+      body: JSON.stringify(input),
+    });
+  }
+
+  deleteAttachment(id: string): Promise<{ deleted: boolean; id: string }> {
+    return this.call(`/api/attachments/${encodeURIComponent(id)}`, { method: "DELETE" });
+  }
+
   sendChat(input: {
     text: string;
     mode?: "auto" | "repo_delivery" | "sse_log";
@@ -505,6 +527,7 @@ export class Api {
     baseRef?: string;
     checkCommand?: string;
     maxRepairRounds?: number;
+    attachmentIds?: string[];
   }): Promise<
     | { kind: "chat"; userMessage: ChatMessage; assistantMessage: ChatMessage }
     | { kind: "task"; userMessage: ChatMessage; taskCardMessage: ChatMessage; taskId: string }

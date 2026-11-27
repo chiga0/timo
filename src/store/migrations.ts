@@ -311,6 +311,13 @@ const MIGRATIONS: ReadonlyArray<{ id: string; sql: string }> = [
       DELETE FROM inbox_items WHERE decision_key = 'delivery_verified';
     `,
   },
+  {
+    // Persist user-uploaded image/file attachments on Main Chat messages.
+    id: "0010-chat-attachments",
+    sql: `
+      ALTER TABLE chat_messages ADD COLUMN attachments_json TEXT;
+    `,
+  },
 ];
 
 export interface MigrationResult {

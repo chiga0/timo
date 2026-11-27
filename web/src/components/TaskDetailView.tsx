@@ -146,8 +146,10 @@ export function TaskDetailView(props: {
     if (!msg) return;
     setSteerText("");
     const id = `steer-${Date.now()}`;
+    pageScroll.scrollToBottom("smooth");
     void props.onSteer(detail.taskId, msg).then((res) => {
       setLocalSteers((prev) => [...prev, { id, text: msg, at: Date.now(), accepted: res.accepted, reason: res.reason }]);
+      pageScroll.scrollToBottom("smooth");
     });
   };
 

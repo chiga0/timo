@@ -23,13 +23,16 @@ export function useAutoScroll(options: {
   contentRef?: RefObject<HTMLDivElement | null>;
   resetKey: string;
   contentVersion: string | number;
+  /** Increment whenever the user explicitly submits a new message so the view snaps straight to bottom. */
+  forceScrollTrigger?: number;
 }): {
   showScrollButton: boolean;
   scrollToBottom: (behavior?: ScrollBehavior) => void;
   suspendFollow: () => void;
 } {
-  const { scrollRef, contentRef, resetKey, contentVersion } = options;
+  const { scrollRef, contentRef, resetKey, contentVersion, forceScrollTrigger } = options;
   const stickRef = useRef(true);
+  const lastForceRef = useRef(forceScrollTrigger ?? 0);
   const [showScrollButton, setShowScrollButton] = useState(false);
 
   const syncScrollState = useCallback(() => {
@@ -76,6 +79,25 @@ export function useAutoScroll(options: {
     });
     return () => window.cancelAnimationFrame(raf);
   }, [resetKey, scrollRef]);
+
+  // Re-engage auto-bottom immediately whenever the user actively sends a prompt.
+  useLayoutEffect(() => {
+    if (forceScrollTrigger === undefined || forceScrollTrigger === lastForceRef.current) return;
+    lastForceRef.current = forceScrollTrigger;
+    stickRef.current = true;
+    setShowScrollButton(false);
+    const el = scrollRef.current;
+    if (el) {
+      el.scrollTop = el.scrollHeight;
+    }
+    const raf = window.requestAnimationFrame(() => {
+      const cur = scrollRef.current;
+      if (cur && stickRef.current) {
+        cur.scrollTop = cur.scrollHeight;
+      }
+    });
+    return () => window.cancelAnimationFrame(raf);
+  }, [forceScrollTrigger, scrollRef]);
 
   // Follow new messages / deltas / run events only while pinned to the bottom.
   useLayoutEffect(() => {

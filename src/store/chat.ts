@@ -1,4 +1,5 @@
 import type { Database } from "./database.js";
+import type { ChatAttachment } from "./attachments.js";
 import { newId, toIso } from "../util.js";
 
 export type ChatRole = "user" | "assistant" | "task_card";
@@ -12,6 +13,7 @@ export interface ChatMessage {
   executorId: string | null;
   model: string | null;
   status: ChatMessageStatus;
+  attachments?: ChatAttachment[];
   createdAt: string;
   updatedAt: string;
 }
@@ -24,11 +26,23 @@ interface ChatRow {
   executor_id: string | null;
   model: string | null;
   status: ChatMessageStatus;
+  attachments_json?: string | null;
   created_at: string;
   updated_at: string;
 }
 
+function parseAttachments(raw?: string | null): ChatAttachment[] | undefined {
+  if (!raw) return undefined;
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) && parsed.length > 0 ? (parsed as ChatAttachment[]) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 function toMessage(row: ChatRow): ChatMessage {
+  const attachments = parseAttachments(row.attachments_json);
   return {
     messageId: row.message_id,
     role: row.role,
@@ -37,6 +51,7 @@ function toMessage(row: ChatRow): ChatMessage {
     executorId: row.executor_id ?? null,
     model: row.model ?? null,
     status: row.status,
+    ...(attachments ? { attachments } : {}),
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
@@ -74,14 +89,17 @@ export class ChatStore {
     executorId?: string | null;
     model?: string | null;
     status?: ChatMessageStatus;
+    attachments?: ChatAttachment[];
     now?: string;
   }): ChatMessage {
     const id = input.messageId ?? newId();
     const now = input.now ?? toIso(new Date());
+    const attachmentsJson =
+      input.attachments && input.attachments.length > 0 ? JSON.stringify(input.attachments) : null;
     this.db
       .prepare(
-        `INSERT INTO chat_messages (message_id, role, content, task_id, executor_id, model, status, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO chat_messages (message_id, role, content, task_id, executor_id, model, status, attachments_json, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         id,
@@ -91,6 +109,7 @@ export class ChatStore {
         input.executorId ?? null,
         input.model ?? null,
         input.status ?? "done",
+        attachmentsJson,
         now,
         now,
       );

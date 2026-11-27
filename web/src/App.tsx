@@ -89,6 +89,7 @@ export function App(): React.JSX.Element {
   const [leftOpen, setLeftOpen] = useState(true);
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [retrying, setRetrying] = useState(false);
+  const [sendScrollTrigger, setSendScrollTrigger] = useState(0);
   const initialSelection = useMemo(readSavedComposerSelection, []);
   const [selectedExecutorId, setSelectedExecutorId] = useState<string>(initialSelection.executorId || "qwen-code");
   const [selectedModel, setSelectedModel] = useState<string>(initialSelection.model);
@@ -367,6 +368,7 @@ export function App(): React.JSX.Element {
   const handleSendChat = async (submission: ComposerSubmission) => {
     const tempUserId = `optimistic-user-${Date.now()}`;
     const nowIso = new Date().toISOString();
+    const attachments = submission.kind === "repo_delivery" ? submission.attachments : undefined;
     const optimisticUser: ChatMessage = {
       messageId: tempUserId,
       role: "user",
@@ -375,9 +377,11 @@ export function App(): React.JSX.Element {
       executorId: submission.kind === "repo_delivery" ? submission.executorId : null,
       model: submission.kind === "repo_delivery" ? (submission.model ?? null) : null,
       status: "done",
+      ...(attachments && attachments.length > 0 ? { attachments } : {}),
       createdAt: nowIso,
       updatedAt: nowIso,
     };
+    setSendScrollTrigger((n) => n + 1);
     setState((previous) => ({
       ...previous,
       messages: [...previous.messages, optimisticUser],
@@ -397,6 +401,7 @@ export function App(): React.JSX.Element {
               baseRef: submission.baseRef,
               checkCommand: submission.checkCommand,
               maxRepairRounds: state.settingsPayload?.settings.assistant.defaultMaxRepairRounds,
+              ...(attachments && attachments.length > 0 ? { attachmentIds: attachments.map((a) => a.id) } : {}),
             },
       );
       setState((previous) => {
@@ -727,6 +732,7 @@ export function App(): React.JSX.Element {
                   tasks={state.tasks}
                   inbox={state.inbox}
                   liveProgress={state.liveProgress}
+                  scrollTrigger={sendScrollTrigger}
                   onQuickPrompt={handleQuickPrompt}
                   onOpenTask={(taskId) => void openTask(taskId)}
                   onStopChat={(messageId) => void api.stopChat(messageId)}
@@ -751,6 +757,13 @@ export function App(): React.JSX.Element {
                   onSelectModel={handleSelectModel}
                   contextSummary={state.contextSummary}
                   skills={state.skillsPayload?.skills ?? []}
+                  onUploadAttachment={async (input) => {
+                    const res = await api.uploadAttachment(input);
+                    return res.attachment;
+                  }}
+                  onDeleteAttachment={async (id) => {
+                    await api.deleteAttachment(id).catch(() => undefined);
+                  }}
                   onOpenSettings={(sec) => {
                     setSettingsSection(sec ?? "assistant");
                     setView("settings");

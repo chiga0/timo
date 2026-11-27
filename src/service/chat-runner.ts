@@ -5,6 +5,7 @@ import type { CapabilityMcpGateway } from "../gateway/mcp-gateway.js";
 import { assembleTaskContext } from "../knowledge/context.js";
 import type { SettingsStore } from "../settings.js";
 import { parseSlashSkillInvocation, type SkillRegistry } from "../skills/registry.js";
+import { MAX_ATTACHMENTS_PER_MESSAGE, type AttachmentStore, type ChatAttachment } from "../store/attachments.js";
 import type { ChatMessage, ChatStore, ChatStreamBus } from "../store/chat.js";
 import type { TaskService } from "./task-service.js";
 import type { VerificationPlan } from "../verify/pipeline.js";
@@ -20,6 +21,7 @@ export interface SendChatInput {
   baseRef?: string;
   checkCommand?: string;
   maxRepairRounds?: number;
+  attachmentIds?: string[];
 }
 
 export type SendChatResult =
@@ -48,14 +50,25 @@ export class MainChatRunner {
       executors?: ExecutorRegistry;
       settingsStore?: SettingsStore;
       skillRegistry?: SkillRegistry;
+      attachments?: AttachmentStore;
       mcpGateway?: CapabilityMcpGateway;
       log?: (line: string) => void;
     },
   ) {}
 
   send(input: SendChatInput): SendChatResult {
-    const text = input.text.trim();
-    if (!text) throw new Error("message text is required");
+    const resolvedAttachments: ChatAttachment[] = [];
+    if (Array.isArray(input.attachmentIds) && input.attachmentIds.length > 0 && this.deps.attachments) {
+      for (const rawId of input.attachmentIds.slice(0, MAX_ATTACHMENTS_PER_MESSAGE)) {
+        const found = this.deps.attachments.get(rawId);
+        if (found) resolvedAttachments.push(found);
+      }
+    }
+    const rawText = input.text.trim();
+    if (!rawText && resolvedAttachments.length === 0) {
+      throw new Error("message text or attachment is required");
+    }
+    const text = rawText || (resolvedAttachments.some((a) => a.isImage) ? "请查看并分析这些图片/附件。" : "请查看并分析这些附件。");
 
     const settings = this.deps.settingsStore?.load();
     const chosenExecutor = input.executorId?.trim() || settings?.assistant.defaultExecutor || "qwen-code";
@@ -69,10 +82,11 @@ export class MainChatRunner {
 
     const userMessage = this.deps.chatStore.append({
       role: "user",
-      content: text,
+      content: rawText,
       executorId: chosenExecutor,
       model: chosenModel ?? null,
       status: "done",
+      attachments: resolvedAttachments,
     });
     this.deps.chatBus.publish({ event: "chat_message", data: userMessage });
 
@@ -137,10 +151,12 @@ export class MainChatRunner {
         verificationPlan = { version: "auto-workspace-v1", steps };
       }
 
+      const attachmentSection = this.formatAttachmentsSection(resolvedAttachments);
+      const taskRequestText = attachmentSection ? `${text}\n\n${attachmentSection}` : text;
       const created = this.deps.service.createTask({
         requestId: `chat-task-${newId()}`,
         kind: "repo_delivery",
-        requestText: text,
+        requestText: taskRequestText,
         executorId: chosenExecutor,
         model: chosenModel,
         repos,
@@ -172,7 +188,14 @@ export class MainChatRunner {
       status: "streaming",
     });
     this.deps.chatBus.publish({ event: "chat_message", data: assistantMessage });
-    void this.runStreamingTurn(assistantMessage.messageId, text, chosenExecutor, chosenModel, readOnlyFolder?.path);
+    void this.runStreamingTurn(
+      assistantMessage.messageId,
+      text,
+      chosenExecutor,
+      chosenModel,
+      readOnlyFolder?.path,
+      resolvedAttachments,
+    );
     return { kind: "chat", userMessage, assistantMessage };
   }
 
@@ -210,6 +233,7 @@ export class MainChatRunner {
     executorId: string,
     model?: string,
     readOnlyCwd?: string,
+    attachments: ChatAttachment[] = [],
   ): Promise<void> {
     if (!this.deps.executors || !this.deps.executors.has(executorId)) {
       const updated = this.deps.chatStore.update(messageId, {
@@ -239,7 +263,7 @@ export class MainChatRunner {
     const adapterDesc = this.deps.executors.snapshot().find((d) => d.id === adapter.id);
     const hasNativeMcp = Boolean(chiefToken && adapterDesc?.capabilities?.mcpGateway);
     const hasHttpBridge = Boolean(chiefToken && !hasNativeMcp);
-    const prompt = this.buildChatPrompt(userText, messageId, readOnlyCwd, { hasNativeMcp, hasHttpBridge });
+    const prompt = this.buildChatPrompt(userText, messageId, readOnlyCwd, { hasNativeMcp, hasHttpBridge }, attachments);
 
     this.activeTurns.set(messageId, { executorId: adapter.id, runId });
     let accumulated = "";
@@ -336,6 +360,7 @@ export class MainChatRunner {
     currentAssistantMsgId: string,
     readOnlyCwd?: string,
     chiefAccess: { hasNativeMcp: boolean; hasHttpBridge: boolean } = { hasNativeMcp: false, hasHttpBridge: false },
+    attachments: ChatAttachment[] = [],
   ): string {
     const settings = this.deps.settingsStore?.load();
     const allSkills = this.deps.skillRegistry ? this.deps.skillRegistry.list(settings) : undefined;
@@ -471,8 +496,29 @@ export class MainChatRunner {
     }
 
     const effectiveUserText = slashMatch ? (slashMatch.remainingText || `请按照 /${slashMatch.skill.id} 执行。`) : userText;
+    const attachmentSection = this.formatAttachmentsSection(attachments);
+    if (attachmentSection) {
+      sections.push(attachmentSection);
+    }
     sections.push(`## 用户最新消息\n${effectiveUserText}`);
     return sections.join("\n\n");
+  }
+
+  private formatAttachmentsSection(attachments: ChatAttachment[]): string {
+    if (attachments.length === 0) return "";
+    const blocks: string[] = [
+      `## 用户随消息附带的图片与文件（共 ${attachments.length} 个）`,
+      "这些附件已安全保存在本机只读路径中。如果是图片，请直接用你的图片/文件读取工具查看对应路径的图像内容后再作答；如果是文本/日志/代码文件，可直接读取原路径。",
+    ];
+    for (const att of attachments) {
+      const kind = att.isImage ? "图片" : "文件";
+      blocks.push(`- [${kind}] **${att.name}** (${att.mimeType}, ${att.sizeBytes} bytes) → 本机路径：\`${att.filePath}\``);
+      const preview = this.deps.attachments?.readTextPreview(att);
+      if (preview) {
+        blocks.push(`\`\`\`\n${preview.text}\n\`\`\``);
+      }
+    }
+    return blocks.join("\n");
   }
 }
 

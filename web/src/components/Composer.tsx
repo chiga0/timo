@@ -1,21 +1,36 @@
 import { useEffect, useRef, useState } from "react";
-import type {
-  ChatContextSummary,
-  ExecutorDescriptor,
-  ExecutorProviderCatalog,
-  SkillRecord,
-  TimoUserSettings,
-  WorkspaceFolderConfig,
+import {
+  readSessionToken,
+  type ChatAttachment,
+  type ChatContextSummary,
+  type ExecutorDescriptor,
+  type ExecutorProviderCatalog,
+  type SkillRecord,
+  type TimoUserSettings,
+  type WorkspaceFolderConfig,
 } from "../api.js";
 import { AgentLogo, agentLabel } from "./AgentIcons.js";
 import { useImeGuard } from "./ime.js";
 
+const MAX_ATTACHMENTS = 8;
+const MAX_FILE_BYTES = 15 * 1024 * 1024;
+
 export type ComposerSubmission =
   | { kind: "sse_log"; text: string }
-  | { kind: "repo_delivery"; text: string; executorId: string; model?: string; sourcePath?: string; baseRef?: string; checkCommand?: string };
+  | {
+      kind: "repo_delivery";
+      text: string;
+      executorId: string;
+      model?: string;
+      sourcePath?: string;
+      baseRef?: string;
+      checkCommand?: string;
+      attachments?: ChatAttachment[];
+    };
 
 /**
  * Minimal bottom composer: clean textarea + ultra-quiet icon-first footer.
+ * Supports pasting screenshots/files (`Cmd+V`), drag-and-drop, and click `+` upload.
  * Agent brand logo opens a compact popover to switch agent & model; advanced
  * overrides (branch / check command / log mode) stay tucked behind a subtle icon.
  */
@@ -33,6 +48,8 @@ export function Composer(props: {
   onSelectModel: (model: string) => void;
   contextSummary?: ChatContextSummary | null;
   skills?: SkillRecord[];
+  onUploadAttachment?: (input: { name: string; mimeType: string; dataBase64: string }) => Promise<ChatAttachment>;
+  onDeleteAttachment?: (id: string) => Promise<void>;
   onOpenSettings: (section?: "assistant" | "folders" | "skills" | "connections" | "appearance" | "system") => void;
   onSubmit: (submission: ComposerSubmission) => void;
 }): React.JSX.Element {
@@ -58,7 +75,12 @@ export function Composer(props: {
   const [repoPath, setRepoPath] = useState("");
   const [baseRef, setBaseRef] = useState("main");
   const [checkCommand, setCheckCommand] = useState("");
+  const [attachments, setAttachments] = useState<ChatAttachment[]>([]);
+  const [uploadingCount, setUploadingCount] = useState(0);
+  const [attachError, setAttachError] = useState<string | null>(null);
+  const [dragging, setDragging] = useState(false);
   const menuRef = useRef<HTMLDivElement | null>(null);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
   const ime = useImeGuard();
 
   const executorId = props.selectedExecutorId;
@@ -113,20 +135,69 @@ export function Composer(props: {
     }
   };
 
+  const uploadFiles = async (incoming: FileList | File[]) => {
+    if (!props.onUploadAttachment) return;
+    const files = Array.from(incoming);
+    if (files.length === 0) return;
+    setAttachError(null);
+    const remainingSlots = MAX_ATTACHMENTS - attachments.length;
+    if (remainingSlots <= 0) {
+      setAttachError(`单条消息最多附加 ${MAX_ATTACHMENTS} 个文件`);
+      return;
+    }
+    const batch = files.slice(0, remainingSlots);
+    if (files.length > remainingSlots) {
+      setAttachError(`已截取前 ${remainingSlots} 个文件（单条消息上限 ${MAX_ATTACHMENTS} 个）`);
+    }
+    for (const file of batch) {
+      if (file.size === 0) {
+        setAttachError(`文件「${file.name || "未命名"}」为空，已跳过`);
+        continue;
+      }
+      if (file.size > MAX_FILE_BYTES) {
+        setAttachError(`文件「${file.name || "未命名"}」超过 15 MB 上限`);
+        continue;
+      }
+      setUploadingCount((n) => n + 1);
+      try {
+        const dataBase64 = await readFileAsBase64(file);
+        const fallbackName = file.name?.trim() || guessClipboardFileName(file.type);
+        const saved = await props.onUploadAttachment({
+          name: fallbackName,
+          mimeType: file.type || "application/octet-stream",
+          dataBase64,
+        });
+        setAttachments((prev) => [...prev, saved]);
+      } catch (err) {
+        setAttachError(`上传失败：${err instanceof Error ? err.message : String(err)}`);
+      } finally {
+        setUploadingCount((n) => Math.max(0, n - 1));
+      }
+    }
+  };
+
+  const removeAttachment = (id: string) => {
+    setAttachments((prev) => prev.filter((a) => a.id !== id));
+    void props.onDeleteAttachment?.(id);
+  };
+
   const canSubmit =
     !props.disabled &&
-    text.trim() !== "" &&
+    uploadingCount === 0 &&
+    (text.trim() !== "" || (mode === "repo_delivery" && attachments.length > 0)) &&
     (mode === "sse_log" || selectedFolderId === "__auto__" || (repoPath.trim() !== "" && baseRef.trim() !== ""));
 
   const submit = () => {
     if (!canSubmit) return;
     const value = text.trim();
+    const sentAttachments = attachments;
     if (mode === "repo_delivery") {
       props.onSubmit({
         kind: "repo_delivery",
         text: value,
         executorId,
         ...(effectiveModel ? { model: effectiveModel } : {}),
+        ...(sentAttachments.length > 0 ? { attachments: sentAttachments } : {}),
         ...(selectedFolderId === "__auto__"
           ? { ...(checkCommand.trim() ? { checkCommand: checkCommand.trim() } : {}) }
           : {
@@ -139,6 +210,8 @@ export function Composer(props: {
       props.onSubmit({ kind: "sse_log", text: value });
     }
     setText("");
+    setAttachments([]);
+    setAttachError(null);
   };
 
   const executorOptions =
@@ -181,17 +254,117 @@ export function Composer(props: {
             ))}
           </div>
         )}
-        <div className="compose-box">
+        <div
+          className={dragging ? "compose-box is-dragging" : "compose-box"}
+          onDragOver={(event) => {
+            if (!props.onUploadAttachment || mode !== "repo_delivery") return;
+            if (event.dataTransfer.types.includes("Files")) {
+              event.preventDefault();
+              event.dataTransfer.dropEffect = "copy";
+              if (!dragging) setDragging(true);
+            }
+          }}
+          onDragLeave={(event) => {
+            if (!event.currentTarget.contains(event.relatedTarget as Node | null)) {
+              setDragging(false);
+            }
+          }}
+          onDrop={(event) => {
+            setDragging(false);
+            if (!props.onUploadAttachment || mode !== "repo_delivery") return;
+            if (event.dataTransfer.files && event.dataTransfer.files.length > 0) {
+              event.preventDefault();
+              void uploadFiles(event.dataTransfer.files);
+            }
+          }}
+        >
+          {dragging && (
+            <div className="compose-drop-hint">松开鼠标添加图片或文件</div>
+          )}
+          {(attachments.length > 0 || uploadingCount > 0 || attachError) && (
+            <div className="compose-attach-strip">
+              {attachments.map((att) =>
+                att.isImage ? (
+                  <div key={att.id} className="compose-attach-thumb" title={`${att.name} (${formatFileSize(att.sizeBytes)})`}>
+                    <img src={withAuthToken(att.url)} alt={att.name} />
+                    <button
+                      type="button"
+                      className="compose-attach-rm"
+                      aria-label={`移除 ${att.name}`}
+                      onClick={() => removeAttachment(att.id)}
+                    >
+                      ×
+                    </button>
+                  </div>
+                ) : (
+                  <div key={att.id} className="compose-attach-chip" title={`${att.name} (${formatFileSize(att.sizeBytes)})`}>
+                    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" aria-hidden="true">
+                      <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+                      <polyline points="14 2 14 8 20 8" />
+                    </svg>
+                    <span className="compose-attach-name">{att.name}</span>
+                    <span className="muted mono" style={{ fontSize: 10 }}>{formatFileSize(att.sizeBytes)}</span>
+                    <button
+                      type="button"
+                      className="compose-attach-chip-rm"
+                      aria-label={`移除 ${att.name}`}
+                      onClick={() => removeAttachment(att.id)}
+                    >
+                      ×
+                    </button>
+                  </div>
+                ),
+              )}
+              {uploadingCount > 0 && (
+                <div className="compose-attach-chip muted">
+                  <span className="dot dot-warning dot-pulse" />
+                  <span>正在上传 {uploadingCount} 个附件…</span>
+                </div>
+              )}
+              {attachError && (
+                <div className="compose-attach-err">{attachError}</div>
+              )}
+            </div>
+          )}
           <div className="compose-row">
             <textarea
               id="composer-input"
               value={text}
               placeholder={
                 mode === "repo_delivery"
-                  ? "向 Timo 提问、查进度，或直接交办开发任务…"
+                  ? "向 Timo 提问、查进度，或直接粘贴/拖入图片与文件…"
                   : "粘贴 SSE 日志或描述需要诊断的问题…"
               }
               onChange={(event) => setText(event.target.value)}
+              onPaste={(event) => {
+                if (!props.onUploadAttachment || mode !== "repo_delivery") return;
+                const pasted: File[] = [];
+                const seen = new Set<string>();
+                for (const item of Array.from(event.clipboardData?.items ?? [])) {
+                  if (item.kind === "file") {
+                    const f = item.getAsFile();
+                    if (f) {
+                      const key = `${f.name}:${f.size}:${f.type}`;
+                      if (!seen.has(key)) {
+                        seen.add(key);
+                        pasted.push(f);
+                      }
+                    }
+                  }
+                }
+                for (const f of Array.from(event.clipboardData?.files ?? [])) {
+                  const key = `${f.name}:${f.size}:${f.type}`;
+                  if (!seen.has(key)) {
+                    seen.add(key);
+                    pasted.push(f);
+                  }
+                }
+                if (pasted.length > 0) {
+                  const hasPlainText = Boolean(event.clipboardData?.getData("text/plain")?.trim());
+                  if (!hasPlainText) event.preventDefault();
+                  void uploadFiles(pasted);
+                }
+              }}
               {...ime.compositionProps}
               onKeyDown={(event) => {
                 if (event.key === "Enter" && !event.shiftKey && !ime.isImeEvent(event)) {
@@ -262,6 +435,34 @@ export function Composer(props: {
           <div className="compose-foot compose-foot-minimal">
             {mode === "repo_delivery" ? (
               <>
+                {props.onUploadAttachment && (
+                  <>
+                    <input
+                      ref={fileInputRef}
+                      type="file"
+                      multiple
+                      style={{ display: "none" }}
+                      onChange={(event) => {
+                        if (event.target.files && event.target.files.length > 0) {
+                          void uploadFiles(event.target.files);
+                        }
+                        event.target.value = "";
+                      }}
+                    />
+                    <button
+                      type="button"
+                      className="icon-btn"
+                      disabled={props.disabled || uploadingCount > 0}
+                      title="上传图片或文件（也支持直接粘贴截图或拖拽放入）"
+                      aria-label="上传图片或文件"
+                      onClick={() => fileInputRef.current?.click()}
+                    >
+                      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" aria-hidden="true">
+                        <path d="M12 5v14M5 12h14" />
+                      </svg>
+                    </button>
+                  </>
+                )}
                 <div className="agent-picker" ref={menuRef}>
                   <button
                     type="button"
@@ -428,7 +629,7 @@ export function Composer(props: {
                   <circle cx="10" cy="18" r="2" fill="var(--bg)" />
                 </svg>
               </button>
-              {props.isStreaming && props.onStopStreaming && text.trim() === "" ? (
+              {props.isStreaming && props.onStopStreaming && text.trim() === "" && attachments.length === 0 ? (
                 <button
                   type="button"
                   className="btn btn-danger btn-sm"
@@ -452,4 +653,47 @@ export function Composer(props: {
       </div>
     </div>
   );
+}
+
+function readFileAsBase64(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error("无法读取文件内容"));
+    reader.onload = () => {
+      const result = typeof reader.result === "string" ? reader.result : "";
+      const comma = result.indexOf(",");
+      resolve(comma >= 0 ? result.slice(comma + 1) : result);
+    };
+    reader.readAsDataURL(file);
+  });
+}
+
+function guessClipboardFileName(mimeType: string): string {
+  const ext =
+    mimeType === "image/png"
+      ? ".png"
+      : mimeType === "image/jpeg"
+        ? ".jpg"
+        : mimeType === "image/webp"
+          ? ".webp"
+          : mimeType === "image/gif"
+            ? ".gif"
+            : mimeType === "application/pdf"
+              ? ".pdf"
+              : ".bin";
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+  return `pasted-${stamp}${ext}`;
+}
+
+function withAuthToken(url: string): string {
+  const token = readSessionToken();
+  if (!token) return url;
+  return `${url}${url.includes("?") ? "&" : "?"}token=${encodeURIComponent(token)}`;
+}
+
+function formatFileSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  const kb = bytes / 1024;
+  if (kb < 1024) return `${kb >= 100 ? Math.round(kb) : kb.toFixed(1)} KB`;
+  return `${(kb / 1024).toFixed(1)} MB`;
 }
