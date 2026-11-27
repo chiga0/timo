@@ -23,6 +23,8 @@ const USAGE = `用法：
   timo amend TASK_ID --version N [--goal TEXT] [--must ITEM]... [--must-not ITEM]...
                                       追加新的约定版本；版本过期返回冲突
   timo steer TASK_ID --message TEXT   向正在运行的执行器注入实时纠偏指令
+  timo handoff TASK_ID --executor ID [--reason TEXT]
+                                      不可变换执行器（g1 -> g2），迁移未提交改动与预算
   timo stop TASK_ID [--reason TEXT]   停止任务并作废当前执行代次
   timo executors                      查看已探测就绪的执行器列表
 
@@ -51,6 +53,7 @@ async function main(argv: string[]): Promise<number> {
   if (command === "list") return runList(rest);
   if (command === "amend") return runAmend(rest);
   if (command === "steer") return runSteer(rest);
+  if (command === "handoff") return runHandoff(rest);
   if (command === "stop") return runStop(rest);
   if (command === "executors") return emit(await call("GET", "/api/executors"));
   process.stderr.write(`未知命令：${command}\n\n${USAGE}\n`);
@@ -167,6 +170,25 @@ async function runSteer(args: string[]): Promise<number> {
   const message = first(parsed.flags, "message")?.trim();
   if (!message) return fail(EXIT_INVALID_INPUT, "缺少 --message TEXT");
   return emit(await call("POST", `/api/tasks/${encodeURIComponent(parsed.positional[0]!)}/steer`, { message }));
+}
+
+async function runHandoff(args: string[]): Promise<number> {
+  let parsed: ReturnType<typeof splitPositional>;
+  try {
+    parsed = splitPositional(args, new Set(["executor", "reason"]));
+  } catch (error) {
+    return fail(EXIT_INVALID_INPUT, error instanceof Error ? error.message : String(error));
+  }
+  if (parsed.positional.length !== 1) return fail(EXIT_INVALID_INPUT, "timo handoff 需要一个 TASK_ID");
+  const executorId = first(parsed.flags, "executor")?.trim();
+  if (!executorId) return fail(EXIT_INVALID_INPUT, "缺少 --executor ID");
+  const reason = first(parsed.flags, "reason")?.trim();
+  return emit(
+    await call("POST", `/api/tasks/${encodeURIComponent(parsed.positional[0]!)}/handoff`, {
+      executorId,
+      ...(reason ? { reason } : {}),
+    }),
+  );
 }
 
 async function runGet(args: string[]): Promise<number> {
