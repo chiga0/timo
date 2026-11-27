@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import type { ExecutorDescriptor, InboxItem, Proposal, RunStreamEvent, TaskDetail, TaskEvent } from "../api.js";
 import { AgentLogo, agentLabel } from "./AgentIcons.js";
 import { TaskTimeline, type LocalSteerItem } from "./TaskTimeline.js";
+import { ScrollToBottomButton, useAutoScroll } from "./ScrollNav.js";
 import { useImeGuard } from "./ime.js";
 
 const STATUS_LABEL: Record<string, string> = {
@@ -62,7 +63,9 @@ export function TaskDetailView(props: {
   const [localSteers, setLocalSteers] = useState<LocalSteerItem[]>([]);
   const [showRawLog, setShowRawLog] = useState(false);
   const [railReqExpanded, setRailReqExpanded] = useState(false);
-  const logRef = useRef<HTMLDivElement | null>(null);
+  const pageScrollRef = useRef<HTMLDivElement | null>(null);
+  const pageInnerRef = useRef<HTMLDivElement | null>(null);
+  const rawLogRef = useRef<HTMLDivElement | null>(null);
   const ime = useImeGuard();
 
   const detail = props.detail;
@@ -81,11 +84,22 @@ export function TaskDetailView(props: {
     setRailReqExpanded(false);
   }, [detail?.taskId]);
 
-  useEffect(() => {
-    if (logRef.current) {
-      logRef.current.scrollTop = logRef.current.scrollHeight;
-    }
-  }, [props.runEvents.length, props.activeRunId]);
+  // Auto-scroll task detail timeline to bottom when opening/switching task or run, and while live events stream.
+  const assistantLen =
+    detail?.result && typeof detail.result === "object" && typeof (detail.result as { assistantText?: unknown }).assistantText === "string"
+      ? (detail.result as { assistantText: string }).assistantText.length
+      : 0;
+  const pageScroll = useAutoScroll({
+    scrollRef: pageScrollRef,
+    contentRef: pageInnerRef,
+    resetKey: `${detail?.taskId ?? "loading"}:${props.activeRunId ?? "none"}:${showRawLog ? "raw" : "chat"}`,
+    contentVersion: `${props.runEvents.length}:${props.events.length}:${localSteers.length}:${assistantLen}:${detail?.status ?? ""}`,
+  });
+  const rawScroll = useAutoScroll({
+    scrollRef: rawLogRef,
+    resetKey: `${detail?.taskId ?? "loading"}:${props.activeRunId ?? "none"}:${showRawLog ? "raw" : "chat"}`,
+    contentVersion: props.runEvents.length,
+  });
 
   if (!detail) {
     return (
@@ -285,8 +299,8 @@ export function TaskDetailView(props: {
       </header>
 
       {/* Scrollable Spacious Task Body */}
-      <div className="task-page-scroll">
-        <div className="task-page-inner">
+      <div className="task-page-scroll" ref={pageScrollRef}>
+        <div className="task-page-inner" ref={pageInnerRef}>
           {/* Priority Human Action Banners */}
           {decision && decisionAction && (
             <section className="card task-banner-card is-warning">
@@ -455,7 +469,7 @@ export function TaskDetailView(props: {
                 </header>
                 <div className="card-body stack" style={{ gap: 12 }}>
                   {showRawLog ? (
-                    <div className="task-event-log" ref={logRef}>
+                    <div className="task-event-log" ref={rawLogRef}>
                       {props.runEvents.length === 0 ? (
                         <div className="empty-box">{isRunning ? "等待执行器输出实时步骤…" : "暂无原始事件"}</div>
                       ) : (
@@ -472,7 +486,7 @@ export function TaskDetailView(props: {
                       )}
                     </div>
                   ) : (
-                    <div className="task-timeline-flow" ref={logRef}>
+                    <div className="task-timeline-flow">
                       <TaskTimeline
                         requestText={detail.requestText}
                         status={detail.status}
@@ -752,6 +766,14 @@ export function TaskDetailView(props: {
           </div>
         </div>
       </div>
+      <ScrollToBottomButton
+        visible={showRawLog ? rawScroll.showScrollButton || pageScroll.showScrollButton : pageScroll.showScrollButton}
+        active={isRunning}
+        onClick={() => {
+          if (showRawLog) rawScroll.scrollToBottom("smooth");
+          pageScroll.scrollToBottom("smooth");
+        }}
+      />
     </div>
   );
 }

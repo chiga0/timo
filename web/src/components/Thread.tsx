@@ -1,7 +1,14 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { ChatMessage, InboxItem, TaskProgressFrame, TaskSummary } from "../api.js";
 import { AgentLogo, agentLabel } from "./AgentIcons.js";
 import { Markdown } from "./Markdown.js";
+import {
+  ConversationMinimap,
+  ScrollToBottomButton,
+  stripMarkdownPreview,
+  useAutoScroll,
+  type NavTickItem,
+} from "./ScrollNav.js";
 
 const STATUS_LABEL: Record<string, string> = {
   accepted: "已接单",
@@ -45,27 +52,83 @@ export function Thread(props: {
   onDismissInbox: (taskId: string, decisionKey: string) => void;
 }): React.JSX.Element {
   const scrollRef = useRef<HTMLDivElement | null>(null);
-  const taskById = new Map(props.tasks.map((t) => [t.taskId, t]));
-  const inboxByTaskId = new Map<string, InboxItem[]>();
-  for (const item of props.inbox) {
-    const arr = inboxByTaskId.get(item.taskId) ?? [];
-    arr.push(item);
-    inboxByTaskId.set(item.taskId, arr);
-  }
+  const innerRef = useRef<HTMLDivElement | null>(null);
+  const taskById = useMemo(() => new Map(props.tasks.map((t) => [t.taskId, t])), [props.tasks]);
+  const inboxByTaskId = useMemo(() => {
+    const map = new Map<string, InboxItem[]>();
+    for (const item of props.inbox) {
+      const arr = map.get(item.taskId) ?? [];
+      arr.push(item);
+      map.set(item.taskId, arr);
+    }
+    return map;
+  }, [props.inbox]);
 
   const lastMsg = props.messages.at(-1);
-  useEffect(() => {
-    const el = scrollRef.current;
-    if (!el) return;
-    const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 160;
-    if (nearBottom || lastMsg?.status === "streaming") {
-      el.scrollTop = el.scrollHeight;
+  const isStreaming = props.messages.some((m, idx) => {
+    if (m.role !== "assistant" || m.status !== "streaming") return false;
+    return !props.messages.slice(idx + 1).some((later) => later.role === "user");
+  });
+
+  // Auto-snap to bottom on mount/refresh & follow new chunks only when user stays near bottom.
+  const firstMsgId = props.messages[0]?.messageId ?? "empty";
+  const { showScrollButton, scrollToBottom, suspendFollow } = useAutoScroll({
+    scrollRef,
+    contentRef: innerRef,
+    resetKey: firstMsgId === "empty" ? "empty" : "loaded",
+    contentVersion: `${props.messages.length}:${lastMsg?.messageId ?? ""}:${lastMsg?.content.length ?? 0}:${lastMsg?.status ?? ""}`,
+  });
+
+  // Build Codex-style left prompt navigation ticks (one tick per user prompt turn).
+  const navItems = useMemo<NavTickItem[]>(() => {
+    const turns: NavTickItem[] = [];
+    for (let i = 0; i < props.messages.length; i += 1) {
+      const msg = props.messages[i]!;
+      if (msg.role !== "user") continue;
+      const prompt = msg.content.replace(/\s+/g, " ").trim() || "(空提问)";
+      let preview = "";
+      let badge: string | undefined;
+      for (let j = i + 1; j < props.messages.length; j += 1) {
+        const next = props.messages[j]!;
+        if (next.role === "user") break;
+        if (next.role === "task_card" && next.taskId) {
+          const task = taskById.get(next.taskId);
+          const taskInbox = inboxByTaskId.get(next.taskId) ?? [];
+          const decision = taskInbox.find((it) => it.decisionKey === "decision_required");
+          const blocked = taskInbox.find((it) => it.decisionKey === "task_blocked_final");
+          badge = task ? (STATUS_LABEL[task.status] ?? task.status) : "任务";
+          preview =
+            task?.status === "completed" && task.resultSummary?.trim()
+              ? stripMarkdownPreview(task.resultSummary, 160)
+              : buildLiveLine(task, props.liveProgress[next.taskId], decision, blocked);
+          break;
+        }
+        if (next.role === "assistant") {
+          const hasLaterUser = props.messages.slice(j + 1).some((m) => m.role === "user");
+          const activelyStreaming = next.status === "streaming" && !hasLaterUser;
+          if (activelyStreaming) badge = "回复中";
+          preview = next.content.trim()
+            ? stripMarkdownPreview(next.content, 160)
+            : activelyStreaming
+              ? "正在思考中…"
+              : "已完成";
+          break;
+        }
+      }
+      turns.push({ id: msg.messageId, prompt, preview, badge });
     }
-  }, [props.messages.length, lastMsg?.content.length]);
+    return turns;
+  }, [props.messages, taskById, inboxByTaskId, props.liveProgress]);
 
   return (
-    <div className="thread" ref={scrollRef}>
-      <div className="thread-inner">
+    <div className="thread-stage">
+      <ConversationMinimap
+        items={navItems}
+        scrollRef={scrollRef}
+        onJump={() => suspendFollow()}
+      />
+      <div className={navItems.length >= 2 ? "thread has-minimap" : "thread"} ref={scrollRef}>
+        <div className="thread-inner" ref={innerRef}>
         {props.messages.length === 0 ? (
           <div className="welcome">
             <div className="welcome-mark">T</div>
@@ -87,7 +150,7 @@ export function Thread(props: {
           props.messages.map((msg, msgIdx) => {
             if (msg.role === "user") {
               return (
-                <div key={msg.messageId} className="msg-user-wrap">
+                <div key={msg.messageId} data-nav-id={msg.messageId} className="msg-user-wrap">
                   <div className="msg-user">{msg.content}</div>
                 </div>
               );
@@ -158,7 +221,13 @@ export function Thread(props: {
             );
           })
         )}
+        </div>
       </div>
+      <ScrollToBottomButton
+        visible={showScrollButton && props.messages.length > 0}
+        active={isStreaming}
+        onClick={() => scrollToBottom("smooth")}
+      />
     </div>
   );
 }
