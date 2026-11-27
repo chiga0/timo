@@ -1,9 +1,9 @@
 import type { SVGProps } from "react";
 
 /**
- * Timo official geometric cat mark with subtle negative-space "T" at the nose/chin.
- * Automatically adapts to Timo's Light & Dark themes via `--primary` / `--primary-ink`
- * CSS tokens (falling back to `#09090b` / `#ffffff` when rendered standalone).
+ * Timo official minimalist geometric cat mark with subtle negative-space "T" at the nose/chin.
+ * Renders as a clean frameless mark adapting automatically to Light (`#09090b`) & Dark (`#fafafa`)
+ * themes via `--ink`. Set `framed` when an app-icon squircle container is explicitly needed.
  */
 export const TIMO_CAT_PATH =
   "M11.7 9.6L24.4 19.8Q32 17.5 39.6 19.8L52.3 9.6V31.4H38.6" +
@@ -16,20 +16,20 @@ export const TIMO_CAT_PATH =
   "M49.7 15.2L42.3 21.3L49.7 27.6Z";
 
 export function TimoLogo(
-  props: { size?: number } & Omit<SVGProps<SVGSVGElement>, "width" | "height" | "viewBox">,
+  props: { size?: number; framed?: boolean } & Omit<SVGProps<SVGSVGElement>, "width" | "height" | "viewBox">,
 ): React.JSX.Element {
-  const { size = 22, ...svgProps } = props;
+  const { size = 22, framed = false, ...svgProps } = props;
+  if (framed) {
+    return (
+      <svg width={size} height={size} viewBox="0 0 64 64" fill="none" aria-hidden="true" {...svgProps}>
+        <rect width="64" height="64" rx="15" fill="var(--primary, #09090b)" />
+        <path fillRule="evenodd" clipRule="evenodd" fill="var(--primary-ink, #ffffff)" d={TIMO_CAT_PATH} />
+      </svg>
+    );
+  }
   return (
-    <svg
-      width={size}
-      height={size}
-      viewBox="0 0 64 64"
-      fill="none"
-      aria-hidden="true"
-      {...svgProps}
-    >
-      <rect width="64" height="64" rx="15" fill="var(--primary, #09090b)" />
-      <path fillRule="evenodd" clipRule="evenodd" fill="var(--primary-ink, #ffffff)" d={TIMO_CAT_PATH} />
+    <svg width={size} height={size} viewBox="6 6 52 52" fill="none" aria-hidden="true" {...svgProps}>
+      <path fillRule="evenodd" clipRule="evenodd" fill="var(--ink, currentColor)" d={TIMO_CAT_PATH} />
     </svg>
   );
 }

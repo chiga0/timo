@@ -1193,8 +1193,6 @@ button {
 
 .welcome-logo {
   display: block;
-  border-radius: 15px;
-  box-shadow: var(--shadow-sm);
 }
 
 .welcome-mark {
