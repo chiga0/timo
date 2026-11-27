@@ -315,7 +315,7 @@
 - **任务说明（Scope）**：
   1. 在 Capability MCP Gateway 上挂载三类受控业务工具：
      - 只读日志查询工具（校验账号、环境、时间窗并做脱敏裁剪）；
-     - MR 创建/更新工具（对接 GitHub `gh` 或内部 Aone `a1`，强制执行 `Intent-Before-Effect` 写 `operations` 意图与稳定幂等键，保存平台 MR ID 与 head SHA）；
+     - MR 创建/更新工具（对接 GitHub `gh` 或企业自建 Git/GitLab API，强制执行 `Intent-Before-Effect` 写 `operations` 意图与稳定幂等键，保存平台 MR ID 与 head SHA）；
      - `platform_mr` 验收插件 + 后台 Outbox **0-Token CI 轮询器**（按原 MR ID 与精确 `head SHA` 跟踪 CI，不消耗大模型 Token）。
   2. 支持多仓组合候选（`{ repoA: shaA, repoB: shaB }`）与组合行为 `command_check` 验收，在 Web 右侧「跨仓交付矩阵」真实渲染每仓基线、head、MR、CI 与组合验收状态。
   - **Out of Scope**：跨执行器交接与丢回执复合故障留到 Sprint 5。

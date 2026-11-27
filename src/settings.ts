@@ -452,7 +452,6 @@ export class SettingsStore {
       "GITHUB_TOKEN",
       "GITLAB_TOKEN",
       "ENTERPRISE_GIT_TOKEN",
-      "A1_TOKEN",
       ...Object.keys(fromFile),
       ...settings.connections.map((c) => c.credentialKey).filter(Boolean),
     ]);

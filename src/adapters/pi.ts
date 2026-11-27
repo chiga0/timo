@@ -22,7 +22,7 @@ import {
 export interface PiAdapterOptions {
   /** Command to run; defaults to `pi` resolved from PATH. */
   command?: string;
-  /** Extra args prepended before the mode flags (e.g. `--provider pai-eas`). */
+  /** Extra args prepended before the mode flags (e.g. `--provider openai`). */
   extraArgs?: string[];
   /** Per-line limit so a pathological output cannot exhaust memory. */
   maxLineBytes?: number;

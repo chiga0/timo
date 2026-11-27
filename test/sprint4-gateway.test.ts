@@ -202,10 +202,10 @@ test("Step 4.1 (S06): revoked generation Fencing Token returns HTTP 403 GENERATI
 test("Step 4.1 (S06): credential physical isolation — worker process environment has no business tokens", async () => {
   const dir = mkdtempSync(join(tmpdir(), "timo-iso-env-"));
   const prevGh = process.env.GH_TOKEN;
-  const prevA1 = process.env.A1_TOKEN;
+  const prevEnt = process.env.ENTERPRISE_GIT_TOKEN;
   const prevProd = process.env.PROD_API_KEY;
   process.env.GH_TOKEN = "ghp_host_secret_123456";
-  process.env.A1_TOKEN = "aone_host_secret_789";
+  process.env.ENTERPRISE_GIT_TOKEN = "enterprise_host_secret_789";
   process.env.PROD_API_KEY = "prod_host_secret_xyz";
 
   try {
@@ -213,7 +213,7 @@ test("Step 4.1 (S06): credential physical isolation — worker process environme
     writeFileSync(
       cli,
       `#!/bin/sh
-echo '{"type":"message","message":{"role":"assistant","content":[{"type":"text","text":"GH='"$GH_TOKEN"' A1='"$A1_TOKEN"' PROD='"$PROD_API_KEY"' GW='"$TIMO_MCP_GATEWAY_URL"'"}]}}'
+echo '{"type":"message","message":{"role":"assistant","content":[{"type":"text","text":"GH='"$GH_TOKEN"' ENT='"$ENTERPRISE_GIT_TOKEN"' PROD='"$PROD_API_KEY"' GW='"$TIMO_MCP_GATEWAY_URL"'"}]}}'
 exit 0
 `,
       { mode: 0o755 },
@@ -230,12 +230,12 @@ exit 0
       () => undefined,
     );
     assert.equal(result.status, "succeeded");
-    assert.equal(result.output, "GH= A1= PROD= GW=http://127.0.0.1:9999/mcp/t-iso/1/nonce123");
+    assert.equal(result.output, "GH= ENT= PROD= GW=http://127.0.0.1:9999/mcp/t-iso/1/nonce123");
   } finally {
     if (prevGh === undefined) delete process.env.GH_TOKEN;
     else process.env.GH_TOKEN = prevGh;
-    if (prevA1 === undefined) delete process.env.A1_TOKEN;
-    else process.env.A1_TOKEN = prevA1;
+    if (prevEnt === undefined) delete process.env.ENTERPRISE_GIT_TOKEN;
+    else process.env.ENTERPRISE_GIT_TOKEN = prevEnt;
     if (prevProd === undefined) delete process.env.PROD_API_KEY;
     else process.env.PROD_API_KEY = prevProd;
     rmSync(dir, { recursive: true, force: true });

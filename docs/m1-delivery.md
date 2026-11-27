@@ -6,7 +6,7 @@
 
 ## 启动与命令
 
-实现后从干净检出执行 npm ci、npm run build、npm test。CLI 构建入口为 node dist/cli.js，发布时命令名为 timo。
+实现后从干净检出执行 npm ci、npm run build、npm test。CLI 构建入口为 node dist/src/cli.js，发布时命令名为 timo。
 
 | 命令 | 最小输入与结果 |
 | --- | --- |
@@ -29,7 +29,7 @@
 
 ## 固定版实测证据（2026-11-26）
 
-环境：T3 `v0.1.12`（GitHub 发行资产 `t3-0.1.12-darwin-arm64.tar.gz`，按 `SHA256SUMS` 核验，自报 `t3 v0.1.12`）；隔离 `--base-dir` 与只含一个合成 Git 仓的项目；Pi provider（`pi` / `default`，PAI-EAS 身份）；MCP 走 `orchestration:read`+`orchestration:operate` 的 `approval-required` 授权；Timo 用 `TIMO_T3_TOKEN` 注入短期 token。
+环境：T3 `v0.1.12`（GitHub 发行资产 `t3-0.1.12-darwin-arm64.tar.gz`，按 `SHA256SUMS` 核验，自报 `t3 v0.1.12`）；隔离 `--base-dir` 与只含一个合成 Git 仓的项目；Pi provider（`pi` / `default`，本地已配置模型通道）；MCP 走 `orchestration:read`+`orchestration:operate` 的 `approval-required` 授权；Timo 用 `TIMO_T3_TOKEN` 注入短期 token。
 
 | 项 | 实测结果 | 状态 |
 | --- | --- | --- |

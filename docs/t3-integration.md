@@ -20,12 +20,12 @@ T3 `v0.1.12`、Codex CLI `0.149.1`、Pi `1.6.0` 在回环隔离实例上验证�
 
 | 步骤 | 实际结果 |
 | --- | --- |
-| Codex 发送、读取、等待 | `gpt-5.6-sol` 通过 MCP 收到合成消息，运行进入 `completed`，助手回复与要求的标记匹配。另用 `gpt-5.4` 观察到该登录目录下模型不可用，Timo 应以实际账户模型目录及运行结果为准。 |
+| Codex 发送、读取、等待 | 使用账号已授权模型通过 MCP 收到合成消息，运行进入 `completed`，助手回复与要求的标记匹配。若所选模型在当前登录目录不可用会明确报错，Timo 应以实际账户模型目录及运行结果为准。 |
 | 已开始输出后的中断 | 轮询读到运行中的助手部分文本，按该 runId 中断，返回 `interrupt_requested`；复查同一 runId 为 `interrupted`，活动记录为 `Stopped by an agent`。随后同一线程再次向 Codex 发送合成消息，获得预期回复。中断的是本轮，后台进程退出仍要单独核查。 |
 | 重启后补查已完成运行 | Codex 回复后停止并重启隔离 T3，用原 OAuth 授权重新创建传输会话。读回原线程、原 run 的 `completed` 和标记文本。 |
-| 切换到 Pi 并继续 | 用 T3 界面使用的 WebSocket 编排合同提交模型选择，收到成功回执。随后在原 threadId 上用 MCP 排队发消息。Pi 的 `pai-eas/qwen3.7-plus` 运行完成，出现 `Provider handoff`，回复完整复述了第二轮提示中未提供的原标记 `TIMO_CEDAR_4817`。切换通过协议复现，界面的实际点击流程留到 M1/M3。 |
+| 切换到 Pi 并继续 | 用 T3 界面使用的 WebSocket 编排合同提交模型选择，收到成功回执。随后在原 threadId 上用 MCP 排队发消息。Pi 的已配置模型通道运行完成，出现 `Provider handoff`，回复完整复述了第二轮提示中未提供的原标记 `TIMO_CEDAR_4817`。切换通过协议复现，界面的实际点击流程留到 M1/M3。 |
 
-早期诊断中，OpenCode 的百炼 Token Plan 请求在 T3 和原生 CLI 均出现 `Invalid API-key provided`。Pi 的百炼 Token Plan 也返回 401。最终通过的组合使用 Pi 已配置的 PAI-EAS 身份。首版将模型选择留在部署配置中，以实际可用的账号和模型为准。
+早期诊断中，部分第三方 Token 通道在 T3 和原生 CLI 下曾出现 `Invalid API-key provided` 或 401，最终通过的组合使用 Pi 已验证可用的默认自定义 Provider 身份。首版将模型选择留在部署配置中，以实际可用的账号和模型为准。
 
 具体产品合同见 [接入决策](t3-adoption.md)。
 

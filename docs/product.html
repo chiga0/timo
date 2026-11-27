@@ -755,7 +755,7 @@ const tasks = new Map([
   }],
   ['T-1045', {
     id: 'T-1045', title: '生产网关日志范围确认', status: 'pending', badge: '红线待批准',
-    generation: 'g1', executor: 'Pi · qwen3.7-plus', threadRef: 'run:pi_4b8e20',
+    generation: 'g1', executor: 'Pi · qwen3-coder', threadRef: 'run:pi_4b8e20',
     budgetPct: 16, budgetText: '¥0.31 / ¥2.00 · 3m', briefV: 1, grantV: 1,
     summary: '预发日志未复现 502 断连特征。需要扩大至生产网关最近 30 分钟只读日志（触及 Standing Policy 生产红线，已原地挂起等待你批准）。',
     next: '等待你决定是否批准一次性生产只读授权；批准后原地恢复执行。',
@@ -790,7 +790,7 @@ const tasks = new Map([
   }],
   ['T-1031', {
     id: 'T-1031', title: '昨夜 SSE 告警日志核验', status: 'done', badge: '已验收',
-    generation: 'g1', executor: 'Pi · qwen3.7-plus', threadRef: 'run:pi_0c7a44',
+    generation: 'g1', executor: 'Pi · qwen3-coder', threadRef: 'run:pi_0c7a44',
     budgetPct: 12, budgetText: '¥0.18 / ¥1.50 · 42s', briefV: 1, grantV: 1,
     summary: '确认 2 起断连事件：alpha 第 2 行断连第 4 行恢复；beta 第 6 行断连且样本末尾前未恢复。独立验证器逐行重算通过。',
     next: '已闭环，无需处理。',
@@ -913,7 +913,7 @@ function handleHandoff(taskId) {
   if (!t) return;
   const nextGen = t.generation === 'g1' ? 'g2' : 'g3';
   t.generation = nextGen;
-  t.executor = t.executor.startsWith('Codex') ? 'Pi · qwen3.7-plus' : 'Codex · gpt-5.6';
+  t.executor = t.executor.startsWith('Codex') ? 'Pi · qwen3-coder' : 'Codex · gpt-5.6';
   t.checkedAt = '刚刚';
   feed.push({
     id: 'm' + Date.now(), role: 'timo', time: '刚刚',
@@ -1414,7 +1414,7 @@ function sendMessage(rawText) {
     const title = text.length > 18 ? text.slice(0, 18) + '…' : text;
     tasks.set(newId, {
       id: newId, title, status: 'active', badge: '已接单 · 准备中',
-      generation: 'g1', executor: 'Pi · qwen3.7-plus', threadRef: 'run:pi_new',
+      generation: 'g1', executor: 'Pi · qwen3-coder', threadRef: 'run:pi_new',
       budgetPct: 5, budgetText: '¥0.05 / ¥2.00 · 10s', briefV: 1, grantV: 1,
       summary: `已冻结请求并建立业务任务：${text}`,
       next: '总助理已按 Standing Policy 放行只读权限并派发执行。',

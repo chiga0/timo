@@ -22,7 +22,7 @@
 **状态：PASS（2026-11-26）。** 固定发行资产 `v0.1.12`（`SHA256SUMS` 核验通过），在回环隔离实例上完成公开 OAuth MCP、只读身份拒绝、双仓 worktree、活动中断与继续、重启补查及 Codex → Pi 同线程交接探测。基于 M0 与 M1.3 的实机经验，确立了“不 Fork T3，将其定位为参考蓝本 + 可选外部 `T3Adapter`”的决策。详见 [T3 集成探测手册](t3-integration.md) 与 [执行器接入决策](t3-adoption.md)。
 
 - [x] 核验 `v0.1.12` macOS arm64 发行资产、SHA-256 与运行版本；验证 OAuth 权限、双仓工作区、重启补查与请求去重。
-- [x] 实测 Codex（`gpt-5.6-sol`）与 Pi（`pai-eas/qwen3.7-plus`）真实运行、活动中断、重启读回及跨 Provider 交接。
+- [x] 实测 Codex 与 Pi 真实运行、活动中断、重启读回及跨 Provider 交接。
 - [x] 固化最小 `T3Adapter` 合同与多仓/权限边界限制。
 
 ---

@@ -504,7 +504,7 @@ test("Step 3.2/4.1: buildIsolatedWorkerEnv strips business secrets before spawni
     HOME: "/tmp/home",
     GH_TOKEN: "ghp_secret",
     GITHUB_TOKEN: "ghp_secret2",
-    A1_TOKEN: "aone_secret",
+    ENTERPRISE_GIT_TOKEN: "enterprise_secret",
     TIMO_SESSION_TOKEN: "sess_secret",
     PROD_DB_URL: "postgres://prod",
     CUSTOM_ACCESS_TOKEN: "tok_secret",
@@ -514,7 +514,7 @@ test("Step 3.2/4.1: buildIsolatedWorkerEnv strips business secrets before spawni
   assert.equal(clean.SAFE_FLAG, "1");
   assert.equal(clean.GH_TOKEN, undefined);
   assert.equal(clean.GITHUB_TOKEN, undefined);
-  assert.equal(clean.A1_TOKEN, undefined);
+  assert.equal(clean.ENTERPRISE_GIT_TOKEN, undefined);
   assert.equal(clean.TIMO_SESSION_TOKEN, undefined);
   assert.equal(clean.PROD_DB_URL, undefined);
   assert.equal(clean.CUSTOM_ACCESS_TOKEN, undefined);

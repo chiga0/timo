@@ -6,7 +6,7 @@
 剧本编号 / 执行日期：S02（单仓实机跨执行器交接 + 僵尸旧写者反例） / 2026-11-27
 证据类型：MIXED（执行器 qwen-code 0.25.3、pi 1.6.0、WorkspaceManager 真实 git worktree、Capability MCP Gateway HTTP 服务、TaskRunner 与独立 command_check 均为 REAL；测试仓库为临时 Git 仓库 sse-demo，不含真实外部 MR/CI 平台调用）
 执行者 / 独立验收者 / 目标用户：Timo 控制面（g1: qwen-code 0.25.3 → g2: pi 1.6.0） / VerifierRegistry command_check（node --test） / 本地开发者
-Timo 提交 / 执行器与模型版本 / StandingPolicy 版本：dd06706 / qwen-code 0.25.3 + pi 1.6.0（pai-eas / DeepSeek-V4.1-Flash-1017） / StandingPolicy v1（default）
+Timo 提交 / 执行器与模型版本 / StandingPolicy 版本：dd06706 / qwen-code 0.25.3 + pi 1.6.0（自定义模型通道） / StandingPolicy v1（default）
 机器、网络位置、实际入口（Web / CLI）：macOS arm64，Node v24.15.0，本机回环，Timo 控制面 TaskService + TaskRunner + CapabilityMcpGateway
 Task ID / Execution 代次 / Fencing Token 摘要 / Run ID：916950da-5123-4249-8930-dba33ed3d4f0 / g1 → g2 / g1 token 已作废（HTTP 403 GENERATION_REVOKED）/ g1: real-g1-qwen（session fcec987f-98d2-4998-96fb-761da3a2143d），g2: pi 自动分配 runId
 BriefRevision / GrantRevision（含总助理自动批复与人工红线审批记录）：Brief v1 / Grant v1（read_worktree、write_worktree、run_local_tests、read_ci_status；未授予 deploy_prod）
@@ -34,6 +34,6 @@ VerificationPlan 版本与检查环境：real-s02-v1（command_check: `node --te
 人工净投入、打断次数与注意力防火墙评估：全过程 0 次人工打断，Inbox 零过程噪音
 缺陷、复测候选与未验证范围：
   - 顺带发现并修复 pi 1.6.0 新增的 `message_end` JSONL 事件类型解析（src/adapters/pi.ts）；
-  - 本机 codex 0.149.1 用户全局配置指向 `gpt-6.1-sol` 在当前账号返回 model_not_found，本次跨执行器实测采用 qwen-code → pi；
-  - 真实外部 GitHub/Aone 双仓 MR + 真实 CI 延续需在获准试验仓库中复核。
+  - 本机 codex 0.149.1 用户全局配置中的默认模型在当前账号返回 model_not_found，本次跨执行器实测采用 qwen-code → pi；
+  - 真实外部 GitHub / 企业 Git 双仓 MR + 真实 CI 延续需在获准试验仓库中复核。
 ```

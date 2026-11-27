@@ -288,7 +288,7 @@ describe("Settings HTTP Routes & Human-Readable Task Titles", () => {
       mkdirSync(join(dir, ".codex"), { recursive: true });
       mkdirSync(join(dir, ".config/opencode"), { recursive: true });
 
-      writeFileSync(join(dir, ".pi/agent/settings.json"), JSON.stringify({ defaultProvider: "pai-eas", defaultModel: "Kimi-K3" }), "utf8");
+      writeFileSync(join(dir, ".pi/agent/settings.json"), JSON.stringify({ defaultProvider: "custom-openai", defaultModel: "claude-sonnet-4" }), "utf8");
       writeFileSync(
         join(dir, ".qwen/settings.json"),
         JSON.stringify({
@@ -308,20 +308,20 @@ describe("Settings HTTP Routes & Human-Readable Task Titles", () => {
         }),
         "utf8",
       );
-      writeFileSync(join(dir, ".config/opencode/opencode.json"), JSON.stringify({ model: "bailian/qwen3.8-max" }), "utf8");
+      writeFileSync(join(dir, ".config/opencode/opencode.json"), JSON.stringify({ model: "openrouter/qwen3-coder" }), "utf8");
 
       const catalogs = discoverExecutorProviders({
         homeDir: dir,
         runCli: (cmd) => {
-          if (cmd === "pi") return "provider model context\npai-eas Kimi-K3 256K\nqwen-plan qwen3.8-max 1M\n";
-          if (cmd === "opencode") return "bailian/qwen3.8-max\nopencode/big-pickle\n";
+          if (cmd === "pi") return "provider model context\ncustom-openai claude-sonnet-4 200K\nopenrouter qwen3-coder 1M\n";
+          if (cmd === "opencode") return "openrouter/qwen3-coder\nopencode/big-pickle\n";
           return null;
         },
       });
 
-      assert.equal(catalogs.pi?.defaultProvider, "pai-eas");
+      assert.equal(catalogs.pi?.defaultProvider, "custom-openai");
       assert.equal(catalogs.pi?.providers.length, 2);
-      assert.equal(catalogs.pi?.providers[0]?.models[0]?.id, "pai-eas/Kimi-K3");
+      assert.equal(catalogs.pi?.providers[0]?.models[0]?.id, "custom-openai/claude-sonnet-4");
 
       assert.equal(catalogs["qwen-code"]?.defaultModel, "qwen3-coder");
       assert.equal(catalogs["qwen-code"]?.providers[0]?.id, "openai");
@@ -331,7 +331,7 @@ describe("Settings HTTP Routes & Human-Readable Task Titles", () => {
       assert.equal(catalogs.codex?.providers.some((p) => p.id === "openai" && p.models.length === 1), true);
       assert.equal(catalogs.codex?.providers.some((p) => p.id === "corp"), true);
 
-      assert.equal(catalogs.opencode?.defaultProvider, "bailian");
+      assert.equal(catalogs.opencode?.defaultProvider, "openrouter");
       assert.equal(catalogs.opencode?.providers.length, 2);
     });
   });

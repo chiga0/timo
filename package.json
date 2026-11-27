@@ -2,19 +2,47 @@
   "name": "timo",
   "version": "0.1.0",
   "private": true,
-  "description": "Timo：个人研发与运维助理",
+  "description": "Timo — Local-first Personal Engineering & Ops Delivery Control Plane (个人研发与运维交付控制面)",
   "license": "MIT",
   "type": "module",
-  "bin": {
-    "timo": "dist/cli.js"
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/chiga0/timo.git"
   },
+  "homepage": "https://github.com/chiga0/timo#readme",
+  "bugs": {
+    "url": "https://github.com/chiga0/timo/issues"
+  },
+  "keywords": [
+    "ai-agent",
+    "control-plane",
+    "mcp",
+    "git-worktree",
+    "codex",
+    "opencode",
+    "qwen-code",
+    "pi",
+    "local-first",
+    "devops"
+  ],
+  "bin": {
+    "timo": "dist/src/cli.js"
+  },
+  "files": [
+    "dist/src",
+    "dist/web",
+    "README.md",
+    "LICENSE"
+  ],
   "engines": {
     "node": ">=24"
   },
   "scripts": {
+    "start": "node dist/src/cli.js serve",
     "build": "npm run build:server && npm run build:web",
     "build:server": "tsc -p tsconfig.json",
     "build:web": "vite build --config web/vite.config.ts",
+    "dev:web": "vite --config web/vite.config.ts",
     "test": "npm run build:server && node --test \"dist/test/**/*.test.js\"",
     "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p web/tsconfig.json --noEmit"
   },

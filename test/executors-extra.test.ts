@@ -58,8 +58,8 @@ test("CodexAdapter streams JSONL items, extracts patch files, mounts MCP gateway
 test("OpenCodeAdapter streams JSON events, extracts patch files, and strips secrets", async () => {
   const dir = mkdtempSync(join(tmpdir(), "timo-oc-"));
   const cwd = mkdtempSync(join(tmpdir(), "timo-oc-cwd-"));
-  const prevA1 = process.env.A1_TOKEN;
-  process.env.A1_TOKEN = "aone_oc_secret";
+  const prevEnt = process.env.ENTERPRISE_GIT_TOKEN;
+  process.env.ENTERPRISE_GIT_TOKEN = "enterprise_oc_secret";
   try {
     const cli = fakeCli(
       dir,
@@ -67,7 +67,7 @@ test("OpenCodeAdapter streams JSON events, extracts patch files, and strips secr
       [
         `echo '{"type":"step_start","sessionID":"oc-sess-1"}'`,
         `echo '{"type":"tool_use","sessionID":"oc-sess-1","part":{"type":"tool","tool":"edit","state":{"status":"completed","input":{"filePath":"src/b.ts"},"output":"patched"}}}'`,
-        `echo '{"type":"text","sessionID":"oc-sess-1","part":{"type":"text","text":"A1='"$A1_TOKEN"' ok"}}'`,
+        `echo '{"type":"text","sessionID":"oc-sess-1","part":{"type":"text","text":"ENT='"$ENTERPRISE_GIT_TOKEN"' ok"}}'`,
         `echo '{"type":"step_finish","sessionID":"oc-sess-1"}'`,
         "exit 0",
       ].join("\n"),
@@ -78,12 +78,12 @@ test("OpenCodeAdapter streams JSON events, extracts patch files, and strips secr
     const res = await adapter.spawn({ taskId: "t-oc", runId: "r-oc", cwd, prompt: "fix b.ts" }, (ev) => events.push(ev));
     assert.equal(res.status, "succeeded");
     assert.equal(res.externalId, "oc-sess-1");
-    assert.equal(res.output, "A1= ok");
+    assert.equal(res.output, "ENT= ok");
     assert.ok(events.some((e) => e.type === "patch" && e.summary.includes("src/b.ts")));
     assert.ok(events.some((e) => e.type === "tool_result"));
   } finally {
-    if (prevA1 === undefined) delete process.env.A1_TOKEN;
-    else process.env.A1_TOKEN = prevA1;
+    if (prevEnt === undefined) delete process.env.ENTERPRISE_GIT_TOKEN;
+    else process.env.ENTERPRISE_GIT_TOKEN = prevEnt;
     rmSync(cwd, { recursive: true, force: true });
     rmSync(dir, { recursive: true, force: true });
   }
