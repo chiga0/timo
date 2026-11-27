@@ -6,6 +6,7 @@ import {
   subscribeChatStream,
   subscribeEvents,
   subscribeRunStream,
+  type ChatContextSummary,
   type ChatMessage,
   type EfficiencyMetricsSnapshot,
   type ExecutorDescriptor,
@@ -15,6 +16,7 @@ import {
   type Proposal,
   type RunStreamEvent,
   type SettingsPayload,
+  type SkillsPayload,
   type TaskDetail,
   type TaskEvent,
   type TaskProgressFrame,
@@ -22,7 +24,7 @@ import {
 } from "./api.js";
 import { Composer, type ComposerSubmission } from "./components/Composer.js";
 import { Palette } from "./components/Palette.js";
-import { SettingsView, type ThemePreference } from "./components/SettingsView.js";
+import { SettingsView, type SettingsSection, type ThemePreference } from "./components/SettingsView.js";
 import { Sidebar } from "./components/Sidebar.js";
 import { TaskDetailView } from "./components/TaskDetailView.js";
 import { Thread } from "./components/Thread.js";
@@ -47,6 +49,8 @@ function isNetworkError(error: unknown): boolean {
 
 export interface WorkbenchState {
   messages: ChatMessage[];
+  contextSummary: ChatContextSummary | null;
+  skillsPayload: SkillsPayload | null;
   tasks: TaskSummary[];
   inbox: InboxItem[];
   liveProgress: Record<string, TaskProgressFrame>;
@@ -71,11 +75,14 @@ export function App(): React.JSX.Element {
   const api = useMemo(() => new Api(readSessionToken()), []);
   const [theme, setTheme] = useState<ThemePreference>(readInitialTheme);
   const [view, setView] = useState<"chat" | "task" | "settings">("chat");
+  const [settingsSection, setSettingsSection] = useState<SettingsSection>("assistant");
   const [leftOpen, setLeftOpen] = useState(true);
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [retrying, setRetrying] = useState(false);
   const [state, setState] = useState<WorkbenchState>({
     messages: [],
+    contextSummary: null,
+    skillsPayload: null,
     tasks: [],
     inbox: [],
     liveProgress: {},
@@ -101,14 +108,15 @@ export function App(): React.JSX.Element {
 
   const refresh = async (selectId?: string | null) => {
     try {
-      const [chatRes, tasks, inbox, policy, health, metrics, settingsPayload] = await Promise.all([
-        api.getChat(200).catch(() => ({ messages: [] as ChatMessage[] })),
+      const [chatRes, tasks, inbox, policy, health, metrics, settingsPayload, skillsPayload] = await Promise.all([
+        api.getChat(200).catch(() => ({ messages: [] as ChatMessage[], contextSummary: undefined })),
         api.listTasks("all"),
         api.inbox(),
         api.policy(),
         api.health(),
         api.metrics(),
         api.getSettings().catch(() => null),
+        api.getSkills().catch(() => null),
       ]);
       const requestedId = selectId === null ? null : (selectId ?? selectedRef.current);
       const nextId = requestedId && tasks.tasks.some((t) => t.taskId === requestedId) ? requestedId : null;
@@ -119,6 +127,8 @@ export function App(): React.JSX.Element {
       setState((previous) => ({
         ...previous,
         messages: mergeMessages(previous.messages, chatRes.messages),
+        contextSummary: chatRes.contextSummary ?? previous.contextSummary,
+        skillsPayload: skillsPayload ?? previous.skillsPayload,
         tasks: tasks.tasks,
         inbox: inbox.items,
         policy,
@@ -464,7 +474,10 @@ export function App(): React.JSX.Element {
 
       {view === "settings" ? (
         <SettingsView
+          key={settingsSection}
+          initialSection={settingsSection}
           payload={state.settingsPayload}
+          skillsPayload={state.skillsPayload}
           executors={state.executors}
           executorProviders={state.executorProviders}
           policy={state.policy}
@@ -473,6 +486,51 @@ export function App(): React.JSX.Element {
           theme={theme}
           onThemeChange={setTheme}
           onRefreshProviders={() => refreshProviders(true)}
+          onRefreshSkills={async () => {
+            const [sp, chatRes] = await Promise.all([api.getSkills(), api.getChat(200)]);
+            setState((previous) => ({
+              ...previous,
+              skillsPayload: sp,
+              contextSummary: chatRes.contextSummary ?? previous.contextSummary,
+            }));
+          }}
+          onSaveSkill={async (input) => {
+            await api.saveSkill(input);
+            const [sp, chatRes] = await Promise.all([api.getSkills(), api.getChat(200)]);
+            setState((previous) => ({
+              ...previous,
+              skillsPayload: sp,
+              contextSummary: chatRes.contextSummary ?? previous.contextSummary,
+            }));
+          }}
+          onUpdateSkill={async (id, patch) => {
+            await api.updateSkill(id, patch);
+            const [sp, chatRes] = await Promise.all([api.getSkills(), api.getChat(200)]);
+            setState((previous) => ({
+              ...previous,
+              skillsPayload: sp,
+              contextSummary: chatRes.contextSummary ?? previous.contextSummary,
+            }));
+          }}
+          onDeleteSkill={async (id) => {
+            await api.deleteSkill(id);
+            const [sp, chatRes] = await Promise.all([api.getSkills(), api.getChat(200)]);
+            setState((previous) => ({
+              ...previous,
+              skillsPayload: sp,
+              contextSummary: chatRes.contextSummary ?? previous.contextSummary,
+            }));
+          }}
+          onImportSkills={async (input) => {
+            const res = await api.importSkills(input);
+            const [sp, chatRes] = await Promise.all([api.getSkills(), api.getChat(200)]);
+            setState((previous) => ({
+              ...previous,
+              skillsPayload: sp,
+              contextSummary: chatRes.contextSummary ?? previous.contextSummary,
+            }));
+            return { imported: res.imported, skipped: res.skipped };
+          }}
           onPickFolder={() => api.pickFolder()}
           onInspectFolder={(path) => api.inspectFolder(path)}
           onScanRoot={(path) => api.scanWorkspaceRoot(path)}
@@ -603,7 +661,12 @@ export function App(): React.JSX.Element {
                   executors={state.executors}
                   executorProviders={state.executorProviders}
                   settings={state.settingsPayload?.settings ?? null}
-                  onOpenSettings={() => setView("settings")}
+                  contextSummary={state.contextSummary}
+                  skills={state.skillsPayload?.skills ?? []}
+                  onOpenSettings={(sec) => {
+                    setSettingsSection(sec ?? "assistant");
+                    setView("settings");
+                  }}
                   onSubmit={(submission) => void handleSendChat(submission)}
                 />
               </>

@@ -126,6 +126,12 @@ export interface WorkspaceFolderConfig {
   description?: string;
 }
 
+export interface SkillConfigOverride {
+  enabled?: boolean;
+  /** `"global"`, `"chat"`, `"task"`, or `"repo:<folderName>"`. */
+  scope?: string;
+}
+
 export interface TimoUserSettings {
   version: 1;
   assistant: AssistantSettings;
@@ -136,6 +142,10 @@ export interface TimoUserSettings {
   workspaceRules?: string;
   /** When true, Timo automatically cleans up clean worktrees of terminal tasks. */
   autoCleanupWorktrees?: boolean;
+  /** Optional read-only external directories scanned for `SKILL.md` skills. */
+  skillDirs?: string[];
+  /** Per-skill enable/scope overrides keyed by skill id. */
+  skillConfigs?: Record<string, SkillConfigOverride>;
   projects: ProjectRepoConfig[];
   knowledge: KnowledgeSourceConfig[];
   connections: PlatformConnectionConfig[];
@@ -362,6 +372,31 @@ export function sanitizeUserSettings(raw: unknown): TimoUserSettings {
       ? requestedDefaultFolder
       : folders.find((f) => f.kind === "git")?.id ?? folders[0]?.id ?? null;
 
+  const skillDirsRaw = Array.isArray(obj.skillDirs) ? obj.skillDirs : [];
+  const skillDirs: string[] = [];
+  const seenSkillDirs = new Set<string>();
+  for (const item of skillDirsRaw) {
+    const p = cleanString(item).replace(/\/+$/, "");
+    if (!p || seenSkillDirs.has(p)) continue;
+    seenSkillDirs.add(p);
+    skillDirs.push(p);
+  }
+
+  const skillConfigsRaw = asRecord(obj.skillConfigs);
+  const skillConfigs: Record<string, SkillConfigOverride> = {};
+  for (const [k, v] of Object.entries(skillConfigsRaw)) {
+    const id = k.trim();
+    if (!id) continue;
+    const rec = asRecord(v);
+    const entry: SkillConfigOverride = {};
+    if (typeof rec.enabled === "boolean") entry.enabled = rec.enabled;
+    const scope = cleanString(rec.scope);
+    if (scope) entry.scope = scope;
+    if (entry.enabled !== undefined || entry.scope !== undefined) {
+      skillConfigs[id] = entry;
+    }
+  }
+
   return {
     version: 1,
     assistant: {
@@ -375,6 +410,8 @@ export function sanitizeUserSettings(raw: unknown): TimoUserSettings {
     folders,
     workspaceRules: typeof obj.workspaceRules === "string" ? obj.workspaceRules.trim() : "",
     autoCleanupWorktrees: obj.autoCleanupWorktrees !== false,
+    skillDirs,
+    skillConfigs,
     projects,
     knowledge,
     connections,

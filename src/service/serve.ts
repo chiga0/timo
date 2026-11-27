@@ -20,7 +20,9 @@ import { WorkspaceManager } from "../workspace/manager.js";
 import { RunStreamStore } from "../workspace/run-stream.js";
 import { ChatStore, ChatStreamBus } from "../store/chat.js";
 import { MainChatRunner } from "./chat-runner.js";
+import { SkillRegistry } from "../skills/registry.js";
 import { CapabilityMcpGateway } from "../gateway/mcp-gateway.js";
+import { registerChiefTools } from "../gateway/chief-tools.js";
 import {
   createPlatformMrVerifier,
   reconcileMrOperation,
@@ -87,17 +89,9 @@ export async function serve(): Promise<void> {
   const probed = await executors.probeAll();
   log(`executors probed: ${probed.map((e) => `${e.id}=${e.available ? "ready" : "unavailable"}`).join(", ")}`);
 
-  // Workspace, assistant, knowledge base & isolated credentials store.
+  // Workspace, assistant, knowledge base, unified skills & isolated credentials store.
   const settingsStore = new SettingsStore(home, env);
-  const chatRunner = new MainChatRunner({
-    home,
-    chatStore,
-    chatBus,
-    service,
-    executors,
-    settingsStore,
-    log,
-  });
+  const skillRegistry = new SkillRegistry(home, env);
 
   // Local Capability MCP Gateway (Step 4.1 + 4.2): holds platform credentials
   // strictly inside the gateway process, never exposed to Worker subprocesses.
@@ -133,6 +127,18 @@ export async function serve(): Promise<void> {
   const mcpBound = await mcpGateway.start();
   log(`capability mcp gateway listening on http://${mcpBound.host}:${mcpBound.port}/mcp/:taskId/:generation/:nonce`);
 
+  const chatRunner = new MainChatRunner({
+    home,
+    chatStore,
+    chatBus,
+    service,
+    executors,
+    settingsStore,
+    skillRegistry,
+    mcpGateway,
+    log,
+  });
+
   const runner = new TaskRunner({
     store,
     service,
@@ -152,8 +158,31 @@ export async function serve(): Promise<void> {
     platformVerifier: createPlatformMrVerifier({ store, service, platform, credentials: settingsStore.resolveGatewayCredentials() }),
     enableWatchdogTriage: true,
     settingsStore,
+    skillRegistry,
     log,
   });
+
+  const handoffTask = (taskId: string, input: { executorId: string; model?: string; reason?: string }) => {
+    executors.require(input.executorId);
+    return service.handoffTask(taskId, {
+      toExecutor: input.executorId,
+      model: input.model,
+      reason: input.reason,
+      workspaces,
+      mcpGateway,
+      interruptActive: (id) => runner.interruptTask(id),
+    });
+  };
+  registerChiefTools(mcpGateway, {
+    service,
+    settingsStore,
+    skillRegistry,
+    chatStore,
+    chatBus,
+    runStreams,
+    handoff: handoffTask,
+  });
+  log(`chief-of-staff mcp tools mounted: ${mcpGateway.listChiefToolNames().join(", ")}`);
 
   const startedAt = new Date().toISOString();
   const apiDeps = {
@@ -165,6 +194,7 @@ export async function serve(): Promise<void> {
     executors,
     runStreams,
     settingsStore,
+    skillRegistry,
     workspaces,
     mcpGateway,
     chatStore,
@@ -178,18 +208,7 @@ export async function serve(): Promise<void> {
       operationId: string,
       input: { resolution: "confirmed_exists" | "confirmed_absent"; mrId?: string; url?: string; headSha?: string; reason?: string },
     ) => resolveMrOperation(operationId, input, { store, service }),
-    handoff: (taskId: string, input: { executorId: string; model?: string; reason?: string }) => {
-      // Validate requested executor is registered & ready before migrating!
-      executors.require(input.executorId);
-      return service.handoffTask(taskId, {
-        toExecutor: input.executorId,
-        model: input.model,
-        reason: input.reason,
-        workspaces,
-        mcpGateway,
-        interruptActive: (id) => runner.interruptTask(id),
-      });
-    },
+    handoff: handoffTask,
   };
 
   const router = new Router();

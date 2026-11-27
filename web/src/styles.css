@@ -1305,6 +1305,68 @@ button {
   max-width: 140px;
 }
 
+.ctx-status-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 26px;
+  padding: 0 8px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--sidebar);
+  color: var(--muted);
+  font-size: 11px;
+  white-space: nowrap;
+  transition: color 120ms ease, border-color 120ms ease, background 120ms ease;
+}
+
+.ctx-status-pill:hover {
+  border-color: var(--muted);
+  background: var(--muted-bg);
+  color: var(--ink);
+}
+
+.slash-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 6px;
+}
+
+.slash-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 9px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--card);
+  color: var(--ink);
+  font-size: 11.5px;
+  box-shadow: var(--shadow-sm);
+}
+
+.slash-chip:hover {
+  border-color: var(--muted);
+  background: var(--muted-bg);
+}
+
+.skill-row {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 11px 14px;
+  border-bottom: 1px solid var(--border);
+}
+
+.skill-row:last-child {
+  border-bottom: 0;
+}
+
+.skill-row.is-disabled {
+  opacity: 0.58;
+}
+
 .msg-user-wrap {
   display: flex;
   justify-content: flex-end;

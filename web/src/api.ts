@@ -34,6 +34,42 @@ export interface RunStreamEvent {
   data?: unknown;
 }
 
+export interface ChatContextSummary {
+  folderCount: number;
+  knowledgeCount: number;
+  enabledSkillCount: number;
+  totalSkillCount: number;
+  connectionCount: number;
+  chiefMcpTools: string[];
+}
+
+export interface SkillRecord {
+  id: string;
+  name: string;
+  description: string;
+  scope: string;
+  enabled: boolean;
+  source: "managed" | "external";
+  sourceLabel: string;
+  filePath: string;
+  bodyPreview: string;
+  updatedAt: string;
+}
+
+export interface ExternalSkillSource {
+  id: string;
+  label: string;
+  path: string;
+  skillCount: number;
+  skills: Array<{ id: string; name: string; description: string; filePath: string }>;
+}
+
+export interface SkillsPayload {
+  managedDir: string | null;
+  skills: SkillRecord[];
+  externalSources: ExternalSkillSource[];
+}
+
 export interface ChatMessage {
   messageId: string;
   role: "user" | "assistant" | "task_card";
@@ -260,6 +296,8 @@ export interface TimoUserSettings {
   folders?: WorkspaceFolderConfig[];
   workspaceRules?: string;
   autoCleanupWorktrees?: boolean;
+  skillDirs?: string[];
+  skillConfigs?: Record<string, { enabled?: boolean; scope?: string }>;
   projects: ProjectRepoConfig[];
   knowledge: KnowledgeSourceConfig[];
   connections: PlatformConnectionConfig[];
@@ -398,8 +436,37 @@ export class Api {
     });
   }
 
-  getChat(limit = 200): Promise<{ messages: ChatMessage[] }> {
+  getChat(limit = 200): Promise<{ messages: ChatMessage[]; contextSummary?: ChatContextSummary }> {
     return this.call(`/api/chat?limit=${limit}`);
+  }
+
+  getSkills(): Promise<SkillsPayload> {
+    return this.call("/api/skills");
+  }
+
+  saveSkill(input: { id?: string; name: string; description: string; content: string; scope?: string }): Promise<{ skill: SkillRecord }> {
+    return this.call("/api/skills", {
+      method: "POST",
+      body: JSON.stringify(input),
+    });
+  }
+
+  updateSkill(id: string, patch: { enabled?: boolean; scope?: string }): Promise<{ skill: SkillRecord | null; skills: SkillRecord[] }> {
+    return this.call(`/api/skills/${encodeURIComponent(id)}`, {
+      method: "PATCH",
+      body: JSON.stringify(patch),
+    });
+  }
+
+  deleteSkill(id: string): Promise<{ deleted: true; id: string }> {
+    return this.call(`/api/skills/${encodeURIComponent(id)}`, { method: "DELETE" });
+  }
+
+  importSkills(input: { sourceDir: string; skillIds?: string[]; overwrite?: boolean }): Promise<{ imported: string[]; skipped: string[]; skills: SkillRecord[] }> {
+    return this.call("/api/skills/import", {
+      method: "POST",
+      body: JSON.stringify(input),
+    });
   }
 
   sendChat(input: {

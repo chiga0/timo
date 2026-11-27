@@ -2,6 +2,7 @@ import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { extname, join, relative } from "node:path";
 import type { KnowledgeSourceConfig, PlatformConnectionConfig, ProjectRepoConfig, TimoUserSettings } from "../settings.js";
 import { redactLogText } from "../platform/adapter.js";
+import { formatSkillsPromptSection, selectActiveSkills, type SkillRecord } from "../skills/registry.js";
 
 const TEXT_EXTENSIONS = new Set([".md", ".markdown", ".txt", ".json", ".yaml", ".yml", ".toml", ".ini", ".conf", ".env.example"]);
 const IGNORED_DIRS = new Set([".git", "node_modules", "dist", "build", ".next", ".turbo", "coverage", ".venv", "__pycache__"]);
@@ -18,12 +19,16 @@ export interface AssembledTaskContext {
   projectSummary: string;
   serviceCatalog: string;
   knowledgeSnippets: KnowledgeSnippet[];
+  skillsCatalog: string;
 }
 
 export interface AssembleOptions {
   maxTotalBytes?: number;
   maxFileBytes?: number;
   maxFilesPerSource?: number;
+  skills?: SkillRecord[];
+  target?: "chat" | "task";
+  repoNames?: string[];
 }
 
 /**
@@ -123,11 +128,18 @@ export function assembleTaskContext(
     }
   }
 
+  const activeSkills = options.skills
+    ? selectActiveSkills(options.skills, options.target ?? "task", options.repoNames ?? [])
+    : [];
+  const skillsCatalog =
+    options.skills !== undefined ? formatSkillsPromptSection(activeSkills, options.target ?? "task") : "";
+
   return {
     systemPrompt: settings.assistant.systemPrompt.trim(),
     projectSummary: [...projectLines, ...folderRefLines].join("\n"),
     serviceCatalog: connectionLines.join("\n"),
     knowledgeSnippets: snippets,
+    skillsCatalog,
   };
 }
 
@@ -148,6 +160,9 @@ export function formatAssembledContext(context: AssembledTaskContext): string {
       .map((s) => `### ${s.filePath}${s.truncated ? " (truncated)" : ""}\n${s.content}`)
       .join("\n\n");
     sections.push(`[Knowledge Base]\n${docs}`);
+  }
+  if (context.skillsCatalog) {
+    sections.push(context.skillsCatalog);
   }
   return sections.join("\n\n");
 }

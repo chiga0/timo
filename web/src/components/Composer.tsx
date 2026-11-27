@@ -1,5 +1,12 @@
 import { useEffect, useRef, useState } from "react";
-import type { ExecutorDescriptor, ExecutorProviderCatalog, TimoUserSettings, WorkspaceFolderConfig } from "../api.js";
+import type {
+  ChatContextSummary,
+  ExecutorDescriptor,
+  ExecutorProviderCatalog,
+  SkillRecord,
+  TimoUserSettings,
+  WorkspaceFolderConfig,
+} from "../api.js";
 import { AgentLogo, agentLabel } from "./AgentIcons.js";
 
 export type ComposerSubmission =
@@ -19,7 +26,9 @@ export function Composer(props: {
   executors: ExecutorDescriptor[];
   executorProviders?: Record<string, ExecutorProviderCatalog>;
   settings: TimoUserSettings | null;
-  onOpenSettings: () => void;
+  contextSummary?: ChatContextSummary | null;
+  skills?: SkillRecord[];
+  onOpenSettings: (section?: "assistant" | "folders" | "skills" | "connections" | "appearance" | "system") => void;
   onSubmit: (submission: ComposerSubmission) => void;
 }): React.JSX.Element {
   const folders: WorkspaceFolderConfig[] =
@@ -154,9 +163,36 @@ export function Composer(props: {
           { id: "opencode", kind: "cli" as const, available: true, capabilities: {} },
         ];
 
+  const enabledSkills = (props.skills ?? []).filter((s) => s.enabled);
+  const slashQuery = text.startsWith("/") && !text.includes(" ") ? text.slice(1).toLowerCase() : null;
+  const slashSuggestions =
+    slashQuery !== null
+      ? enabledSkills
+          .filter((s) => s.id.toLowerCase().includes(slashQuery) || s.name.toLowerCase().includes(slashQuery))
+          .slice(0, 5)
+      : [];
+
   return (
     <div className="composer-wrap">
       <div className="composer-inner">
+        {slashSuggestions.length > 0 && (
+          <div className="slash-bar" role="listbox" aria-label="Timo 统一 Skills 快捷调用">
+            {slashSuggestions.map((skill) => (
+              <button
+                key={skill.id}
+                type="button"
+                className="slash-chip"
+                onClick={() => {
+                  setText(`/${skill.id} `);
+                  document.getElementById("composer-input")?.focus();
+                }}
+              >
+                <span className="mono" style={{ fontWeight: 600 }}>/{skill.id}</span>
+                <span className="muted">{skill.description.slice(0, 42)}</span>
+              </button>
+            ))}
+          </div>
+        )}
         <div className="compose-box">
           <div className="compose-row">
             <textarea
@@ -189,7 +225,7 @@ export function Composer(props: {
                   </button>
                 </div>
                 {mode === "repo_delivery" && (
-                  <button type="button" className="btn-link" style={{ marginLeft: "auto" }} onClick={props.onOpenSettings}>
+                  <button type="button" className="btn-link" style={{ marginLeft: "auto" }} onClick={() => props.onOpenSettings("folders")}>
                     管理仓库与默认模型 →
                   </button>
                 )}
@@ -361,6 +397,22 @@ export function Composer(props: {
                     <option value="__add__">+ 管理工作区</option>
                   </select>
                 </label>
+
+                {props.contextSummary && (
+                  <button
+                    type="button"
+                    className="ctx-status-pill"
+                    onClick={() => props.onOpenSettings("skills")}
+                    title={`Timo 主助手已装配上下文：${props.contextSummary.folderCount} 个工作区、${props.contextSummary.knowledgeCount} 个知识源、${props.contextSummary.enabledSkillCount} 个统一 Skill${props.contextSummary.chiefMcpTools.length > 0 ? `、${props.contextSummary.chiefMcpTools.length} 个控制面 MCP 工具` : ""}（点击管理）`}
+                  >
+                    <span className="dot dot-success" />
+                    <span>
+                      {props.contextSummary.enabledSkillCount} Skills
+                      {props.contextSummary.knowledgeCount > 0 ? ` · ${props.contextSummary.knowledgeCount} 知识源` : ""}
+                      {props.contextSummary.chiefMcpTools.length > 0 ? " · MCP" : ""}
+                    </span>
+                  </button>
+                )}
               </>
             ) : (
               <span className="ctx-chip">日志诊断</span>

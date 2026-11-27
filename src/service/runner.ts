@@ -26,6 +26,7 @@ import {
 import type { RepoDeliveryState } from "../config.js";
 import type { SettingsStore } from "../settings.js";
 import { assembleTaskContext, formatAssembledContext } from "../knowledge/context.js";
+import type { SkillRegistry } from "../skills/registry.js";
 
 const NON_RUNNABLE_WAIT_REASONS: ReadonlySet<string> = new Set([
   "needs_human_decision",
@@ -72,6 +73,8 @@ export interface RunnerOptions {
   enableWatchdogTriage?: boolean;
   /** Optional user settings & knowledge base store (`TIMO_HOME/settings.json`). */
   settingsStore?: SettingsStore;
+  /** Optional Timo Unified Skills registry (`~/.timo/skills`). */
+  skillRegistry?: SkillRegistry;
   log: (line: string) => void;
 }
 
@@ -1080,8 +1083,10 @@ export class TaskRunner {
       });
     }
     if (view.task.kind === "assistant_chat") {
-      const settingsBlock = this.options.settingsStore
-        ? formatAssembledContext(assembleTaskContext(this.options.settingsStore.load(), []))
+      const settings = this.options.settingsStore?.load();
+      const skills = this.options.skillRegistry?.list(settings);
+      const settingsBlock = settings
+        ? formatAssembledContext(assembleTaskContext(settings, [], { skills, target: "chat" }))
         : "";
       return [
         settingsBlock,
@@ -1099,11 +1104,14 @@ export class TaskRunner {
     const capsuleBlock = capsule
       ? `[Handoff Capsule g${capsule.fromGeneration} -> g${capsule.toGeneration} (${capsule.fromExecutor} -> ${capsule.toExecutor})]\n${serializeHandoffCapsule(capsule)}`
       : "";
-    const settingsBlock = this.options.settingsStore
+    const settings = this.options.settingsStore?.load();
+    const skills = this.options.skillRegistry?.list(settings);
+    const settingsBlock = settings
       ? formatAssembledContext(
           assembleTaskContext(
-            this.options.settingsStore.load(),
+            settings,
             view.task.repos.map((r) => r.sourcePath),
+            { skills, target: "task", repoNames: view.task.repos.map((r) => r.name) },
           ),
         )
       : "";

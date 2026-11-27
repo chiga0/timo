@@ -46,6 +46,19 @@ export interface GatewayToolDefinition {
   handler: (args: Record<string, unknown>, ctx: GatewayCallContext) => Promise<GatewayToolResult>;
 }
 
+export interface ChiefToolContext {
+  nonce: string;
+  service: TaskService;
+  credentials: Record<string, string | undefined>;
+}
+
+export interface ChiefToolDefinition {
+  name: string;
+  description: string;
+  inputSchema: Record<string, unknown>;
+  handler: (args: Record<string, unknown>, ctx: ChiefToolContext) => Promise<GatewayToolResult>;
+}
+
 interface ActiveToken {
   taskId: string;
   generation: number;
@@ -65,11 +78,15 @@ export interface CapabilityMcpGatewayOptions {
 }
 
 const MCP_PATH_RE = /^\/mcp\/([^/]+)\/(\d+)\/([^/]+)$/;
+const CHIEF_MCP_PATH_RE = /^\/mcp\/chief\/([^/]+)$/;
 
 export class CapabilityMcpGateway {
   private readonly tools = new Map<string, GatewayToolDefinition>();
+  private readonly chiefTools = new Map<string, ChiefToolDefinition>();
   /** Keyed by `${taskId}:${generation}` -> active fencing token. */
   private readonly tokens = new Map<string, ActiveToken>();
+  /** Active short-lived nonces for Chief-of-Staff Main Chat sessions. */
+  private readonly chiefNonces = new Set<string>();
   private readonly credentials: Record<string, string | undefined>;
   private server: HttpServer | null = null;
   private boundPort: number | null = null;
@@ -81,9 +98,33 @@ export class CapabilityMcpGateway {
     this.registerBuiltinRequestGrant();
   }
 
-  /** Registers a controlled capability tool on the gateway. */
+  /** Registers a controlled capability tool on the gateway (for background Worker tasks). */
   registerTool(definition: GatewayToolDefinition): void {
     this.tools.set(definition.name, definition);
+  }
+
+  /** Registers a Chief-of-Staff control-plane tool (strictly isolated to `/mcp/chief/:nonce`). */
+  registerChiefTool(definition: ChiefToolDefinition): void {
+    this.chiefTools.set(definition.name, definition);
+  }
+
+  /** Lists all registered Chief-of-Staff control-plane tool names. */
+  listChiefToolNames(): string[] {
+    return [...this.chiefTools.keys()];
+  }
+
+  /** Issues a short-lived Chief-of-Staff MCP URL for one Main Chat turn. */
+  issueChiefToken(): { nonce: string; path: string; url: string } {
+    const nonce = randomBytes(24).toString("base64url");
+    this.chiefNonces.add(nonce);
+    const path = `/mcp/chief/${nonce}`;
+    const port = this.boundPort ?? this.options.port ?? 0;
+    return { nonce, path, url: `http://${this.host}:${port}${path}` };
+  }
+
+  /** Revokes a Chief-of-Staff session nonce when the Main Chat turn finishes. */
+  revokeChief(nonce: string): void {
+    this.chiefNonces.delete(nonce);
   }
 
   get port(): number | null {
@@ -215,6 +256,27 @@ export class CapabilityMcpGateway {
 
   private async handleHttp(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const url = new URL(req.url ?? "/", `http://${this.host}`);
+
+    // Chief-of-Staff Main Chat MCP endpoint (isolated from Worker tools).
+    const chiefMatch = CHIEF_MCP_PATH_RE.exec(url.pathname);
+    if (chiefMatch) {
+      const nonce = decodeURIComponent(chiefMatch[1]!);
+      if (!this.hasChiefNonce(nonce)) {
+        res.writeHead(403, { "content-type": "application/json; charset=utf-8" });
+        res.end(JSON.stringify({ error: { code: "SESSION_REVOKED", message: "chief session token is invalid or revoked" } }));
+        return;
+      }
+      const mcp = this.createChiefMcpServer(nonce);
+      const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+      res.on("close", () => {
+        void transport.close().catch(() => undefined);
+        void mcp.close().catch(() => undefined);
+      });
+      await mcp.connect(transport);
+      await transport.handleRequest(req, res);
+      return;
+    }
+
     const match = MCP_PATH_RE.exec(url.pathname);
     if (!match) {
       res.writeHead(404, { "content-type": "application/json; charset=utf-8" });
@@ -242,6 +304,71 @@ export class CapabilityMcpGateway {
     });
     await mcp.connect(transport);
     await transport.handleRequest(req, res);
+  }
+
+  private hasChiefNonce(nonce: string): boolean {
+    for (const active of this.chiefNonces) {
+      if (safeEquals(active, nonce)) return true;
+    }
+    return false;
+  }
+
+  private createChiefMcpServer(nonce: string): McpServer {
+    const server = new McpServer(
+      { name: "timo-chief-of-staff", version: "0.1.0" },
+      { capabilities: { tools: {} } },
+    );
+
+    server.setRequestHandler(ListToolsRequestSchema, async () => {
+      return {
+        tools: [...this.chiefTools.values()].map((tool) => ({
+          name: tool.name,
+          description: tool.description,
+          inputSchema: tool.inputSchema as { type: "object"; properties?: Record<string, object>; required?: string[] },
+        })),
+      };
+    });
+
+    server.setRequestHandler(CallToolRequestSchema, async (request) => {
+      const { name, arguments: rawArgs } = request.params;
+      if (!this.hasChiefNonce(nonce)) {
+        return {
+          isError: true,
+          content: [{ type: "text", text: JSON.stringify({ code: "SESSION_REVOKED", message: "chief session expired" }) }],
+        };
+      }
+      const tool = this.chiefTools.get(name);
+      if (!tool) {
+        return {
+          isError: true,
+          content: [{ type: "text", text: JSON.stringify({ code: "TOOL_NOT_FOUND", message: `unknown chief tool ${name}` }) }],
+        };
+      }
+      const args = rawArgs && typeof rawArgs === "object" && !Array.isArray(rawArgs) ? (rawArgs as Record<string, unknown>) : {};
+      try {
+        const result = await tool.handler(args, {
+          nonce,
+          service: this.options.service,
+          credentials: this.options.credentialsProvider ? this.options.credentialsProvider() : this.credentials,
+        });
+        return {
+          isError: result.isError === true,
+          content: [{ type: "text", text: JSON.stringify(result.data) }],
+        };
+      } catch (error) {
+        return {
+          isError: true,
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({ code: "TOOL_ERROR", message: error instanceof Error ? error.message : String(error) }),
+            },
+          ],
+        };
+      }
+    });
+
+    return server;
   }
 
   private createScopedMcpServer(scope: { taskId: string; generation: number; nonce: string }): McpServer {

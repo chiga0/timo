@@ -18,6 +18,7 @@ import { discoverExecutorProviders, type ExecutorProviderCatalog } from "../adap
 import { inspectLocalFolder, pickNativeFolder, probeLocalPlatformAuth, scanWorkspaceRoot, selectFoldersForRequest } from "../workspace/inspect.js";
 import type { ChatStore, ChatStreamBus, ChatStreamFrame } from "../store/chat.js";
 import type { MainChatRunner } from "../service/chat-runner.js";
+import type { SkillRegistry } from "../skills/registry.js";
 
 export interface ApiDeps {
   service: TaskService;
@@ -34,10 +35,12 @@ export interface ApiDeps {
   runStreams?: RunStreamStore;
   /** Workspace, assistant, knowledge & isolated credential settings store. */
   settingsStore?: SettingsStore;
+  /** Executor-agnostic Timo Unified Skills registry (`~/.timo/skills`). */
+  skillRegistry?: SkillRegistry;
   /** Autonomous multi-repo worktree manager for inspection & managed cleanup. */
   workspaces?: WorkspaceManager;
   /** Gateway token revocation hook when force-deleting an active task. */
-  mcpGateway?: { revoke(taskId: string, generation?: number): void };
+  mcpGateway?: { revoke(taskId: string, generation?: number): void; listChiefToolNames?(): string[] };
   /** Interrupts an in-flight run (used on force-delete). */
   interruptActive?: (taskId: string) => Promise<void>;
   /** Live steering hook into the runner (Step 3.2). */
@@ -328,9 +331,112 @@ export function registerApi(router: Router, deps: ApiDeps): void {
   // ---- Fixed Main Chat (User <-> Timo) + Live SSE Stream ----
 
   router.add("GET", "/api/chat", (context) => {
-    if (!deps.chatStore) return { body: { messages: [] } };
     const limit = parsePositiveInt(context.query.get("limit"), 200);
-    return { body: { messages: deps.chatStore.list(limit) } };
+    const messages = deps.chatStore ? deps.chatStore.list(limit) : [];
+    const settings = deps.settingsStore?.load();
+    const skills = deps.skillRegistry ? deps.skillRegistry.list(settings) : [];
+    const docFolders = (settings?.folders ?? []).filter((f) => f.kind === "docs").length;
+    const explicitKnowledge = (settings?.knowledge ?? []).filter((k) => k.enabled).length;
+    const contextSummary = {
+      folderCount: (settings?.folders ?? []).length,
+      knowledgeCount: explicitKnowledge + docFolders,
+      enabledSkillCount: skills.filter((s) => s.enabled).length,
+      totalSkillCount: skills.length,
+      connectionCount: (settings?.connections ?? []).length,
+      chiefMcpTools: deps.mcpGateway?.listChiefToolNames?.() ?? [],
+    };
+    return { body: { messages, contextSummary } };
+  });
+
+  // ---- Timo Unified Skills Management ----
+
+  router.add("GET", "/api/skills", () => {
+    if (!deps.skillRegistry) {
+      return { body: { managedDir: null, skills: [], externalSources: [] } };
+    }
+    const settings = deps.settingsStore?.load();
+    return {
+      body: {
+        managedDir: deps.skillRegistry.managedDir,
+        skills: deps.skillRegistry.list(settings),
+        externalSources: deps.skillRegistry.discoverExternalSources(),
+      },
+    };
+  });
+
+  router.add("POST", "/api/skills", (context) => {
+    if (!deps.skillRegistry) {
+      throw new RouteError(501, "unsupported", "skill registry is not configured");
+    }
+    const body = asRecord(context.body);
+    const name = requireString(body.name, "name");
+    const description = requireString(body.description, "description");
+    const content = requireString(body.content, "content");
+    const saved = withMappedErrors(() =>
+      deps.skillRegistry!.saveManaged({
+        id: optionalString(body.id),
+        name,
+        description,
+        content,
+        scope: optionalString(body.scope),
+      }),
+    );
+    return { status: 201, body: { skill: saved } };
+  });
+
+  router.add("PATCH", "/api/skills/:id", (context) => {
+    if (!deps.settingsStore) {
+      throw new RouteError(501, "unsupported", "settings store is not configured");
+    }
+    const id = context.params.id!;
+    const body = asRecord(context.body);
+    const current = deps.settingsStore.load();
+    const existing = current.skillConfigs?.[id] ?? {};
+    const nextOverride = {
+      ...existing,
+      ...(typeof body.enabled === "boolean" ? { enabled: body.enabled } : {}),
+      ...(typeof body.scope === "string" && body.scope.trim() !== "" ? { scope: body.scope.trim() } : {}),
+    };
+    const saved = deps.settingsStore.save({
+      ...current,
+      skillConfigs: {
+        ...(current.skillConfigs ?? {}),
+        [id]: nextOverride,
+      },
+    });
+    const skills = deps.skillRegistry ? deps.skillRegistry.list(saved) : [];
+    return { body: { skill: skills.find((s) => s.id === id) ?? null, skills } };
+  });
+
+  router.add("DELETE", "/api/skills/:id", (context) => {
+    if (!deps.skillRegistry) {
+      throw new RouteError(501, "unsupported", "skill registry is not configured");
+    }
+    const id = context.params.id!;
+    const deleted = withMappedErrors(() => deps.skillRegistry!.deleteManaged(id));
+    if (!deleted) {
+      throw new RouteError(404, "not_found", `managed skill ${id} not found`);
+    }
+    return { body: { deleted: true, id } };
+  });
+
+  router.add("POST", "/api/skills/import", (context) => {
+    if (!deps.skillRegistry) {
+      throw new RouteError(501, "unsupported", "skill registry is not configured");
+    }
+    const body = asRecord(context.body);
+    const sourceDir = requireString(body.sourceDir, "sourceDir");
+    const skillIds = optionalStringArray(body.skillIds);
+    const overwrite = body.overwrite === true;
+    const outcome = withMappedErrors(() => deps.skillRegistry!.importFromDir(sourceDir, { skillIds, overwrite }));
+    const settings = deps.settingsStore?.load();
+    return {
+      status: 201,
+      body: {
+        ...outcome,
+        skills: deps.skillRegistry.list(settings),
+      },
+    };
   });
 
   router.add("POST", "/api/chat/send", (context) => {

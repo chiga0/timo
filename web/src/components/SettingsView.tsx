@@ -11,12 +11,14 @@ import type {
   PolicyRuleItem,
   PolicySnapshot,
   SettingsPayload,
+  SkillRecord,
+  SkillsPayload,
   TimoUserSettings,
   WorkspaceFolderConfig,
 } from "../api.js";
 import { AgentLogo, agentLabel } from "./AgentIcons.js";
 
-type SettingsSection = "assistant" | "folders" | "connections" | "appearance" | "system";
+export type SettingsSection = "assistant" | "folders" | "skills" | "connections" | "appearance" | "system";
 export type ThemePreference = "light" | "dark" | "system";
 
 const CONNECTION_KIND_LABEL: Record<ConnectionKind, string> = {
@@ -44,7 +46,9 @@ const EMPTY_SETTINGS: TimoUserSettings = {
 };
 
 export function SettingsView(props: {
+  initialSection?: SettingsSection;
   payload: SettingsPayload | null;
+  skillsPayload: SkillsPayload | null;
   executors: ExecutorDescriptor[];
   executorProviders: Record<string, ExecutorProviderCatalog>;
   policy: PolicySnapshot | null;
@@ -53,6 +57,11 @@ export function SettingsView(props: {
   theme: ThemePreference;
   onThemeChange: (theme: ThemePreference) => void;
   onRefreshProviders: () => Promise<void>;
+  onRefreshSkills: () => Promise<void>;
+  onSaveSkill: (input: { id?: string; name: string; description: string; content: string; scope?: string }) => Promise<void>;
+  onUpdateSkill: (id: string, patch: { enabled?: boolean; scope?: string }) => Promise<void>;
+  onDeleteSkill: (id: string) => Promise<void>;
+  onImportSkills: (input: { sourceDir: string; skillIds?: string[]; overwrite?: boolean }) => Promise<{ imported: string[]; skipped: string[] }>;
   onPickFolder: () => Promise<{ cancelled: boolean; folder?: InspectedFolder; error?: string }>;
   onInspectFolder: (path: string) => Promise<{ folder: InspectedFolder }>;
   onScanRoot: (path?: string) => Promise<{ cancelled: boolean; rootPath?: string; folders: InspectedFolder[]; error?: string }>;
@@ -62,7 +71,7 @@ export function SettingsView(props: {
   onSaveCredential: (key: string, value: string) => Promise<void>;
   onTestConnection: (connectionId: string) => Promise<{ ok: boolean; message: string }>;
 }): React.JSX.Element {
-  const [section, setSection] = useState<SettingsSection>("assistant");
+  const [section, setSection] = useState<SettingsSection>(props.initialSection ?? "assistant");
   const [draft, setDraft] = useState<TimoUserSettings>(props.payload?.settings ?? EMPTY_SETTINGS);
   const [saving, setSaving] = useState(false);
   const [pickingFolder, setPickingFolder] = useState(false);
@@ -74,6 +83,16 @@ export function SettingsView(props: {
   const [activeProviderByExec, setActiveProviderByExec] = useState<Record<string, string>>({});
   const [notice, setNotice] = useState<string | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+
+  // Unified Skills form state
+  const [showSkillEditor, setShowSkillEditor] = useState(false);
+  const [editingSkillId, setEditingSkillId] = useState<string | undefined>(undefined);
+  const [skillName, setSkillName] = useState("");
+  const [skillDesc, setSkillDesc] = useState("");
+  const [skillScope, setSkillScope] = useState("global");
+  const [skillBody, setSkillBody] = useState("");
+  const [customSkillDir, setCustomSkillDir] = useState("");
+  const [importingSkillSource, setImportingSkillSource] = useState<string | null>(null);
 
   // Add platform / service connection form state
   const [newConnName, setNewConnName] = useState("");
@@ -264,6 +283,9 @@ export function SettingsView(props: {
   const localAuth = props.payload?.localAuth;
   const credentials: CredentialStatus[] = props.payload?.credentials ?? [];
 
+  const skills: SkillRecord[] = props.skillsPayload?.skills ?? [];
+  const externalSkillSources = props.skillsPayload?.externalSources ?? [];
+
   const navGroups: Array<{ label: string; items: Array<[SettingsSection, string]> }> = [
     {
       label: "通用",
@@ -274,6 +296,7 @@ export function SettingsView(props: {
       items: [
         ["assistant", "主助手与代理"],
         ["folders", `工作区 (${folders.length})`],
+        ["skills", `Skills (${skills.filter((s) => s.enabled).length}/${skills.length})`],
         ["connections", "平台与凭证"],
       ],
     },
@@ -1006,6 +1029,312 @@ export function SettingsView(props: {
                         <span className="muted small" style={{ fontWeight: 400 }}>{desc}</span>
                       </button>
                     ))}
+                  </div>
+                </div>
+              </section>
+            </>
+          )}
+
+          {section === "skills" && (
+            <>
+              <div className="settings-head">
+                <h2>Timo 统一 Skills 管理</h2>
+                <p className="muted">
+                  跨执行器共享的个人研发方法论资产（存放在{" "}
+                  <span className="mono">{props.skillsPayload?.managedDir ?? "~/.timo/skills"}</span>
+                  ，兼容标准 <span className="mono">SKILL.md</span> 格式）。启用后自动装配到主对话与后台任务，支持{" "}
+                  <span className="mono">/skill-name</span> 显式调用，换任何执行器（Qwen / Pi / Codex / OpenCode）均生效。
+                </p>
+              </div>
+
+              <section className="card">
+                <header className="card-head">
+                  <span>已管理 Skill（{skills.length}）</span>
+                  <div className="row" style={{ gap: 6 }}>
+                    <button
+                      type="button"
+                      className="btn btn-sm"
+                      onClick={() => void props.onRefreshSkills()}
+                    >
+                      刷新
+                    </button>
+                    <button
+                      type="button"
+                      className="btn btn-primary btn-sm"
+                      onClick={() => {
+                        setEditingSkillId(undefined);
+                        setSkillName("");
+                        setSkillDesc("");
+                        setSkillScope("global");
+                        setSkillBody("# 触发条件\n\n# 执行步骤\n1. \n");
+                        setShowSkillEditor((v) => !v);
+                      }}
+                    >
+                      {showSkillEditor && !editingSkillId ? "收起新建" : "+ 新建 Skill"}
+                    </button>
+                  </div>
+                </header>
+
+                {showSkillEditor && (
+                  <div className="card-body stack" style={{ borderBottom: "1px solid var(--border)", background: "var(--sidebar)" }}>
+                    <div className="form-grid2">
+                      <label className="field">
+                        <span className="field-label">Skill 名称（同时生成 /slash 标识）</span>
+                        <input
+                          className="input"
+                          placeholder="例如：code-review 或 release-check"
+                          value={skillName}
+                          onChange={(e) => setSkillName(e.target.value)}
+                        />
+                      </label>
+                      <label className="field">
+                        <span className="field-label">生效范围</span>
+                        <select className="input" value={skillScope} onChange={(e) => setSkillScope(e.target.value)}>
+                          <option value="global">全局（主对话 + 后台任务）</option>
+                          <option value="chat">仅主对话</option>
+                          <option value="task">仅后台交付任务</option>
+                          {folders.map((f) => (
+                            <option key={f.id} value={`repo:${f.name}`}>
+                              仅仓库：{f.name}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                    </div>
+                    <label className="field">
+                      <span className="field-label">一句话用途说明（用于 Progressive Disclosure 目录索引）</span>
+                      <input
+                        className="input"
+                        placeholder="例如：审查本次代码改动是否存在并发风险、回归或安全隐患"
+                        value={skillDesc}
+                        onChange={(e) => setSkillDesc(e.target.value)}
+                      />
+                    </label>
+                    <label className="field">
+                      <span className="field-label">SKILL.md 正文指令（Markdown）</span>
+                      <textarea
+                        className="textarea mono"
+                        rows={6}
+                        value={skillBody}
+                        onChange={(e) => setSkillBody(e.target.value)}
+                      />
+                    </label>
+                    <div className="row" style={{ justifyContent: "flex-end", gap: 6 }}>
+                      <button type="button" className="btn btn-sm" onClick={() => setShowSkillEditor(false)}>
+                        取消
+                      </button>
+                      <button
+                        type="button"
+                        className="btn btn-primary btn-sm"
+                        disabled={saving || !skillName.trim() || !skillDesc.trim() || !skillBody.trim()}
+                        onClick={async () => {
+                          setSaving(true);
+                          setNotice(null);
+                          setErrorMsg(null);
+                          try {
+                            await props.onSaveSkill({
+                              id: editingSkillId,
+                              name: skillName.trim(),
+                              description: skillDesc.trim(),
+                              content: skillBody.trim(),
+                              scope: skillScope,
+                            });
+                            setShowSkillEditor(false);
+                            setNotice(`Skill「${skillName.trim()}」已保存并立即生效`);
+                          } catch (err) {
+                            setErrorMsg(formatError(err));
+                          } finally {
+                            setSaving(false);
+                          }
+                        }}
+                      >
+                        保存 Skill
+                      </button>
+                    </div>
+                  </div>
+                )}
+
+                {skills.length === 0 ? (
+                  <div className="card-body">
+                    <div className="empty-box">
+                      还没有 Timo 统一托管的 Skill。点击右上角「+ 新建 Skill」，或在下方从本机 Agent 目录一键导入。
+                    </div>
+                  </div>
+                ) : (
+                  <div>
+                    {skills.map((skill) => (
+                      <div key={skill.id} className={skill.enabled ? "skill-row" : "skill-row is-disabled"}>
+                        <div className="row" style={{ gap: 8, flexWrap: "wrap" }}>
+                          <span className={skill.enabled ? "dot dot-success" : "dot"} />
+                          <span style={{ fontWeight: 600 }}>{skill.name}</span>
+                          <span className="badge-pill mono">/{skill.id}</span>
+                          <span className="badge-pill">{skill.sourceLabel}</span>
+                          <div className="row" style={{ marginLeft: "auto", gap: 6 }}>
+                            <select
+                              aria-label={`${skill.name} 范围`}
+                              className="chip-select"
+                              value={skill.scope}
+                              onChange={(e) => {
+                                void props.onUpdateSkill(skill.id, { scope: e.target.value }).catch((err) => setErrorMsg(formatError(err)));
+                              }}
+                            >
+                              <option value="global">全局</option>
+                              <option value="chat">仅主对话</option>
+                              <option value="task">仅后台任务</option>
+                              {folders.map((f) => (
+                                <option key={f.id} value={`repo:${f.name}`}>
+                                  仓库: {f.name}
+                                </option>
+                              ))}
+                            </select>
+                            <button
+                              type="button"
+                              className={skill.enabled ? "btn btn-sm" : "btn btn-primary btn-sm"}
+                              onClick={() => {
+                                void props
+                                  .onUpdateSkill(skill.id, { enabled: !skill.enabled })
+                                  .then(() => setNotice(`已${skill.enabled ? "停用" : "启用"} Skill「${skill.name}」`))
+                                  .catch((err) => setErrorMsg(formatError(err)));
+                              }}
+                            >
+                              {skill.enabled ? "停用" : "启用"}
+                            </button>
+                            {skill.source === "managed" && (
+                              <>
+                                <button
+                                  type="button"
+                                  className="btn-link"
+                                  onClick={() => {
+                                    setEditingSkillId(skill.id);
+                                    setSkillName(skill.name);
+                                    setSkillDesc(skill.description);
+                                    setSkillScope(skill.scope);
+                                    setSkillBody(skill.bodyPreview);
+                                    setShowSkillEditor(true);
+                                  }}
+                                >
+                                  编辑
+                                </button>
+                                <button
+                                  type="button"
+                                  className="btn-link"
+                                  style={{ color: "var(--error)" }}
+                                  onClick={() => {
+                                    void props
+                                      .onDeleteSkill(skill.id)
+                                      .then(() => setNotice(`已删除 Skill「${skill.name}」`))
+                                      .catch((err) => setErrorMsg(formatError(err)));
+                                  }}
+                                >
+                                  删除
+                                </button>
+                              </>
+                            )}
+                          </div>
+                        </div>
+                        <div className="muted small">{skill.description}</div>
+                        <details className="finding-details" style={{ marginTop: 2 }}>
+                          <summary>预览 SKILL.md（{skill.filePath}）</summary>
+                          <pre className="finding-pre mono">{skill.bodyPreview}</pre>
+                        </details>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </section>
+
+              <section className="card">
+                <header className="card-head">
+                  <span>从本机 Agent 目录一键导入</span>
+                  <span className="muted small">导入后归 Timo 统一托管，跨执行器共享</span>
+                </header>
+                <div className="card-body stack small">
+                  {externalSkillSources.length === 0 ? (
+                    <div className="muted">未在 ~/.qwen/skills、~/.codex/skills、~/.claude/skills 等常见位置探测到现有 Skill。</div>
+                  ) : (
+                    externalSkillSources.map((src) => (
+                      <div key={src.id} className="card-box row" style={{ justifyContent: "space-between", gap: 10 }}>
+                        <div className="stack" style={{ gap: 2, minWidth: 0 }}>
+                          <span style={{ fontWeight: 600 }}>{src.label}</span>
+                          <span className="muted mono" style={{ fontSize: 11 }}>
+                            {src.path} · 共 {src.skillCount} 个 Skill
+                          </span>
+                        </div>
+                        <button
+                          type="button"
+                          className="btn btn-sm"
+                          disabled={importingSkillSource === src.id}
+                          onClick={async () => {
+                            setImportingSkillSource(src.id);
+                            setNotice(null);
+                            setErrorMsg(null);
+                            try {
+                              const res = await props.onImportSkills({ sourceDir: src.path });
+                              setNotice(
+                                `已从 ${src.label} 导入 ${res.imported.length} 个 Skill` +
+                                  (res.skipped.length > 0 ? `（跳过 ${res.skipped.length} 个同名项）` : ""),
+                              );
+                            } catch (err) {
+                              setErrorMsg(formatError(err));
+                            } finally {
+                              setImportingSkillSource(null);
+                            }
+                          }}
+                        >
+                          {importingSkillSource === src.id ? "导入中…" : "全部导入"}
+                        </button>
+                      </div>
+                    ))
+                  )}
+
+                  <div className="stack" style={{ gap: 6, marginTop: 6, borderTop: "1px solid var(--border)", paddingTop: 10 }}>
+                    <span className="field-label">或挂载只读外部 Skill 目录（例如团队仓库的 skills/ 目录）</span>
+                    {(draft.skillDirs ?? []).length > 0 && (
+                      <div className="stack" style={{ gap: 4 }}>
+                        {(draft.skillDirs ?? []).map((dir) => (
+                          <div key={dir} className="row card-box" style={{ justifyContent: "space-between" }}>
+                            <span className="mono">{dir}</span>
+                            <button
+                              type="button"
+                              className="btn-link"
+                              style={{ color: "var(--error)" }}
+                              onClick={async () => {
+                                const next = { ...draft, skillDirs: (draft.skillDirs ?? []).filter((d) => d !== dir) };
+                                setDraft(next);
+                                await persist(next, `已移除外部 Skill 目录：${dir}`);
+                                await props.onRefreshSkills();
+                              }}
+                            >
+                              移除
+                            </button>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                    <div className="row" style={{ gap: 6 }}>
+                      <input
+                        className="input mono"
+                        placeholder="/path/to/team-repo/skills"
+                        value={customSkillDir}
+                        onChange={(e) => setCustomSkillDir(e.target.value)}
+                      />
+                      <button
+                        type="button"
+                        className="btn btn-sm"
+                        disabled={!customSkillDir.trim()}
+                        onClick={async () => {
+                          const clean = customSkillDir.trim().replace(/\/+$/, "");
+                          if (!clean) return;
+                          const next = { ...draft, skillDirs: [...new Set([...(draft.skillDirs ?? []), clean])] };
+                          setDraft(next);
+                          setCustomSkillDir("");
+                          await persist(next, `已挂载只读 Skill 目录：${clean}`);
+                          await props.onRefreshSkills();
+                        }}
+                      >
+                        挂载目录
+                      </button>
+                    </div>
                   </div>
                 </div>
               </section>
