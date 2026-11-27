@@ -100,6 +100,8 @@ export interface GetTaskResponse {
     receipt: unknown;
     reconciledAt: string | null;
   }>;
+  createdAt: string;
+  updatedAt: string;
   lastObservedAt: string | null;
   /** Current brief revision; callers must echo it back when amending. */
   briefVersion: number;

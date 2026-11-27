@@ -21,10 +21,10 @@ import {
   type TaskSummary,
 } from "./api.js";
 import { Composer, type ComposerSubmission } from "./components/Composer.js";
-import { Inspector, type InspectorTab } from "./components/Inspector.js";
 import { Palette } from "./components/Palette.js";
 import { SettingsView, type ThemePreference } from "./components/SettingsView.js";
 import { Sidebar } from "./components/Sidebar.js";
+import { TaskDetailView } from "./components/TaskDetailView.js";
 import { Thread } from "./components/Thread.js";
 import { Topbar } from "./components/Topbar.js";
 
@@ -70,10 +70,8 @@ export interface WorkbenchState {
 export function App(): React.JSX.Element {
   const api = useMemo(() => new Api(readSessionToken()), []);
   const [theme, setTheme] = useState<ThemePreference>(readInitialTheme);
-  const [view, setView] = useState<"workbench" | "settings">("workbench");
+  const [view, setView] = useState<"chat" | "task" | "settings">("chat");
   const [leftOpen, setLeftOpen] = useState(true);
-  const [rightOpen, setRightOpen] = useState(false);
-  const [inspectorTab, setInspectorTab] = useState<InspectorTab>("overview");
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [retrying, setRetrying] = useState(false);
   const [state, setState] = useState<WorkbenchState>({
@@ -264,18 +262,17 @@ export function App(): React.JSX.Element {
         return;
       }
       if (event.key === "[") setLeftOpen((open) => !open);
-      if (event.key === "]" && selectedRef.current) setRightOpen((open) => !open);
       if (event.key === "Escape") setPaletteOpen(false);
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, []);
 
-  // Subscribe to the selected task's detailed run stream when the right drawer is on "执行记录".
+  // Automatically subscribe to the active task's detailed run stream when on the Task Detail page.
   useEffect(() => {
     const taskId = state.selectedId;
     const runId = state.activeRunId;
-    if (!taskId || !runId || !rightOpen || inspectorTab !== "live") {
+    if (view !== "task" || !taskId || !runId) {
       return;
     }
     setState((previous) => ({ ...previous, runEvents: [] }));
@@ -288,12 +285,17 @@ export function App(): React.JSX.Element {
       });
     });
     return unsub;
-  }, [state.selectedId, state.activeRunId, rightOpen, inspectorTab]);
+  }, [view, state.selectedId, state.activeRunId]);
 
-  const selectTask = async (taskId: string) => {
-    setView("workbench");
-    setRightOpen(true);
-    setState((previous) => ({ ...previous, selectedId: taskId, activeRunId: null, runEvents: [] }));
+  const openTask = async (taskId: string) => {
+    setView("task");
+    setState((previous) => ({
+      ...previous,
+      selectedId: taskId,
+      detail: previous.detail?.taskId === taskId ? previous.detail : null,
+      activeRunId: null,
+      runEvents: [],
+    }));
     try {
       const [detail, events, proposalsRes, runsRes] = await Promise.all([
         api.getTask(taskId),
@@ -320,7 +322,7 @@ export function App(): React.JSX.Element {
   };
 
   const focusMainChat = () => {
-    setView("workbench");
+    setView("chat");
     window.setTimeout(() => document.getElementById("composer-input")?.focus(), 20);
   };
 
@@ -351,7 +353,6 @@ export function App(): React.JSX.Element {
       createdAt: nowIso,
       updatedAt: nowIso,
     };
-    // 0ms optimistic render: show the user's message immediately without waiting for network!
     setState((previous) => ({
       ...previous,
       messages: [...previous.messages, optimisticUser],
@@ -416,11 +417,11 @@ export function App(): React.JSX.Element {
   };
 
   const handleDeleteTask = async (taskId: string, force: boolean) => {
-    const wasSelected = state.selectedId === taskId;
+    const wasViewing = view === "task" && state.selectedId === taskId;
     await run(async () => {
       await api.deleteTask(taskId, force);
-      if (wasSelected) {
-        setRightOpen(false);
+      if (wasViewing) {
+        setView("chat");
         return null;
       }
       return undefined;
@@ -444,8 +445,7 @@ export function App(): React.JSX.Element {
     }
   };
 
-  const showRight = rightOpen && state.selectedId !== null;
-  const shellClass = ["shell", leftOpen ? "" : "no-left", showRight ? "" : "no-right"].filter(Boolean).join(" ");
+  const shellClass = leftOpen ? "shell" : "shell no-left";
   const isOffline = state.connection === "reconnecting" || state.connection === "closed";
   const streamingMsg = state.messages.find((m) => m.role === "assistant" && m.status === "streaming");
 
@@ -454,12 +454,10 @@ export function App(): React.JSX.Element {
       <div className="topbar">
         <Topbar
           leftOpen={leftOpen}
-          rightOpen={showRight}
-          hasSelection={state.selectedId !== null}
           view={view}
           onToggleLeft={() => setLeftOpen((open) => !open)}
-          onToggleRight={() => setRightOpen((open) => !open)}
-          onView={setView}
+          onGoHome={focusMainChat}
+          onBackFromSettings={() => setView(state.selectedId && state.detail ? "chat" : "chat")}
           onPalette={() => setPaletteOpen(true)}
         />
       </div>
@@ -506,12 +504,12 @@ export function App(): React.JSX.Element {
               <Sidebar
                 tasks={state.tasks}
                 inbox={state.inbox}
-                selectedTaskId={showRight ? state.selectedId : null}
-                chatActive={view === "workbench"}
+                selectedTaskId={view === "task" ? state.selectedId : null}
+                chatActive={view === "chat"}
                 hasChatMessages={state.messages.length > 0}
                 onFocusMainChat={focusMainChat}
                 onClearChat={() => void handleClearChat()}
-                onSelectTask={(taskId) => void selectTask(taskId)}
+                onSelectTask={(taskId) => void openTask(taskId)}
                 onRenameTask={(taskId, title) => void handleRenameTask(taskId, title)}
                 onArchiveTask={(taskId, archived) => void handleArchiveTask(taskId, archived)}
                 onDeleteTask={(taskId, force) => void handleDeleteTask(taskId, force)}
@@ -519,7 +517,7 @@ export function App(): React.JSX.Element {
               />
             </aside>
           )}
-          <main className={state.messages.length > 0 ? "center" : "center is-empty"}>
+          <main className={view === "chat" && state.messages.length === 0 ? "center is-empty" : "center"}>
             {isOffline && (
               <div className="conn-bar" role="status">
                 <span className="dot dot-warning dot-pulse" />
@@ -550,37 +548,8 @@ export function App(): React.JSX.Element {
                 </button>
               </div>
             )}
-            <Thread
-              messages={state.messages}
-              tasks={state.tasks}
-              inbox={state.inbox}
-              liveProgress={state.liveProgress}
-              selectedTaskId={showRight ? state.selectedId : null}
-              onQuickPrompt={handleQuickPrompt}
-              onSelectTask={(taskId) => void selectTask(taskId)}
-              onStopChat={(messageId) => void api.stopChat(messageId)}
-              onStopTask={(taskId) => run(async () => { await api.stop(taskId); })}
-              onRetryTask={(taskId) => run(async () => { await api.retry(taskId); })}
-              onResolveDecision={(taskId, action, approved) => run(async () => { await api.resolve(taskId, action, approved); })}
-              onDismissInbox={(taskId, decisionKey) => run(async () => { await api.dismissInbox(taskId, decisionKey); })}
-            />
-            <Composer
-              disabled={isOffline}
-              isStreaming={Boolean(streamingMsg)}
-              onStopStreaming={() => {
-                if (streamingMsg) void api.stopChat(streamingMsg.messageId);
-              }}
-              defaultRepoPath={state.defaultRepoPath}
-              executors={state.executors}
-              executorProviders={state.executorProviders}
-              settings={state.settingsPayload?.settings ?? null}
-              onOpenSettings={() => setView("settings")}
-              onSubmit={(submission) => void handleSendChat(submission)}
-            />
-          </main>
-          {showRight && (
-            <aside className="inspector">
-              <Inspector
+            {view === "task" ? (
+              <TaskDetailView
                 detail={state.detail}
                 events={state.events}
                 executors={state.executors}
@@ -588,9 +557,8 @@ export function App(): React.JSX.Element {
                 activeRunId={state.activeRunId}
                 runEvents={state.runEvents}
                 proposals={state.proposals}
-                tab={inspectorTab}
-                onTabChange={setInspectorTab}
-                onClose={() => setRightOpen(false)}
+                inbox={state.inbox}
+                onBack={focusMainChat}
                 onSelectRun={(runId) => setState((previous) => ({ ...previous, activeRunId: runId }))}
                 onSteer={async (taskId, message) => {
                   const res = await api.steer(taskId, message);
@@ -608,13 +576,42 @@ export function App(): React.JSX.Element {
                 onConfirmProposal={(proposalId) => run(async () => { await api.confirmProposal(proposalId); })}
                 onCancelProposal={(proposalId) => run(async () => { await api.cancelProposal(proposalId); })}
                 onResolve={(taskId, action, approved) => run(async () => { await api.resolve(taskId, action, approved); })}
-                inbox={state.inbox}
+                onDismissInbox={(taskId, decisionKey) => run(async () => { await api.dismissInbox(taskId, decisionKey); })}
               />
-            </aside>
-          )}
+            ) : (
+              <>
+                <Thread
+                  messages={state.messages}
+                  tasks={state.tasks}
+                  inbox={state.inbox}
+                  liveProgress={state.liveProgress}
+                  onQuickPrompt={handleQuickPrompt}
+                  onOpenTask={(taskId) => void openTask(taskId)}
+                  onStopChat={(messageId) => void api.stopChat(messageId)}
+                  onStopTask={(taskId) => run(async () => { await api.stop(taskId); })}
+                  onRetryTask={(taskId) => run(async () => { await api.retry(taskId); })}
+                  onResolveDecision={(taskId, action, approved) => run(async () => { await api.resolve(taskId, action, approved); })}
+                  onDismissInbox={(taskId, decisionKey) => run(async () => { await api.dismissInbox(taskId, decisionKey); })}
+                />
+                <Composer
+                  disabled={isOffline}
+                  isStreaming={Boolean(streamingMsg)}
+                  onStopStreaming={() => {
+                    if (streamingMsg) void api.stopChat(streamingMsg.messageId);
+                  }}
+                  defaultRepoPath={state.defaultRepoPath}
+                  executors={state.executors}
+                  executorProviders={state.executorProviders}
+                  settings={state.settingsPayload?.settings ?? null}
+                  onOpenSettings={() => setView("settings")}
+                  onSubmit={(submission) => void handleSendChat(submission)}
+                />
+              </>
+            )}
+          </main>
         </div>
       )}
-      {paletteOpen && <Palette tasks={state.tasks} onSelect={(taskId) => void selectTask(taskId)} onClose={() => setPaletteOpen(false)} />}
+      {paletteOpen && <Palette tasks={state.tasks} onSelect={(taskId) => void openTask(taskId)} onClose={() => setPaletteOpen(false)} />}
     </>
   );
 }
@@ -642,7 +639,6 @@ function mergeMessages(previous: ChatMessage[], server: ChatMessage[]): ChatMess
     }
     return msg;
   });
-  // Keep any in-flight optimistic user message until the server response replaces it.
   for (const local of previous) {
     if (local.messageId.startsWith("optimistic-")) {
       merged.push(local);

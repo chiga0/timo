@@ -1,56 +1,92 @@
-import { useState, type ReactNode } from "react";
+import { isValidElement, memo, useEffect, useId, useState, type ReactElement, type ReactNode } from "react";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
+import rehypeHighlight from "rehype-highlight";
+
+const REMARK_PLUGINS = [remarkGfm];
+const REHYPE_PLUGINS: Parameters<typeof ReactMarkdown>[0]["rehypePlugins"] = [
+  [rehypeHighlight, { ignoreMissing: true, plainText: ["mermaid"] }],
+];
 
 /**
- * Lightweight, zero-dependency, XSS-safe Markdown renderer for Timo replies.
- * Supports fenced code blocks (with copy button), headings, lists, blockquotes,
- * horizontal rules, inline code, bold, italic, and safe http(s) links.
+ * Production Markdown renderer built on react-markdown + remark-gfm +
+ * rehype-highlight + lazy-loaded Mermaid SVG rendering.
+ *
+ * - Safe by default (no raw HTML injection; links restricted to safe schemes).
+ * - Full GFM support: scrollable tables, strikethrough, task lists, autolinks.
+ * - Syntax highlighting with one-click copy and theme-adaptive styling.
+ * - Lazy Mermaid diagrams that auto-adapt to light/dark theme and degrade
+ *   gracefully to source code while streaming or on incomplete syntax.
  */
-export function Markdown(props: { content: string }): React.JSX.Element {
-  const blocks = parseBlocks(props.content);
+export const Markdown = memo(function Markdown(props: { content: string }): React.JSX.Element {
   return (
     <div className="md">
-      {blocks.map((block, idx) => {
-        if (block.type === "code") {
-          return <CodeBlock key={idx} lang={block.lang} code={block.code} />;
-        }
-        if (block.type === "heading") {
-          const Tag = block.level <= 2 ? "h3" : "h4";
-          return <Tag key={idx} className={`md-h${block.level}`}>{renderInline(block.text)}</Tag>;
-        }
-        if (block.type === "ul") {
-          return (
-            <ul key={idx} className="md-list">
-              {block.items.map((item, i) => (
-                <li key={i}>{renderInline(item)}</li>
-              ))}
-            </ul>
-          );
-        }
-        if (block.type === "ol") {
-          return (
-            <ol key={idx} className="md-list">
-              {block.items.map((item, i) => (
-                <li key={i}>{renderInline(item)}</li>
-              ))}
-            </ol>
-          );
-        }
-        if (block.type === "quote") {
-          return <blockquote key={idx} className="md-quote">{renderInline(block.text)}</blockquote>;
-        }
-        if (block.type === "hr") {
-          return <hr key={idx} className="md-hr" />;
-        }
-        return <p key={idx} className="md-p">{renderInline(block.text)}</p>;
-      })}
+      <ReactMarkdown
+        remarkPlugins={REMARK_PLUGINS}
+        rehypePlugins={REHYPE_PLUGINS}
+        components={{
+          pre({ children }) {
+            const codeEl = findCodeChild(children);
+            const className = typeof codeEl?.props.className === "string" ? codeEl.props.className : "";
+            const langMatch = className.match(/language-([A-Za-z0-9_+-]+)/);
+            const lang = (langMatch?.[1] ?? "").toLowerCase();
+            const rawCode = extractText(codeEl ? codeEl.props.children : children).replace(/\n$/, "");
+            if (lang === "mermaid") {
+              return <MermaidBlock code={rawCode} />;
+            }
+            return (
+              <CodeBlock lang={lang} rawCode={rawCode}>
+                {children}
+              </CodeBlock>
+            );
+          },
+          code({ className, children, ...rest }) {
+            const isBlock = Boolean(className && /(^|\s)(language-|hljs)/.test(className));
+            if (isBlock) {
+              return (
+                <code className={className} {...rest}>
+                  {children}
+                </code>
+              );
+            }
+            return (
+              <code className="md-inline-code mono" {...rest}>
+                {children}
+              </code>
+            );
+          },
+          table({ children }) {
+            return (
+              <div className="md-table-wrap">
+                <table className="md-table">{children}</table>
+              </div>
+            );
+          },
+          a({ href, children }) {
+            return (
+              <a href={href} target="_blank" rel="noopener noreferrer" className="md-link">
+                {children}
+              </a>
+            );
+          },
+          input({ type, checked, ...rest }) {
+            if (type === "checkbox") {
+              return <input type="checkbox" className="md-checkbox" checked={Boolean(checked)} readOnly {...rest} />;
+            }
+            return <input type={type} {...rest} />;
+          },
+        }}
+      >
+        {props.content}
+      </ReactMarkdown>
     </div>
   );
-}
+});
 
-function CodeBlock(props: { lang: string; code: string }): React.JSX.Element {
+function CodeBlock(props: { lang: string; rawCode: string; children: ReactNode }): React.JSX.Element {
   const [copied, setCopied] = useState(false);
   const copy = () => {
-    void navigator.clipboard?.writeText(props.code).then(() => {
+    void navigator.clipboard?.writeText(props.rawCode).then(() => {
       setCopied(true);
       window.setTimeout(() => setCopied(false), 1500);
     });
@@ -63,157 +99,144 @@ function CodeBlock(props: { lang: string; code: string }): React.JSX.Element {
           {copied ? "已复制" : "复制"}
         </button>
       </div>
-      <pre className="md-pre mono"><code>{props.code}</code></pre>
+      <pre className="md-pre mono">{props.children}</pre>
     </div>
   );
 }
 
-type Block =
-  | { type: "code"; lang: string; code: string }
-  | { type: "heading"; level: number; text: string }
-  | { type: "ul"; items: string[] }
-  | { type: "ol"; items: string[] }
-  | { type: "quote"; text: string }
-  | { type: "hr" }
-  | { type: "p"; text: string };
+let mermaidModulePromise: Promise<typeof import("mermaid")> | null = null;
+let mermaidRenderCounter = 0;
 
-function parseBlocks(raw: string): Block[] {
-  const lines = raw.replace(/\r\n/g, "\n").split("\n");
-  const blocks: Block[] = [];
-  let i = 0;
-
-  while (i < lines.length) {
-    const line = lines[i]!;
-    const trimmed = line.trim();
-    if (trimmed === "") {
-      i += 1;
-      continue;
-    }
-
-    // Fenced code block
-    const fence = trimmed.match(/^```([A-Za-z0-9_+-]*)/);
-    if (fence) {
-      const lang = fence[1] ?? "";
-      const codeLines: string[] = [];
-      i += 1;
-      while (i < lines.length && !lines[i]!.trim().startsWith("```")) {
-        codeLines.push(lines[i]!);
-        i += 1;
-      }
-      if (i < lines.length) i += 1; // closing fence
-      blocks.push({ type: "code", lang, code: codeLines.join("\n") });
-      continue;
-    }
-
-    // Horizontal rule
-    if (/^([-*_])\1{2,}$/.test(trimmed)) {
-      blocks.push({ type: "hr" });
-      i += 1;
-      continue;
-    }
-
-    // Heading
-    const heading = trimmed.match(/^(#{1,4})\s+(.+)$/);
-    if (heading) {
-      blocks.push({ type: "heading", level: heading[1]!.length, text: heading[2]! });
-      i += 1;
-      continue;
-    }
-
-    // Blockquote
-    if (trimmed.startsWith(">")) {
-      const quoteLines: string[] = [];
-      while (i < lines.length && lines[i]!.trim().startsWith(">")) {
-        quoteLines.push(lines[i]!.trim().replace(/^>\s?/, ""));
-        i += 1;
-      }
-      blocks.push({ type: "quote", text: quoteLines.join("\n") });
-      continue;
-    }
-
-    // Unordered list
-    if (/^[-*+]\s+/.test(trimmed)) {
-      const items: string[] = [];
-      while (i < lines.length && /^\s*[-*+]\s+/.test(lines[i]!)) {
-        items.push(lines[i]!.trim().replace(/^[-*+]\s+/, ""));
-        i += 1;
-      }
-      blocks.push({ type: "ul", items });
-      continue;
-    }
-
-    // Ordered list
-    if (/^\d+\.\s+/.test(trimmed)) {
-      const items: string[] = [];
-      while (i < lines.length && /^\s*\d+\.\s+/.test(lines[i]!)) {
-        items.push(lines[i]!.trim().replace(/^\d+\.\s+/, ""));
-        i += 1;
-      }
-      blocks.push({ type: "ol", items });
-      continue;
-    }
-
-    // Paragraph (absorb consecutive plain lines)
-    const para: string[] = [line];
-    i += 1;
-    while (i < lines.length) {
-      const next = lines[i]!;
-      const nt = next.trim();
-      if (
-        nt === "" ||
-        nt.startsWith("```") ||
-        /^#{1,4}\s+/.test(nt) ||
-        nt.startsWith(">") ||
-        /^[-*+]\s+/.test(nt) ||
-        /^\d+\.\s+/.test(nt) ||
-        /^([-*_])\1{2,}$/.test(nt)
-      ) {
-        break;
-      }
-      para.push(next);
-      i += 1;
-    }
-    blocks.push({ type: "p", text: para.join("\n") });
+function loadMermaid(): Promise<typeof import("mermaid")> {
+  if (!mermaidModulePromise) {
+    mermaidModulePromise = import("mermaid");
   }
-
-  return blocks;
+  return mermaidModulePromise;
 }
 
-function renderInline(text: string): ReactNode[] {
-  const out: ReactNode[] = [];
-  // Tokenize inline code, bold, italic, and safe http(s) markdown links.
-  const regex = /(`[^`]+`|\*\*[^*]+\*\*|\*[^*\n]+\*|\[[^\]]+\]\(https?:\/\/[^)\s]+\))/g;
-  let last = 0;
-  let match: RegExpExecArray | null;
-  let key = 0;
+function readIsDarkTheme(): boolean {
+  if (typeof document === "undefined") return false;
+  return document.documentElement.classList.contains("theme-dark");
+}
 
-  while ((match = regex.exec(text)) !== null) {
-    if (match.index > last) {
-      out.push(text.slice(last, match.index));
+function MermaidBlock(props: { code: string }): React.JSX.Element {
+  const uid = useId().replace(/[^a-zA-Z0-9_-]/g, "");
+  const [isDark, setIsDark] = useState(readIsDarkTheme);
+  const [svg, setSvg] = useState<string | null>(null);
+  const [showSource, setShowSource] = useState(false);
+  const [copied, setCopied] = useState(false);
+
+  useEffect(() => {
+    if (typeof document === "undefined" || typeof MutationObserver === "undefined") return;
+    const observer = new MutationObserver(() => {
+      setIsDark(readIsDarkTheme());
+    });
+    observer.observe(document.documentElement, { attributes: true, attributeFilter: ["class"] });
+    return () => observer.disconnect();
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    const trimmed = props.code.trim();
+    if (!trimmed) {
+      setSvg(null);
+      return;
     }
-    const token = match[0];
-    if (token.startsWith("`") && token.endsWith("`")) {
-      out.push(<code key={key++} className="md-inline-code mono">{token.slice(1, -1)}</code>);
-    } else if (token.startsWith("**") && token.endsWith("**")) {
-      out.push(<strong key={key++}>{token.slice(2, -2)}</strong>);
-    } else if (token.startsWith("*") && token.endsWith("*")) {
-      out.push(<em key={key++}>{token.slice(1, -1)}</em>);
-    } else if (token.startsWith("[")) {
-      const parts = token.match(/^\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)$/);
-      if (parts) {
-        out.push(
-          <a key={key++} href={parts[2]} target="_blank" rel="noopener noreferrer" className="md-link">
-            {parts[1]}
-          </a>,
-        );
-      } else {
-        out.push(token);
+
+    const timer = window.setTimeout(() => {
+      void (async () => {
+        const renderId = `timo-mmd-${uid}-${++mermaidRenderCounter}`;
+        try {
+          const mod = await loadMermaid();
+          const mermaid = mod.default;
+          mermaid.initialize({
+            startOnLoad: false,
+            securityLevel: "strict",
+            theme: isDark ? "dark" : "neutral",
+            fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif',
+            suppressErrorRendering: true,
+          });
+          const valid = await mermaid.parse(trimmed, { suppressErrors: true });
+          if (!valid || cancelled) {
+            if (!cancelled) setSvg(null);
+            return;
+          }
+          const rendered = await mermaid.render(renderId, trimmed);
+          if (!cancelled) {
+            setSvg(rendered.svg);
+          }
+        } catch {
+          if (!cancelled) setSvg(null);
+        } finally {
+          document.getElementById(`d${renderId}`)?.remove();
+        }
+      })();
+    }, 140);
+
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [props.code, isDark, uid]);
+
+  const copy = () => {
+    void navigator.clipboard?.writeText(props.code).then(() => {
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1500);
+    });
+  };
+
+  return (
+    <div className="md-code-wrap md-mermaid-wrap">
+      <div className="md-code-head">
+        <span className="mono">mermaid</span>
+        <div className="row" style={{ gap: 4 }}>
+          {svg && (
+            <button
+              type="button"
+              className="md-copy-btn"
+              onClick={() => setShowSource((v) => !v)}
+            >
+              {showSource ? "查看图表" : "源码"}
+            </button>
+          )}
+          <button type="button" className="md-copy-btn" onClick={copy}>
+            {copied ? "已复制" : "复制"}
+          </button>
+        </div>
+      </div>
+      {svg && !showSource ? (
+        <div
+          className="md-mermaid-canvas"
+          // SVG is rendered by Mermaid with `securityLevel: "strict"`.
+          dangerouslySetInnerHTML={{ __html: svg }}
+        />
+      ) : (
+        <pre className="md-pre mono">
+          <code>{props.code}</code>
+        </pre>
+      )}
+    </div>
+  );
+}
+
+function findCodeChild(children: ReactNode): ReactElement<{ className?: string; children?: ReactNode }> | null {
+  if (isValidElement(children)) {
+    return children as ReactElement<{ className?: string; children?: ReactNode }>;
+  }
+  if (Array.isArray(children)) {
+    for (const child of children) {
+      if (isValidElement(child)) {
+        return child as ReactElement<{ className?: string; children?: ReactNode }>;
       }
     }
-    last = match.index + token.length;
   }
-  if (last < text.length) {
-    out.push(text.slice(last));
-  }
-  return out;
+  return null;
+}
+
+function extractText(node: ReactNode): string {
+  if (typeof node === "string" || typeof node === "number") return String(node);
+  if (Array.isArray(node)) return node.map(extractText).join("");
+  if (isValidElement<{ children?: ReactNode }>(node)) return extractText(node.props.children);
+  return "";
 }

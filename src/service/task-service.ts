@@ -567,6 +567,8 @@ export class TaskService {
         receipt: op.receipt,
         reconciledAt: op.reconciledAt,
       })),
+      createdAt: task.createdAt,
+      updatedAt: task.updatedAt,
       lastObservedAt: task.updatedAt,
       // Callers need this to send a correct `expectedBriefVersion` to amend.
       briefVersion: view.briefVersion,
@@ -981,12 +983,18 @@ export class TaskService {
     status: TaskStatus;
     waitingReason: string | null;
     inputDigest: string;
+    resultSummary: string | null;
+    failureReason: string | null;
     createdAt: string;
     updatedAt: string;
   }> {
     const rows = this.store.listTasks(limit, status, options);
     return rows.map((task) => {
       const rawText = this.store.latestRequestText(task.taskId);
+      const assistantText =
+        task.result && typeof task.result === "object" && typeof task.result.assistantText === "string"
+          ? task.result.assistantText.trim()
+          : "";
       return {
         taskId: task.taskId,
         title: task.titleOverride?.trim() || summarizeTaskTitle(rawText, task.kind, task.taskId),
@@ -997,6 +1005,8 @@ export class TaskService {
         status: task.status,
         waitingReason: task.waitingReason,
         inputDigest: task.inputDigest,
+        resultSummary: assistantText || null,
+        failureReason: task.failureReason,
         createdAt: task.createdAt,
         updatedAt: task.updatedAt,
       };

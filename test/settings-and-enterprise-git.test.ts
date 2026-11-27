@@ -708,9 +708,19 @@ describe("Settings HTTP Routes & Human-Readable Task Titles", () => {
         // 3. Explicit delivery intent delegates a background task and appends ONE task_card in Main Chat
         const workRes = chatRunner.send({ text: "请帮我修复 demo-app 的超时逻辑", executorId: "qwen-code" });
         assert.equal(workRes.kind, "task");
-        assert.equal(service.listTasks(50, undefined, { archived: "all" }).length, 1);
+        const listed = service.listTasks(50, undefined, { archived: "all" });
+        assert.equal(listed.length, 1);
+        assert.equal(listed[0]?.resultSummary, null);
         const history = chatStore.list(50);
         assert.equal(history.filter((m) => m.role === "task_card").length, 1);
+
+        // 4. Completed task exposes `resultSummary` in listTasks() so the single inline Task Card
+        // can render the capped expandable Markdown conclusion without posting duplicate chat bubbles.
+        service.completeAssistantChat(workRes.taskId, "run-summary-1", "## 最终结论\n\n| 项 | 状态 |\n|---|---|\n| 超时重试 | 已修复 |");
+        const afterComplete = service.listTasks(50, undefined, { archived: "all" });
+        assert.equal(afterComplete[0]?.status, "completed");
+        assert.match(afterComplete[0]?.resultSummary ?? "", /最终结论/);
+        assert.match(afterComplete[0]?.resultSummary ?? "", /超时重试/);
       } finally {
         service.close();
       }

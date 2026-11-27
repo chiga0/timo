@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { ChatMessage, InboxItem, TaskProgressFrame, TaskSummary } from "../api.js";
 import { AgentLogo, agentLabel } from "./AgentIcons.js";
 import { Markdown } from "./Markdown.js";
@@ -20,21 +20,24 @@ const STARTER_PROMPTS = [
   "我想重构一个模块，先帮我列一份工程交付检查清单",
 ];
 
+const CONCLUSION_COLLAPSED_HEIGHT = 240;
+
 /**
  * Fixed global Main Chat (`User <-> Timo Chief of Staff`).
  *
  * - Never bound to a single Task: casual Q&A streams directly as Markdown here.
- * - Delegated engineering tasks appear inline as a single compact, live-updating
- *   Task Card (merging status + live progress + quick actions in one place).
+ * - Delegated engineering tasks appear inline as a single live-updating Task Card:
+ *   running shows a clean 1-line progress bar; completed renders the Markdown
+ *   final conclusion capped at 240px with an inline expand/collapse toggle,
+ *   plus "查看详情 →" to open the dedicated Task Detail page.
  */
 export function Thread(props: {
   messages: ChatMessage[];
   tasks: TaskSummary[];
   inbox: InboxItem[];
   liveProgress: Record<string, TaskProgressFrame>;
-  selectedTaskId: string | null;
   onQuickPrompt: (text: string) => void;
-  onSelectTask: (taskId: string) => void;
+  onOpenTask: (taskId: string) => void;
   onStopChat: (messageId: string) => void;
   onStopTask: (taskId: string) => void;
   onRetryTask: (taskId: string) => void;
@@ -101,8 +104,7 @@ export function Thread(props: {
                   task={task}
                   inboxItems={taskInbox}
                   live={live}
-                  selected={props.selectedTaskId === msg.taskId}
-                  onSelect={() => props.onSelectTask(msg.taskId!)}
+                  onOpen={() => props.onOpenTask(msg.taskId!)}
                   onStop={() => props.onStopTask(msg.taskId!)}
                   onRetry={() => props.onRetryTask(msg.taskId!)}
                   onResolve={(action, approved) => props.onResolveDecision(msg.taskId!, action, approved)}
@@ -162,13 +164,16 @@ function InlineTaskCard(props: {
   task?: TaskSummary;
   inboxItems: InboxItem[];
   live?: TaskProgressFrame;
-  selected: boolean;
-  onSelect: () => void;
+  onOpen: () => void;
   onStop: () => void;
   onRetry: () => void;
   onResolve: (action: string, approved: boolean) => void;
   onDismiss: (decisionKey: string) => void;
 }): React.JSX.Element {
+  const [expanded, setExpanded] = useState(false);
+  const [overflows, setOverflows] = useState(false);
+  const conclusionRef = useRef<HTMLDivElement | null>(null);
+
   const task = props.task;
   const status = task?.status ?? "accepted";
   const isRunning = status === "accepted" || status === "running" || status === "verifying";
@@ -178,23 +183,40 @@ function InlineTaskCard(props: {
   const blocked = props.inboxItems.find((i) => i.decisionKey === "task_blocked_final");
   const title = task?.title || props.message.content.split("\n")[0]?.slice(0, 48) || "后台任务";
   const execId = task?.executorId || props.message.executorId;
-
+  const conclusion = status === "completed" ? (task?.resultSummary?.trim() || "") : "";
   const liveLine = buildLiveLine(task, props.live, decision, blocked);
+  const repoLabel = task?.repoNames && task.repoNames.length > 0 ? task.repoNames.join("、") : "";
+
+  useEffect(() => {
+    const el = conclusionRef.current;
+    if (!el || !conclusion) {
+      setOverflows(false);
+      return;
+    }
+    const measure = () => {
+      setOverflows(el.scrollHeight > CONCLUSION_COLLAPSED_HEIGHT + 8);
+    };
+    measure();
+    if (typeof ResizeObserver === "undefined") return;
+    const ro = new ResizeObserver(measure);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [conclusion, expanded]);
 
   return (
-    <article
-      className={props.selected ? "live-task-card selected" : "live-task-card"}
-      onClick={props.onSelect}
-      role="button"
-      tabIndex={0}
-      onKeyDown={(e) => {
-        if (e.key === "Enter" || e.key === " ") {
-          e.preventDefault();
-          props.onSelect();
-        }
-      }}
-    >
-      <div className="live-task-head">
+    <article className="live-task-card">
+      <div
+        className="live-task-head"
+        role="button"
+        tabIndex={0}
+        onClick={props.onOpen}
+        onKeyDown={(e) => {
+          if (e.key === "Enter" || e.key === " ") {
+            e.preventDefault();
+            props.onOpen();
+          }
+        }}
+      >
         <span className={statusDot(status, isRunning)} />
         <span className="live-task-title">{title}</span>
         {execId && (
@@ -208,13 +230,34 @@ function InlineTaskCard(props: {
         </span>
       </div>
 
-      <div className="live-task-body">
-        <span className={status === "failed" ? "live-task-line is-error" : "live-task-line"}>
-          {liveLine}
-        </span>
-      </div>
+      {conclusion ? (
+        <div className="task-conclusion-box">
+          <div
+            ref={conclusionRef}
+            className={expanded ? "task-conclusion-content is-expanded" : "task-conclusion-content"}
+          >
+            <Markdown content={conclusion} />
+          </div>
+          {!expanded && overflows && <div className="task-conclusion-fade" aria-hidden="true" />}
+          {overflows && (
+            <button
+              type="button"
+              className="task-conclusion-toggle"
+              onClick={() => setExpanded((v) => !v)}
+            >
+              {expanded ? "收起结论 ⌃" : "展开完整结论 ⌄"}
+            </button>
+          )}
+        </div>
+      ) : (
+        <div className="live-task-body">
+          <span className={status === "failed" ? "live-task-line is-error" : "live-task-line"}>
+            {liveLine}
+          </span>
+        </div>
+      )}
 
-      <div className="live-task-foot" onClick={(e) => e.stopPropagation()}>
+      <div className="live-task-foot">
         {decision && decision.action && task?.waitingReason === "needs_human_decision" ? (
           <>
             <button type="button" className="btn btn-primary btn-sm" onClick={() => props.onResolve(decision.action!, true)}>
@@ -244,9 +287,14 @@ function InlineTaskCard(props: {
                 停止任务
               </button>
             )}
+            {status === "completed" && (
+              <span className="muted small">
+                {repoLabel ? `${repoLabel} · 已通过独立验收` : "已完成交付"}
+              </span>
+            )}
           </>
         )}
-        <button type="button" className="btn-link" style={{ marginLeft: "auto" }} onClick={props.onSelect}>
+        <button type="button" className="btn-link" style={{ marginLeft: "auto" }} onClick={props.onOpen}>
           查看详情 →
         </button>
       </div>
@@ -265,8 +313,8 @@ function buildLiveLine(
     return `等待批准：${decision.action ?? decision.title} — ${decision.summary}`;
   }
   if (task.status === "failed") {
-    const raw = blocked?.summary || live?.summary || "执行未通过，点击「查看详情」排查原因";
-    return raw.length > 120 ? `${raw.slice(0, 119)}…` : raw;
+    const raw = blocked?.summary || task.failureReason || live?.summary || "执行未通过，点击「查看详情」排查原因";
+    return raw.length > 140 ? `${raw.slice(0, 139)}…` : raw;
   }
   if (task.status === "completed") {
     const repos = task.repoNames && task.repoNames.length > 0 ? ` · ${task.repoNames.join("、")}` : "";

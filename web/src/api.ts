@@ -89,6 +89,8 @@ export interface TaskSummary {
   status: string;
   waitingReason: string | null;
   inputDigest: string;
+  resultSummary?: string | null;
+  failureReason?: string | null;
   liveSummary?: string;
   liveType?: string;
   liveAt?: number;

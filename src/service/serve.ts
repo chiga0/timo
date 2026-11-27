@@ -75,26 +75,6 @@ export async function serve(): Promise<void> {
       data: { taskId: event.taskId, runId: event.runId, type: event.type, summary: event.summary, at: event.at },
     });
   });
-  // When a background task completes with an assistant summary, post it once
-  // into Main Chat so the user sees Timo's Markdown report immediately without
-  // needing to dig into raw JSON.
-  bus.on("task_completed", (event) => {
-    const payload = event.payload as { result?: { assistantText?: string } } | null;
-    const summary = typeof payload?.result?.assistantText === "string" ? payload.result.assistantText.trim() : "";
-    if (!summary) return;
-    const summaryMsgId = `task-result:${event.taskId}`;
-    if (chatStore.get(summaryMsgId)) return;
-    const task = service.row(event.taskId);
-    const posted = chatStore.append({
-      messageId: summaryMsgId,
-      role: "assistant",
-      content: summary,
-      taskId: event.taskId,
-      executorId: task?.executorId ?? null,
-      status: "done",
-    });
-    chatBus.publish({ event: "chat_message", data: posted });
-  });
   const executors = new ExecutorRegistry();
   // Register the 4 resident native CLI agents: pi, qwen-code, codex, opencode (+ optional t3).
   executors.register(new PiAdapter());
