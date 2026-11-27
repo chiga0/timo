@@ -8,7 +8,7 @@ import { parseSlashSkillInvocation, type SkillRegistry } from "../skills/registr
 import type { ChatMessage, ChatStore, ChatStreamBus } from "../store/chat.js";
 import type { TaskService } from "./task-service.js";
 import type { VerificationPlan } from "../verify/pipeline.js";
-import { inspectLocalFolder, selectFoldersForRequest } from "../workspace/inspect.js";
+import { inspectLocalFolder, resolveValidBaseRef, selectFoldersForRequest } from "../workspace/inspect.js";
 import { newId, toIso } from "../util.js";
 
 export interface SendChatInput {
@@ -92,25 +92,23 @@ export class MainChatRunner {
     }
 
     const explicitSource = input.sourcePath?.trim() ?? "";
-    const matchedFolders = explicitSource ? [] : selectFoldersForRequest(text, settings?.folders ?? []);
-    const wantsRepoDelivery = explicitSource !== "" || (matchedFolders.length > 0 && hasDeliveryActionIntent(text));
+    const isTimoMgmt = explicitSource === "" && isTimoManagementIntent(text);
+    const matchedFolders = explicitSource || isTimoMgmt ? [] : selectFoldersForRequest(text, settings?.folders ?? []);
+    const wantsRepoDelivery = explicitSource !== "" || (!isTimoMgmt && matchedFolders.length > 0 && hasDeliveryActionIntent(text));
     if (wantsRepoDelivery) {
       const repos = explicitSource
         ? [
             {
               sourcePath: explicitSource,
-              baseRef: input.baseRef?.trim() || inspectLocalFolder(explicitSource).baseRef || "main",
+              baseRef: input.baseRef?.trim() || resolveValidBaseRef(explicitSource),
               name: explicitSource.replace(/\/+$/, "").split("/").at(-1) || "repo",
             },
           ]
-        : matchedFolders.map((f) => {
-            const inspected = inspectLocalFolder(f.path);
-            return {
-              sourcePath: f.path,
-              baseRef: f.baseRef || inspected.baseRef || "main",
-              name: f.name,
-            };
-          });
+        : matchedFolders.map((f) => ({
+            sourcePath: f.path,
+            baseRef: resolveValidBaseRef(f.path, f.baseRef),
+            name: f.name,
+          }));
 
       const checkCmd = input.checkCommand?.trim() ?? "";
       let verificationPlan: VerificationPlan;
@@ -315,9 +313,17 @@ export class MainChatRunner {
     const invokedSkillBody =
       slashMatch && this.deps.skillRegistry ? this.deps.skillRegistry.readFull(slashMatch.skill.id, settings)?.body : undefined;
 
+    const managedSkillsDir = this.deps.skillRegistry?.managedDir;
+    const externalSkillSources = this.deps.skillRegistry?.discoverExternalSources() ?? [];
+
     const sections: string[] = [
       "你是 Timo（提莫），用户的本地个人研发总助理（Chief of Staff）。",
-      "当前处于「主对话」会话中：请用简洁、清晰的中文 Markdown 直接回答用户问题；严禁在主对话中直接修改本地代码文件、严禁创建 commit、严禁运行耗时的全量测试或破坏性命令。",
+      "当前处于「主对话」会话中：请用简洁、清晰的中文 Markdown 直接回答用户问题；严禁在主对话中直接修改任何业务代码仓库文件、严禁创建 commit、严禁运行耗时的全量测试或破坏性命令。",
+      ...(managedSkillsDir
+        ? [
+            `唯一的管理写操作例外：当用户明确要求导入、新建或更新 Timo 统一 Skill 时，优先调用 MCP 工具 \`timo_discover_external_skills\` / \`timo_import_skills\` / \`timo_save_skill\`；若当前执行器（例如 Pi）未原生挂载 MCP，你可以直接只读查看下方本机外部 Agent Skill 目录，并将对应 \`SKILL.md\` 脱敏复制或写入到 Timo 托管目录 \`${managedSkillsDir}/<skill-id>/SKILL.md\`，完成后向用户清晰汇报已导入清单与未找到项。`,
+          ]
+        : []),
       ...(readOnlyCwd
         ? [`本次对话的工作目录已定位到 \`${readOnlyCwd}\`，你可以直接只读查看其中的 git log、文档或代码文件来精准回答用户问题，但不要修改任何文件。`]
         : ["当用户明确要求开发、修复或修改某个工作区仓库代码时，可通过 `timo_delegate_task` 或系统自动路由创建后台独立 Worktree 交付任务；否则你只需直接给出高质量回答或建议。"]),
@@ -331,13 +337,22 @@ export class MainChatRunner {
             "## Timo 控制面工具（Chief-of-Staff MCP，已挂载）",
             `你已连接到 Timo 本地控制面 MCP（可用工具：${toolNames.map((n) => `\`${n}\``).join("、")}）：`,
             "- 查询任意任务详情/验收日志/实时进展 → 调用 `timo_get_task_detail` / `timo_list_tasks` / `timo_list_inbox`；",
-            "- 查看或读取 Timo 统一 Skill → 调用 `timo_list_skills` / `timo_read_skill`；",
+            "- 发现、查看、导入或保存 Timo 统一 Skill → 调用 `timo_discover_external_skills` / `timo_import_skills` / `timo_list_skills` / `timo_read_skill` / `timo_save_skill`；",
             "- 用户明确要求派发代码改动任务 → 调用 `timo_delegate_task`（自动建隔离 worktree 并在主对话插入单张任务卡）；",
             "- 用户要求修改进行中任务的目标 → 调用 `timo_propose_task_change`（生成两阶段 Diff 确认卡，由人拍板生效）；",
             "- 用户要求重试失败任务或切换执行器交接 → 调用 `timo_retry_or_handoff_task`。",
           ].join("\n"),
         );
       }
+    }
+
+    if (externalSkillSources.length > 0 && managedSkillsDir) {
+      sections.push(
+        [
+          `## 本机探测到的外部 Agent Skill 目录（可导入至 \`${managedSkillsDir}\`）`,
+          ...externalSkillSources.map((src) => `- ${src.label}: \`${src.path}\`（共 ${src.skillCount} 个 Skill）`),
+        ].join("\n"),
+      );
     }
 
     if (settings) {
@@ -412,6 +427,21 @@ export class MainChatRunner {
     sections.push(`## 用户最新消息\n${effectiveUserText}`);
     return sections.join("\n\n");
   }
+}
+
+/**
+ * Detects Timo control-plane / Skill management requests (e.g. "你能帮我导入这些 skill 吗？")
+ * which MUST be handled directly in Main Chat rather than creating a Git repo worktree task.
+ */
+export function isTimoManagementIntent(text: string): boolean {
+  const lowered = text.toLowerCase();
+  const mentionsSkill = /\bskills?\b|技能/.test(lowered);
+  const skillMgmtAction = /(导入|安装|同步|启用|停用|禁用|列出|查看|有哪些|管理|迁移|拷贝|复制|import|install|sync|enable|disable|list)/i.test(
+    lowered,
+  );
+  if (mentionsSkill && skillMgmtAction) return true;
+  if (/(帮我导入|能否导入|可以导入|导入.*skill|导入.*技能)/i.test(lowered)) return true;
+  return false;
 }
 
 /**

@@ -224,6 +224,73 @@ export class SkillRegistry {
     }
     return { imported, skipped };
   }
+
+  /**
+   * Searches across all discovered local agent skill directories (plus optional
+   * extra dirs) and imports skills matching `skillIds` into `<TIMO_HOME>/skills/`.
+   */
+  importByNames(
+    skillIds: string[],
+    options: { overwrite?: boolean; extraDirs?: string[] } = {},
+  ): { imported: string[]; skipped: string[]; notFound: string[]; matchedFrom: Record<string, string> } {
+    const sources = this.discoverExternalSources();
+    const extraDirs = (options.extraDirs ?? []).map((d) => d.trim()).filter((d) => d && existsSync(d));
+    const catalog = new Map<string, { id: string; name: string; filePath: string; sourceDir: string }>();
+
+    for (const src of sources) {
+      for (const item of src.skills) {
+        const keyId = item.id.toLowerCase();
+        const keyName = item.name.toLowerCase();
+        if (!catalog.has(keyId)) catalog.set(keyId, { ...item, sourceDir: src.path });
+        if (!catalog.has(keyName)) catalog.set(keyName, { ...item, sourceDir: src.path });
+      }
+    }
+    for (const dir of extraDirs) {
+      for (const item of scanSkillDir(dir, "external", dir)) {
+        const keyId = item.id.toLowerCase();
+        const keyName = item.name.toLowerCase();
+        if (!catalog.has(keyId)) catalog.set(keyId, { id: item.id, name: item.name, filePath: item.filePath, sourceDir: dir });
+        if (!catalog.has(keyName)) catalog.set(keyName, { id: item.id, name: item.name, filePath: item.filePath, sourceDir: dir });
+      }
+    }
+
+    const imported: string[] = [];
+    const skipped: string[] = [];
+    const notFound: string[] = [];
+    const matchedFrom: Record<string, string> = {};
+    const seenRequested = new Set<string>();
+
+    for (const rawName of skillIds) {
+      const needle = rawName.trim().toLowerCase();
+      if (!needle || seenRequested.has(needle)) continue;
+      seenRequested.add(needle);
+      const hit = catalog.get(needle) ?? catalog.get(slugifySkillId(needle));
+      if (!hit) {
+        notFound.push(rawName.trim());
+        continue;
+      }
+      const targetFile = join(resolve(this.managedDir, hit.id), "SKILL.md");
+      if (existsSync(targetFile) && !options.overwrite) {
+        skipped.push(hit.id);
+        matchedFrom[hit.id] = hit.sourceDir;
+        continue;
+      }
+      const raw = readFileSync(hit.filePath, "utf8").slice(0, MAX_SKILL_BYTES);
+      const parsed = parseSkillMarkdown(raw, hit.id);
+      const safeBody = redactLogText(parsed.body).text;
+      this.saveManaged({
+        id: hit.id,
+        name: parsed.name || hit.name,
+        description: parsed.description || hit.name,
+        content: safeBody || parsed.description || hit.name,
+        scope: parsed.scope || "global",
+      });
+      imported.push(hit.id);
+      matchedFrom[hit.id] = hit.sourceDir;
+    }
+
+    return { imported, skipped, notFound, matchedFrom };
+  }
 }
 
 /** Filters enabled skills applicable to the target surface (`chat` or `task`) and optional repo names. */
@@ -306,12 +373,20 @@ function scanSkillDir(dir: string, source: "managed" | "external", sourceLabel: 
     let skillFile: string | null = null;
     let fallbackId = entry.name;
 
-    if (entry.isDirectory()) {
+    // Follow symlinks cleanly: many agent runtimes symlink skill folders into ~/.qwen/skills etc.
+    let entryStat;
+    try {
+      entryStat = statSync(full);
+    } catch {
+      continue;
+    }
+
+    if (entryStat.isDirectory()) {
       const candidate = join(full, "SKILL.md");
       if (existsSync(candidate)) {
         skillFile = candidate;
       }
-    } else if (entry.isFile() && entry.name.toLowerCase().endsWith(".md") && entry.name.toLowerCase() !== "readme.md") {
+    } else if (entryStat.isFile() && entry.name.toLowerCase().endsWith(".md") && entry.name.toLowerCase() !== "readme.md") {
       skillFile = full;
       fallbackId = entry.name.replace(/\.md$/i, "");
     }

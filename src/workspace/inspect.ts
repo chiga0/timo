@@ -104,6 +104,38 @@ function detectGitBranch(dir: string): string | undefined {
   return undefined;
 }
 
+function gitRefExists(dir: string, ref: string): boolean {
+  const clean = ref.trim();
+  if (!clean) return false;
+  try {
+    execFileSync("git", ["-C", dir, "rev-parse", "--verify", "--quiet", `${clean}^{commit}`], {
+      encoding: "utf8",
+      timeout: 2_000,
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Resolves a valid baseRef for a registered local Git folder: prefers `preferredRef`
+ * when it exists in the repository, otherwise falls back to the repository's live
+ * checked-out branch so stale saved defaults (e.g. `main` on a `master` repo) never
+ * fail worktree creation.
+ */
+export function resolveValidBaseRef(dir: string, preferredRef?: string): string {
+  const preferred = preferredRef?.trim();
+  if (preferred && gitRefExists(dir, preferred)) return preferred;
+  const live = detectGitBranch(dir);
+  if (live && gitRefExists(dir, live)) return live;
+  for (const fallback of ["main", "master", "HEAD"]) {
+    if (gitRefExists(dir, fallback)) return fallback;
+  }
+  return preferred || live || "main";
+}
+
 function detectGitRemote(dir: string): string | undefined {
   try {
     const out = execFileSync("git", ["-C", dir, "remote", "get-url", "origin"], {
@@ -276,9 +308,9 @@ export function scanWorkspaceRoot(rootPath: string, maxDepth = 2, limit = 40): I
 
 /**
  * Automatically selects which Git folders from the workspace are explicitly
- * targeted by a user's natural-language request. Returns `[]` when no repo is
- * referenced (e.g. greetings, general Q&A, or workspace-wide read-only queries)
- * so Timo never blindly mounts unrelated repos or runs unrelated test suites.
+ * targeted by a user's natural-language request. Matches on identifier
+ * boundaries so hyphenated skill/tool names like `data-agent-skill` never
+ * falsely trigger the `data-agent` repository.
  */
 export function selectFoldersForRequest<T extends { name: string; path: string; kind?: "git" | "docs"; remoteRepo?: string }>(
   requestText: string,
@@ -289,6 +321,20 @@ export function selectFoldersForRequest<T extends { name: string; path: string; 
   const lower = requestText.toLowerCase();
   return gitFolders.filter((f) => {
     const tokens = [f.name, f.remoteRepo ?? ""].map((s) => s.trim().toLowerCase()).filter((s) => s.length >= 2);
-    return tokens.some((token) => lower.includes(token));
+    return tokens.some((token) => containsIdentifierToken(lower, token));
   });
+}
+
+function containsIdentifierToken(haystack: string, token: string): boolean {
+  const isIdentChar = (ch: string | undefined) => Boolean(ch && /[a-z0-9_-]/.test(ch));
+  let from = 0;
+  while (from <= haystack.length - token.length) {
+    const idx = haystack.indexOf(token, from);
+    if (idx === -1) return false;
+    const before = idx > 0 ? haystack[idx - 1] : undefined;
+    const after = idx + token.length < haystack.length ? haystack[idx + token.length] : undefined;
+    if (!isIdentChar(before) && !isIdentChar(after)) return true;
+    from = idx + 1;
+  }
+  return false;
 }

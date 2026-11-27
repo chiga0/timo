@@ -15,7 +15,7 @@ import type { VerificationPlan } from "../verify/pipeline.js";
 import type { SettingsStore } from "../settings.js";
 import { EnterpriseGitPlatformAdapter } from "../platform/adapter.js";
 import { discoverExecutorProviders, type ExecutorProviderCatalog } from "../adapters/providers.js";
-import { inspectLocalFolder, pickNativeFolder, probeLocalPlatformAuth, scanWorkspaceRoot, selectFoldersForRequest } from "../workspace/inspect.js";
+import { inspectLocalFolder, pickNativeFolder, probeLocalPlatformAuth, resolveValidBaseRef, scanWorkspaceRoot, selectFoldersForRequest } from "../workspace/inspect.js";
 import type { ChatStore, ChatStreamBus, ChatStreamFrame } from "../store/chat.js";
 import type { MainChatRunner } from "../service/chat-runner.js";
 import type { SkillRegistry } from "../skills/registry.js";
@@ -512,14 +512,11 @@ export function registerApi(router: Router, deps: ApiDeps): void {
       if (repos.length === 0) {
         const matched = selectFoldersForRequest(requestText, userSettings?.folders ?? []);
         if (matched.length > 0) {
-          repos = matched.map((f) => {
-            const inspected = inspectLocalFolder(f.path);
-            return {
-              sourcePath: f.path,
-              baseRef: f.baseRef || inspected.baseRef || "main",
-              name: f.name,
-            };
-          });
+          repos = matched.map((f) => ({
+            sourcePath: f.path,
+            baseRef: resolveValidBaseRef(f.path, f.baseRef),
+            name: f.name,
+          }));
           if (!verificationPlan) {
             const steps = matched
               .map((f) => ({ repo: f.name, cmd: f.checkCommand || inspectLocalFolder(f.path).detectedCheckCommand }))

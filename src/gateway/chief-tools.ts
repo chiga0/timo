@@ -5,7 +5,7 @@ import type { ChatStore, ChatStreamBus } from "../store/chat.js";
 import type { RunStreamStore } from "../workspace/run-stream.js";
 import type { SkillRegistry } from "../skills/registry.js";
 import type { VerificationPlan } from "../verify/pipeline.js";
-import { inspectLocalFolder } from "../workspace/inspect.js";
+import { inspectLocalFolder, resolveValidBaseRef } from "../workspace/inspect.js";
 import { newId } from "../util.js";
 
 export interface ChiefToolsDeps {
@@ -156,6 +156,94 @@ export function registerChiefTools(gateway: CapabilityMcpGateway, deps: ChiefToo
   });
 
   gateway.registerChiefTool({
+    name: "timo_discover_external_skills",
+    description: "Discover skills installed in local agent runtimes (~/.qwen/skills, ~/.codex/skills, ~/.claude/skills, ~/.agents/skills, ~/.pi/agent/skills) that can be imported into Timo.",
+    inputSchema: { type: "object", properties: {} },
+    handler: async () => {
+      if (!deps.skillRegistry) return { data: { sources: [] } };
+      const sources = deps.skillRegistry.discoverExternalSources();
+      return { data: { managedDir: deps.skillRegistry.managedDir, sources } };
+    },
+  });
+
+  gateway.registerChiefTool({
+    name: "timo_import_skills",
+    description: "Import skills into Timo's unified managed directory (~/.timo/skills) with secret redaction. Pass either `sourceDir` (and optional `skillIds`) OR just `skillIds` to auto-locate and import matching skills across all local agent skill directories.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        sourceDir: { type: "string", description: "Optional source skill directory path (omit to search all discovered local agent skill dirs)" },
+        skillIds: {
+          type: "array",
+          items: { type: "string" },
+          description: "Specific skill ids/names to import (omit with sourceDir to import all skills from sourceDir)",
+        },
+        overwrite: { type: "boolean", description: "Overwrite existing managed skill with same id (default false)" },
+      },
+    },
+    handler: async (args) => {
+      if (!deps.skillRegistry) return { isError: true, data: { code: "UNSUPPORTED", message: "skill registry not configured" } };
+      const sourceDir = typeof args.sourceDir === "string" ? args.sourceDir.trim() : "";
+      const skillIds = Array.isArray(args.skillIds)
+        ? args.skillIds.filter((s): s is string => typeof s === "string" && s.trim() !== "").map((s) => s.trim())
+        : [];
+      const overwrite = args.overwrite === true;
+      const settings = deps.settingsStore?.load();
+      if (sourceDir) {
+        const outcome = deps.skillRegistry.importFromDir(sourceDir, {
+          skillIds: skillIds.length > 0 ? skillIds : undefined,
+          overwrite,
+        });
+        return { data: { ...outcome, totalManaged: deps.skillRegistry.list(settings).length } };
+      }
+      if (skillIds.length === 0) {
+        return {
+          isError: true,
+          data: { code: "INVALID_INPUT", message: "provide either sourceDir or a non-empty skillIds array" },
+        };
+      }
+      const outcome = deps.skillRegistry.importByNames(skillIds, {
+        overwrite,
+        extraDirs: settings?.skillDirs,
+      });
+      return { data: { ...outcome, totalManaged: deps.skillRegistry.list(settings).length } };
+    },
+  });
+
+  gateway.registerChiefTool({
+    name: "timo_save_skill",
+    description: "Create or update a Timo-managed skill in ~/.timo/skills/<id>/SKILL.md so it works across all executors.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "string", description: "Optional slug id" },
+        name: { type: "string", description: "Skill name" },
+        description: { type: "string", description: "One-line purpose summary" },
+        content: { type: "string", description: "Full Markdown body instructions" },
+        scope: { type: "string", description: "global | chat | task | repo:<name>" },
+      },
+      required: ["name", "description", "content"],
+    },
+    handler: async (args) => {
+      if (!deps.skillRegistry) return { isError: true, data: { code: "UNSUPPORTED", message: "skill registry not configured" } };
+      const name = typeof args.name === "string" ? args.name.trim() : "";
+      const description = typeof args.description === "string" ? args.description.trim() : "";
+      const content = typeof args.content === "string" ? args.content.trim() : "";
+      if (!name || !description || !content) {
+        return { isError: true, data: { code: "INVALID_INPUT", message: "name, description, and content are required" } };
+      }
+      const saved = deps.skillRegistry.saveManaged({
+        id: typeof args.id === "string" ? args.id.trim() : undefined,
+        name,
+        description,
+        content,
+        scope: typeof args.scope === "string" ? args.scope.trim() : undefined,
+      });
+      return { data: { skill: saved } };
+    },
+  });
+
+  gateway.registerChiefTool({
     name: "timo_delegate_task",
     description: "Create a background isolated-worktree engineering delivery task for one or more registered workspace Git repositories and post a single live Task Card into Main Chat.",
     inputSchema: {
@@ -200,8 +288,7 @@ export function registerChiefTools(gateway: CapabilityMcpGateway, deps: ChiefToo
       }
       const repos = matched.map((m) => {
         const f = m.folder!;
-        const inspected = inspectLocalFolder(f.path);
-        return { sourcePath: f.path, baseRef: f.baseRef || inspected.baseRef || "main", name: f.name };
+        return { sourcePath: f.path, baseRef: resolveValidBaseRef(f.path, f.baseRef), name: f.name };
       });
       const checkCmd = typeof args.checkCommand === "string" ? args.checkCommand.trim() : "";
       const verificationPlan: VerificationPlan = checkCmd

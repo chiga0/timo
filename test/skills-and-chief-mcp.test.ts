@@ -1,7 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Client as McpClient } from "@modelcontextprotocol/sdk/client/index.js";
@@ -11,7 +11,8 @@ import { TaskService } from "../src/service/task-service.js";
 import { SettingsStore } from "../src/settings.js";
 import { SkillRegistry, parseSlashSkillInvocation, selectActiveSkills } from "../src/skills/registry.js";
 import { ChatStore, ChatStreamBus } from "../src/store/chat.js";
-import { MainChatRunner } from "../src/service/chat-runner.js";
+import { MainChatRunner, isTimoManagementIntent } from "../src/service/chat-runner.js";
+import { resolveValidBaseRef, selectFoldersForRequest } from "../src/workspace/inspect.js";
 import { CapabilityMcpGateway } from "../src/gateway/mcp-gateway.js";
 import { registerChiefTools } from "../src/gateway/chief-tools.js";
 import { ExecutorRegistry, type ExecutionAdapter, type RunStreamEvent, type SpawnRequest, type SpawnResult } from "../src/adapters/execution.js";
@@ -297,6 +298,92 @@ describe("Timo Unified Skills, Main Chat Context Engine & Chief-of-Staff MCP", (
         const rec = (skillsAfter.body as { skills: Array<{ id: string; enabled: boolean; scope: string }> }).skills[0]!;
         assert.equal(rec.enabled, false);
         assert.equal(rec.scope, "chat");
+      } finally {
+        await gateway.close();
+        service.close();
+      }
+    });
+  });
+
+  it("never routes skill import requests (with hyphenated skill names like data-agent-skill) to repo_delivery, follows skill symlinks, and resolves valid git baseRef", async () => {
+    await withTempDir(async (dir) => {
+      // 1. Repo initialized on `master` (no `main` ref!)
+      const repoDir = join(dir, "data-agent");
+      mkdirSync(repoDir, { recursive: true });
+      writeFileSync(join(repoDir, "README.md"), "# data-agent\n", "utf8");
+      execFileSync("git", ["init", "-b", "master"], { cwd: repoDir });
+      execFileSync("git", ["config", "user.email", "test@example.com"], { cwd: repoDir });
+      execFileSync("git", ["config", "user.name", "Test"], { cwd: repoDir });
+      execFileSync("git", ["add", "README.md"], { cwd: repoDir });
+      execFileSync("git", ["commit", "-m", "init"], { cwd: repoDir });
+
+      assert.equal(resolveValidBaseRef(repoDir, "main"), "master");
+
+      const folders = [{ id: "data-agent", name: "data-agent", path: repoDir, kind: "git" as const, baseRef: "main" }];
+      // Hyphenated skill names MUST NOT false-match repo `data-agent`
+      const skillImportPrompt =
+        "你能帮我导入吗？\nDataAgent (2) data-agent-skill, data-agent-case-eval\ncloudspec-operation-edit\n可以结合 aliyun-runbook 中规定 skill";
+      assert.deepEqual(selectFoldersForRequest(skillImportPrompt, folders), []);
+      assert.equal(isTimoManagementIntent(skillImportPrompt), true);
+      // Actual repo reference still matches cleanly
+      assert.deepEqual(
+        selectFoldersForRequest("请帮我修复 data-agent 里的超时问题", folders).map((f) => f.name),
+        ["data-agent"],
+      );
+
+      // 2. Symlinked external skill folder discovery + importByNames
+      const home = join(dir, "timo-home");
+      const fakeUserHome = join(dir, "user-home");
+      const realSkillDir = join(dir, "store", "data-agent-skill");
+      mkdirSync(realSkillDir, { recursive: true });
+      writeFileSync(
+        join(realSkillDir, "SKILL.md"),
+        "---\nname: data-agent-skill\ndescription: DataAgent 常用排障流程\n---\n按步骤检查配置。",
+        "utf8",
+      );
+      const qwenSkillsDir = join(fakeUserHome, ".qwen", "skills");
+      mkdirSync(qwenSkillsDir, { recursive: true });
+      symlinkSync(realSkillDir, join(qwenSkillsDir, "data-agent-skill"));
+
+      const registry = new SkillRegistry(home, { HOME: fakeUserHome });
+      const sources = registry.discoverExternalSources();
+      assert.equal(sources.length, 1);
+      assert.equal(sources[0]?.skills[0]?.id, "data-agent-skill");
+
+      const res = registry.importByNames(["data-agent-skill", "dataagent-user-trace"]);
+      assert.deepEqual(res.imported, ["data-agent-skill"]);
+      assert.deepEqual(res.notFound, ["dataagent-user-trace"]);
+
+      // 3. Chief MCP `timo_import_skills` works by skillIds without needing sourceDir
+      const config = defaultConfig({}, home);
+      const { service, db } = TaskService.open(config);
+      const settingsStore = new SettingsStore(home, {});
+      settingsStore.save({ ...settingsStore.load(), folders });
+      const gateway = new CapabilityMcpGateway({ service, port: 0 });
+      registerChiefTools(gateway, {
+        service,
+        settingsStore,
+        skillRegistry: registry,
+        chatStore: new ChatStore(db),
+        chatBus: new ChatStreamBus(),
+      });
+      await gateway.start();
+      try {
+        const chief = gateway.issueChiefToken();
+        const client = new McpClient({ name: "import-test", version: "1.0.0" });
+        await client.connect(new StreamableHTTPClientTransport(new URL(chief.url)));
+        const impRes = await client.callTool({
+          name: "timo_import_skills",
+          arguments: { skillIds: ["data-agent-skill", "missing-skill"], overwrite: true },
+        });
+        const impJson = JSON.parse((impRes.content as Array<{ text: string }>)[0]!.text) as {
+          imported: string[];
+          notFound: string[];
+        };
+        assert.deepEqual(impJson.imported, ["data-agent-skill"]);
+        assert.deepEqual(impJson.notFound, ["missing-skill"]);
+        await client.close();
+        gateway.revokeChief(chief.nonce);
       } finally {
         await gateway.close();
         service.close();
