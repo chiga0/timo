@@ -8,6 +8,7 @@ import type {
   WorkspaceFolderConfig,
 } from "../api.js";
 import { AgentLogo, agentLabel } from "./AgentIcons.js";
+import { useImeGuard } from "./ime.js";
 
 export type ComposerSubmission =
   | { kind: "sse_log"; text: string }
@@ -58,6 +59,7 @@ export function Composer(props: {
   const [baseRef, setBaseRef] = useState("main");
   const [checkCommand, setCheckCommand] = useState("");
   const menuRef = useRef<HTMLDivElement | null>(null);
+  const ime = useImeGuard();
 
   const executorId = props.selectedExecutorId;
   const modelOverride = props.selectedModel;
@@ -190,8 +192,9 @@ export function Composer(props: {
                   : "粘贴 SSE 日志或描述需要诊断的问题…"
               }
               onChange={(event) => setText(event.target.value)}
+              {...ime.compositionProps}
               onKeyDown={(event) => {
-                if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
+                if (event.key === "Enter" && !event.shiftKey && !ime.isImeEvent(event)) {
                   event.preventDefault();
                   submit();
                 }

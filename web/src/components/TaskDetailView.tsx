@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import type { ExecutorDescriptor, InboxItem, Proposal, RunStreamEvent, TaskDetail, TaskEvent } from "../api.js";
 import { AgentLogo, agentLabel } from "./AgentIcons.js";
 import { TaskTimeline, type LocalSteerItem } from "./TaskTimeline.js";
+import { useImeGuard } from "./ime.js";
 
 const STATUS_LABEL: Record<string, string> = {
   accepted: "已接单",
@@ -62,6 +63,7 @@ export function TaskDetailView(props: {
   const [showRawLog, setShowRawLog] = useState(false);
   const [railReqExpanded, setRailReqExpanded] = useState(false);
   const logRef = useRef<HTMLDivElement | null>(null);
+  const ime = useImeGuard();
 
   const detail = props.detail;
   const decision = props.inbox.find((item) => item.taskId === detail?.taskId && item.decisionKey === "decision_required");
@@ -155,8 +157,9 @@ export function TaskDetailView(props: {
                 autoFocus
                 placeholder="输入任务标题（留空恢复默认）"
                 onChange={(event) => setTitleDraft(event.target.value)}
+                {...ime.compositionProps}
                 onKeyDown={(event) => {
-                  if (event.key === "Enter" && !event.nativeEvent.isComposing) {
+                  if (event.key === "Enter" && !ime.isImeEvent(event)) {
                     event.preventDefault();
                     setEditingTitle(false);
                     props.onRenameTask(detail.taskId, titleDraft.trim());
@@ -493,8 +496,9 @@ export function TaskDetailView(props: {
                         placeholder="向当前运行中的任务发送纠偏指令（Enter 发送）…"
                         value={steerText}
                         onChange={(event) => setSteerText(event.target.value)}
+                        {...ime.compositionProps}
                         onKeyDown={(event) => {
-                          if (event.key === "Enter" && !event.nativeEvent.isComposing && steerText.trim() !== "") {
+                          if (event.key === "Enter" && !ime.isImeEvent(event) && steerText.trim() !== "") {
                             event.preventDefault();
                             submitSteer();
                           }

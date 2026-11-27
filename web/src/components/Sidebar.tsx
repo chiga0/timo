@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import type { InboxItem, TaskSummary } from "../api.js";
+import { useImeGuard } from "./ime.js";
 
 const STATUS_LABEL: Record<string, string> = {
   accepted: "已接单",
@@ -44,6 +45,7 @@ export function Sidebar(props: {
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
   const menuRef = useRef<HTMLDivElement | null>(null);
   const renameInputRef = useRef<HTMLInputElement | null>(null);
+  const ime = useImeGuard();
 
   // Filter out legacy conversational tasks (`assistant_chat`) from the engineering
   // task list so casual greetings never clutter background delivery tasks.
@@ -202,8 +204,9 @@ export function Sidebar(props: {
                         placeholder="输入任务标题（留空恢复默认）"
                         maxLength={120}
                         onChange={(event) => setRenameDraft(event.target.value)}
+                        {...ime.compositionProps}
                         onKeyDown={(event) => {
-                          if (event.key === "Enter" && !event.nativeEvent.isComposing) {
+                          if (event.key === "Enter" && !ime.isImeEvent(event)) {
                             event.preventDefault();
                             commitRename(task.taskId);
                           } else if (event.key === "Escape") {
