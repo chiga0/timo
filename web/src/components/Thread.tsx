@@ -84,7 +84,7 @@ export function Thread(props: {
             </div>
           </div>
         ) : (
-          props.messages.map((msg) => {
+          props.messages.map((msg, msgIdx) => {
             if (msg.role === "user") {
               return (
                 <div key={msg.messageId} className="msg-user-wrap">
@@ -113,6 +113,10 @@ export function Thread(props: {
               );
             }
 
+            // Never render a zombie blinking caret on an older message superseded by a newer user turn.
+            const hasNewerUserTurn = props.messages.slice(msgIdx + 1).some((m) => m.role === "user");
+            const isActivelyStreaming = msg.status === "streaming" && !hasNewerUserTurn;
+
             return (
               <div key={msg.messageId} className="msg-assistant">
                 <div className="msg-assistant-head">
@@ -124,7 +128,7 @@ export function Thread(props: {
                       <span>{agentLabel(msg.executorId)}</span>
                     </span>
                   )}
-                  {msg.status === "streaming" && (
+                  {isActivelyStreaming && (
                     <button
                       type="button"
                       className="btn-link"
@@ -139,9 +143,9 @@ export function Thread(props: {
                   {msg.content ? (
                     <>
                       <Markdown content={msg.content} />
-                      {msg.status === "streaming" && <span className="stream-caret" aria-hidden="true" />}
+                      {isActivelyStreaming && <span className="stream-caret" aria-hidden="true" />}
                     </>
-                  ) : msg.status === "streaming" ? (
+                  ) : isActivelyStreaming ? (
                     <div className="thinking-line">
                       <span className="dot dot-warning dot-pulse" />
                       <span className="muted">思考中…</span>

@@ -61,6 +61,12 @@ export class MainChatRunner {
     const chosenExecutor = input.executorId?.trim() || settings?.assistant.defaultExecutor || "qwen-code";
     const chosenModel = input.model?.trim() || settings?.assistant.executorModels[chosenExecutor] || undefined;
 
+    // Settle any previous lingering streaming turn cleanly before starting a new user turn
+    // so an older message never stays stuck with a blinking cursor.
+    if (this.activeTurns.size > 0) {
+      void this.stop();
+    }
+
     const userMessage = this.deps.chatStore.append({
       role: "user",
       content: text,

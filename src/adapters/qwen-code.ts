@@ -248,6 +248,8 @@ export class QwenCodeAdapter implements ExecutionAdapter {
     let externalId: string | null = resumeSessionId;
     let stderrTail = "";
     let resultError: string | null = null;
+    let settledAfterResult = false;
+    let postResultTimer: NodeJS.Timeout | null = null;
 
     const timer =
       request.timeoutMs && request.timeoutMs > 0
@@ -288,8 +290,21 @@ export class QwenCodeAdapter implements ExecutionAdapter {
             for (const ev of parsed.events) emit(ev.type, ev.summary, ev.data);
             if (parsed.turnFinished) {
               run.pendingTurns = Math.max(0, run.pendingTurns - 1);
-              if (run.pendingTurns === 0 && child.stdin.writable && !child.stdin.writableEnded) {
-                child.stdin.end();
+              if (run.pendingTurns === 0) {
+                if (child.stdin.writable && !child.stdin.writableEnded) {
+                  child.stdin.end();
+                }
+                // HTTP MCP transports can keep qwen's event loop alive for 30-60s
+                // even after emitting the final `result` frame. Give it 1.5s to exit
+                // cleanly on its own, then terminate gracefully and mark succeeded.
+                if (postResultTimer) clearTimeout(postResultTimer);
+                postResultTimer = setTimeout(() => {
+                  if (run.pendingTurns === 0 && child.exitCode === null && child.signalCode === null) {
+                    settledAfterResult = true;
+                    this.terminate(child);
+                  }
+                }, 1_500);
+                postResultTimer.unref?.();
               }
             }
           }
@@ -306,6 +321,7 @@ export class QwenCodeAdapter implements ExecutionAdapter {
       });
     } finally {
       if (timer) clearTimeout(timer);
+      if (postResultTimer) clearTimeout(postResultTimer);
       this.active.delete(request.runId);
     }
 
@@ -314,7 +330,7 @@ export class QwenCodeAdapter implements ExecutionAdapter {
       ? "timed_out"
       : run.interrupted
         ? "interrupted"
-        : exitCode === 0 && !resultError
+        : (exitCode === 0 || settledAfterResult) && !resultError
           ? "succeeded"
           : "failed";
     if (status !== "succeeded") {

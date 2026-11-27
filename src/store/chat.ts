@@ -122,6 +122,18 @@ export class ChatStore {
     this.db.prepare("DELETE FROM chat_messages WHERE task_id = ?").run(taskId);
   }
 
+  /** Marks any leftover `streaming` messages from a previous process crash/restart as `done`. */
+  settleOrphanedStreaming(now = toIso(new Date())): number {
+    const res = this.db
+      .prepare(
+        `UPDATE chat_messages
+         SET status = 'done', updated_at = ?
+         WHERE status = 'streaming'`,
+      )
+      .run(now) as { changes?: number };
+    return Number(res.changes ?? 0);
+  }
+
   clear(): void {
     this.db.prepare("DELETE FROM chat_messages").run();
   }

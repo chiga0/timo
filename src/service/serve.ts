@@ -67,6 +67,7 @@ export async function serve(): Promise<void> {
   const workspaces = new WorkspaceManager({ home: join(home, "workspaces") });
   const runStreams = new RunStreamStore(home);
   const chatStore = new ChatStore(db);
+  chatStore.settleOrphanedStreaming();
   const chatBus = new ChatStreamBus();
   // Forward meaningful live worker progress to Main Chat so embedded Task Cards
   // update in real time with a single clean status line (never raw token spam).
