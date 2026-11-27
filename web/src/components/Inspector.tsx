@@ -1,16 +1,17 @@
 import { useEffect, useRef, useState } from "react";
-import type { InboxItem, Proposal, RunStreamEvent, TaskDetail, TaskEvent } from "../api.js";
+import type { ExecutorDescriptor, InboxItem, Proposal, RunStreamEvent, TaskDetail, TaskEvent } from "../api.js";
 
 type Tab = "overview" | "live";
 
 /**
  * Right-hand inspector: a read-only delivery overview (including multi-repo
- * delivery matrix and effect_unknown reconciliation) plus the live NDJSON run
- * stream with manual steering.
+ * delivery matrix, executor handoff, and effect_unknown reconciliation) plus
+ * the live NDJSON run stream with manual steering.
  */
 export function Inspector(props: {
   detail: TaskDetail | null;
   events: TaskEvent[];
+  executors: ExecutorDescriptor[];
   runIds: string[];
   activeRunId: string | null;
   runEvents: RunStreamEvent[];
@@ -18,7 +19,9 @@ export function Inspector(props: {
   proposals: Proposal[];
   onSelectRun: (runId: string) => void;
   onSteer: (taskId: string, message: string) => Promise<{ accepted: boolean; reason?: string }>;
+  onHandoff: (taskId: string, executorId: string) => void;
   onReconcileOperation: (operationId: string) => void;
+  onResolveOperation: (operationId: string, resolution: "confirmed_absent") => void;
   onStop: (taskId: string) => void;
   onProposeGoal: (taskId: string, goal: string) => void;
   onConfirmProposal: (proposalId: string) => void;
@@ -29,12 +32,14 @@ export function Inspector(props: {
   const [confirmStop, setConfirmStop] = useState(false);
   const [showProof, setShowProof] = useState(false);
   const [goal, setGoal] = useState("");
+  const [handoffTarget, setHandoffTarget] = useState("");
   const [steerText, setSteerText] = useState("");
   const [steerFeedback, setSteerFeedback] = useState<string | null>(null);
   const logRef = useRef<HTMLDivElement | null>(null);
   const detail = props.detail;
   const decision = props.inbox.find((item) => item.taskId === detail?.taskId && item.decisionKey === "decision_required");
   const unknownOps = (detail?.operations ?? []).filter((op) => op.status === "unknown");
+  const readyExecutors = props.executors.filter((e) => e.available);
 
   useEffect(() => {
     if (tab === "live" && logRef.current) {
@@ -170,13 +175,22 @@ export function Inspector(props: {
                   <div>key: {op.operationKey ?? op.clientRequestId}</div>
                   {op.reconciledAt && <div className="muted">上次核查: {new Date(op.reconciledAt).toLocaleTimeString()}</div>}
                 </div>
-                <button
-                  type="button"
-                  className="btn btn-outline-muted btn-sm"
-                  onClick={() => props.onReconcileOperation(op.operationId)}
-                >
-                  重新向平台核查
-                </button>
+                <div className="card-actions" style={{ marginLeft: 0, flexWrap: "wrap" }}>
+                  <button
+                    type="button"
+                    className="btn btn-outline-muted btn-sm"
+                    onClick={() => props.onReconcileOperation(op.operationId)}
+                  >
+                    重新向平台核查
+                  </button>
+                  <button
+                    type="button"
+                    className="btn btn-outline-muted btn-sm"
+                    onClick={() => props.onResolveOperation(op.operationId, "confirmed_absent")}
+                  >
+                    人工确认不存在（允许重试）
+                  </button>
+                </div>
               </div>
             </section>
           ))}
@@ -273,6 +287,40 @@ export function Inspector(props: {
                   }}
                 >
                   生成 Diff 确认卡（目标 v{detail.briefVersion + 1}）
+                </button>
+              </div>
+            </section>
+          )}
+
+          {!isTerminal && detail.kind === "repo_delivery" && readyExecutors.length > 0 && (
+            <section className="card">
+              <header className="card-head">
+                <span>不可变快照交接（换执行器）</span>
+                <span className="mono muted small">{detail.executorId ?? "—"}</span>
+              </header>
+              <div className="card-body stack small">
+                <select
+                  aria-label="目标执行器"
+                  className="card-box mono small"
+                  style={{ border: "1px solid var(--border)" }}
+                  value={handoffTarget || readyExecutors.find((e) => e.id !== detail.executorId)?.id || readyExecutors[0]!.id}
+                  onChange={(event) => setHandoffTarget(event.target.value)}
+                >
+                  {readyExecutors.map((exec) => (
+                    <option key={exec.id} value={exec.id}>
+                      {exec.id}
+                    </option>
+                  ))}
+                </select>
+                <button
+                  type="button"
+                  className="btn btn-outline-muted btn-sm"
+                  onClick={() => {
+                    const target = handoffTarget || readyExecutors.find((e) => e.id !== detail.executorId)?.id || readyExecutors[0]!.id;
+                    props.onHandoff(detail.taskId, target);
+                  }}
+                >
+                  作废旧代次并交接快照（g1 → g2）
                 </button>
               </div>
             </section>

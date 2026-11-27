@@ -30,6 +30,13 @@ export interface ApiDeps {
   steer?: (taskId: string, message: string) => Promise<{ accepted: boolean; runId: string | null; reason?: string }>;
   /** Operation reconciliation hook (Step 4.2). */
   reconcileOperation?: (operationId: string) => Promise<unknown>;
+  /** Operator resolution for effect_unknown (Step 5.2). */
+  resolveOperation?: (
+    operationId: string,
+    input: { resolution: "confirmed_exists" | "confirmed_absent"; mrId?: string; url?: string; headSha?: string; reason?: string },
+  ) => unknown;
+  /** Immutable g1 -> g2 executor handoff hook (Step 5.1). */
+  handoff?: (taskId: string, input: { executorId: string; model?: string; reason?: string }) => Promise<unknown>;
 }
 
 const SSE_HEADERS = {
@@ -275,7 +282,7 @@ export function registerApi(router: Router, deps: ApiDeps): void {
     return { body: { taskId, ...result } };
   });
 
-  // ---- Step 4.2: Operation reconciliation for effect_unknown ----
+  // ---- Step 4.2 / 5.2: Operation reconciliation & human resolution for effect_unknown ----
 
   router.add("POST", "/api/operations/:opId/reconcile", async (context) => {
     if (!deps.reconcileOperation) {
@@ -285,6 +292,50 @@ export function registerApi(router: Router, deps: ApiDeps): void {
     try {
       const result = await deps.reconcileOperation(opId);
       return { body: result };
+    } catch (error) {
+      throw toRouteError(error);
+    }
+  });
+
+  router.add("POST", "/api/operations/:opId/resolve", (context) => {
+    if (!deps.resolveOperation) {
+      throw new RouteError(501, "unsupported", "operation resolution is not configured");
+    }
+    const opId = context.params.opId!;
+    const body = asRecord(context.body);
+    const resolution = body.resolution === "confirmed_exists" || body.resolution === "confirmed_absent" ? body.resolution : null;
+    if (!resolution) {
+      throw new RouteError(400, "invalid_input", "resolution must be confirmed_exists or confirmed_absent");
+    }
+    return {
+      body: withMappedErrors(() =>
+        deps.resolveOperation!(opId, {
+          resolution,
+          mrId: optionalString(body.mrId),
+          url: optionalString(body.url),
+          headSha: optionalString(body.headSha),
+          reason: optionalString(body.reason),
+        }),
+      ),
+    };
+  });
+
+  // ---- Step 5.1: Immutable g1 -> g2 executor handoff ----
+
+  router.add("POST", "/api/tasks/:id/handoff", async (context) => {
+    if (!deps.handoff) {
+      throw new RouteError(501, "unsupported", "executor handoff is not configured");
+    }
+    const taskId = context.params.id!;
+    const body = asRecord(context.body);
+    const executorId = requireString(body.executorId, "executorId");
+    try {
+      const result = await deps.handoff(taskId, {
+        executorId,
+        model: optionalString(body.model),
+        reason: optionalString(body.reason),
+      });
+      return { status: 200, body: result };
     } catch (error) {
       throw toRouteError(error);
     }

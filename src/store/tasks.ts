@@ -714,6 +714,35 @@ export class TaskStore {
     this.db.prepare("UPDATE executions SET revoked_at = ? WHERE task_id = ? AND revoked_at IS NULL").run(now, taskId);
   }
 
+  /**
+   * Atomically revokes all prior execution generations and creates the next
+   * generation (`g1 -> g2`) for immutable handoff to a new executor.
+   */
+  advanceExecutionGeneration(
+    taskId: string,
+    input: { environment: string; providerInstanceId: string; model: string; now: string },
+  ): { fromGeneration: number; toGeneration: number; executionId: string } {
+    return this.db.transaction(() => {
+      const current = this.db
+        .prepare("SELECT COALESCE(MAX(generation), 1) AS gen FROM executions WHERE task_id = ?")
+        .get(taskId) as { gen: number };
+      const fromGeneration = Number(current.gen);
+      const toGeneration = fromGeneration + 1;
+      const executionId = `${taskId}:g${toGeneration}`;
+      this.db.prepare("UPDATE executions SET revoked_at = ? WHERE task_id = ? AND revoked_at IS NULL").run(input.now, taskId);
+      this.db
+        .prepare(
+          `INSERT INTO executions (execution_id, task_id, generation, environment, provider_instance_id, model, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(executionId, taskId, toGeneration, input.environment, input.providerInstanceId, input.model, input.now);
+      this.db
+        .prepare("UPDATE tasks SET executor_id = ?, updated_at = ? WHERE task_id = ?")
+        .run(input.providerInstanceId, input.now, taskId);
+      return { fromGeneration, toGeneration, executionId };
+    });
+  }
+
   executionReachable(taskId: string): boolean {
     const row = this.db
       .prepare("SELECT revoked_at FROM executions WHERE task_id = ? ORDER BY generation DESC LIMIT 1")

@@ -268,6 +268,7 @@ export function App(): React.JSX.Element {
             <Inspector
               detail={state.detail}
               events={state.events}
+              executors={state.executors}
               runIds={state.runIds}
               activeRunId={state.activeRunId}
               runEvents={state.runEvents}
@@ -277,7 +278,9 @@ export function App(): React.JSX.Element {
                 const res = await api.steer(taskId, message);
                 return { accepted: res.accepted, reason: res.reason };
               }}
+              onHandoff={(taskId, executorId) => run(async () => { await api.handoff(taskId, executorId); })}
               onReconcileOperation={(operationId) => run(async () => { await api.reconcileOperation(operationId); })}
+              onResolveOperation={(operationId, resolution) => run(async () => { await api.resolveOperation(operationId, resolution); })}
               onStop={(taskId) => run(async () => { await api.stop(taskId); })}
               onProposeGoal={(taskId, goal) => run(async () => { await api.proposeGoal(taskId, goal); })}
               onConfirmProposal={(proposalId) => run(async () => { await api.confirmProposal(proposalId); })}

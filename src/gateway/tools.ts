@@ -317,6 +317,55 @@ export async function reconcileMrOperation(
 }
 
 /**
+ * Human resolution for an `effect_unknown` operation when the platform itself
+ * cannot confirm idempotency (Step 5.2 / S04):
+ * - `confirmed_exists`: binds the operator-supplied external MR receipt and marks `done`;
+ * - `confirmed_absent`: marks the operation `failed` so a fresh explicit retry is permitted.
+ */
+export function resolveMrOperation(
+  operationId: string,
+  input: { resolution: "confirmed_exists" | "confirmed_absent"; mrId?: string; url?: string; headSha?: string; reason?: string },
+  deps: { store: TaskStore; service: TaskService },
+): { operationId: string; status: string; message: string } {
+  const op = deps.store.getOperationById(operationId);
+  if (!op) throw new Error(`operation ${operationId} not found`);
+  const repo = typeof op.payload.repo === "string" ? op.payload.repo : "";
+  const now = toIso(new Date());
+
+  if (input.resolution === "confirmed_exists") {
+    if (!input.mrId?.trim()) throw new Error("mrId is required when resolution is confirmed_exists");
+    const headSha = input.headSha ?? (typeof op.payload.headSha === "string" ? op.payload.headSha : "");
+    const receipt: MrReceipt = {
+      mrId: input.mrId.trim(),
+      repo,
+      url: input.url?.trim() || `manual://${repo}/${input.mrId.trim()}`,
+      branch: typeof op.payload.branch === "string" ? op.payload.branch : "",
+      baseRef: typeof op.payload.baseRef === "string" ? op.payload.baseRef : "main",
+      headSha,
+      clientRequestId: op.clientRequestId,
+    };
+    deps.store.setOperationStatus(op.operationId, "done", receipt, now, now);
+    const view = deps.service.getTaskView(op.taskId);
+    if (view) {
+      const nextRepos = view.task.repos.map((r) =>
+        r.name === repo ? { ...r, mrId: receipt.mrId, mrUrl: receipt.url, mrHeadSha: receipt.headSha, ciStatus: r.ciStatus ?? "pending" } : r,
+      );
+      deps.service.updateRepoStates(op.taskId, nextRepos);
+    }
+    return { operationId: op.operationId, status: "done", message: `operator confirmed MR ${receipt.mrId} for ${repo}` };
+  }
+
+  deps.store.setOperationStatus(
+    op.operationId,
+    "failed",
+    { resolvedBy: "operator", resolution: "confirmed_absent", reason: input.reason ?? "confirmed absent on platform" },
+    now,
+    now,
+  );
+  return { operationId: op.operationId, status: "failed", message: `operator confirmed no MR exists for ${repo}; retry is now allowed` };
+}
+
+/**
  * `platform_mr` verification step handler (Step 4.2):
  * - Verifies that the repo has a confirmed MR receipt bound to the exact latest candidate SHA;
  * - Polls external CI status with 0 model calls;

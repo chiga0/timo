@@ -179,6 +179,24 @@ export class Api {
     return this.call(`/api/operations/${encodeURIComponent(operationId)}/reconcile`, { method: "POST" });
   }
 
+  resolveOperation(
+    operationId: string,
+    resolution: "confirmed_exists" | "confirmed_absent",
+    extra?: { mrId?: string; url?: string; reason?: string },
+  ): Promise<{ operationId: string; status: string; message: string }> {
+    return this.call(`/api/operations/${encodeURIComponent(operationId)}/resolve`, {
+      method: "POST",
+      body: JSON.stringify({ resolution, ...(extra ?? {}) }),
+    });
+  }
+
+  handoff(taskId: string, executorId: string, reason = "Web 界面切换执行器"): Promise<{ taskId: string; fromGeneration: number; toGeneration: number; toExecutor: string }> {
+    return this.call(`/api/tasks/${encodeURIComponent(taskId)}/handoff`, {
+      method: "POST",
+      body: JSON.stringify({ executorId, reason }),
+    });
+  }
+
   listTasks(): Promise<{ tasks: TaskSummary[] }> {
     return this.call("/api/tasks");
   }

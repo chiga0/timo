@@ -4,7 +4,7 @@
 
 **架构定案原则**：绝不自研 Agent Loop / Harness，不 Fork T3 Code；基于当前 `timo` 仓库自主演进事件驱动控制面、总助理分级委派授权、两级 Watchdog、自主多仓 Worktree、本地 Capability MCP Gateway 与极简黑白（Tailwind + shadcn/ui）Web 工作台，并通过统一 `ExecutionAdapter` 复用成熟外部运行时（Codex / OpenCode / Pi，以及保留为可选适配器的 T3 Code）。
 
-**当前状态（2026-11-26）：M0、M1.1–M1.6（Sprint 1–3）与 M2（Sprint 4）的工程实现及 `FIXTURE` 全套自动化验收均已通过（`npm run typecheck && npm run build && npm test` 138 项全通过，本机 `pi 1.6.0` Preflight 探测就绪）；待在获准账号与网络环境下完成 1 次 M1.6 真实自用试点与 M2 真实双仓 MR/CI `REAL` 复核后，即可勾选对应真实退出条件并推进 Sprint 5（M3）。** 关联文档：[README](../README.md)、[架构](architecture.md)、[领域模型](domain-model.md)、[技术设计](technical-design.md)、[执行器与 T3 决策](t3-adoption.md)、[托管开发任务书](implementation-plan.md)、[验收剧本](acceptance.md)、[产品设计 HTML](product.html)。
+**当前状态（2026-11-27）：M0、M1（含 M1.6 实机 Web Dogfooding：`qwen-code 0.25.3` 通过 Timo 极简黑白 Web 页面完成了 Sprint 5 Step 5.1 快照交接模块的独立 worktree 开发并合入主分支）、M2（Sprint 4）与 M3（Sprint 5）工程实现及 `FIXTURE` 全套自动化验收均已通过（`npm run typecheck && npm run build && npm test` 151 项全通过，本机 `qwen-code 0.25.3` + `pi 1.6.0` 双执行器探测就绪）；待在获准外部账号与试验双仓完成 M2/M3 的真实平台 `REAL` 复核后进入 M4 日常试用度量。** 关联文档：[README](../README.md)、[架构](architecture.md)、[领域模型](domain-model.md)、[技术设计](technical-design.md)、[执行器与 T3 决策](t3-adoption.md)、[托管开发任务书](implementation-plan.md)、[验收剧本](acceptance.md)、[产品设计 HTML](product.html)。
 
 > **托管开发派发入口**：每个冲刺与里程碑已进一步拆解为可直接托管给外部 Agent 的原子任务包（含前置依赖、改动边界、禁止越界项、必含反例测试与可执行验收命令），详见 [托管开发任务书与逐阶段验收合同](implementation-plan.md)。
 
@@ -36,12 +36,13 @@
 - [x] **M1.3 零仓 SSE 独立验收**：串起 `sse-v1` 独立重算验收器；并在隔离 T3 `v0.1.12` + Pi 上通过 `disconnect.log` 正例、重启原样读回、幂等冲突与 T3 拒绝路径验证。详细证据与待补项见 [M1.1–M1.3 开发合同](m1-delivery.md)。
 - [x] **M1.4（Sprint 1）底座加固 + 事件驱动 HTTP/SSE 控制面**：修复 5 项底座缺陷（二进制制品、真实重启 `reconcile`、非阻塞并发池、原子锁与残留 `.sock` 自愈、通知去重与执行元信息回写）；引入 `task_events`、`TypedEventBus` 在线唤醒与 `outbox_jobs`；升级 `node:http`（Unix Socket + Loopback REST/SSE 分页断点续传）及 CLI `list` / `amend` / `stop`（含运行中实时中断与防复活）。
 - [x] **M1.5（Sprint 2）极简黑白 Web 工作台 + 分级授权 + 一级 Watchdog**：实现 `StandingPolicy` 三层分级授权（Tier 0/1 总助理静默放行、Tier 2 红线挂起与批准原地恢复）、注意力防火墙 3 枚举白名单与 Inbox 结构化 `action` Upsert、两阶段 Amendment Diff 确认卡、一级 0-Token Watchdog（4 类检测与冷却去重），以及 React 19 + Vite 极简黑白三栏可折叠控制台（静态托管 + 实时 SSE + JSON 快照读取 + `⌘K` + 中文 IME 兼容）。
-- [x] **M1.6（Sprint 3）自主 Worktree + 统一执行器（含 Live 运行流）+ 声明式 `VerificationPipeline`（工程与 `FIXTURE` 通过，待留存 `REAL` 自用记录）**：
-  - `WorkspaceManager` 原生多仓 `git worktree`、精确 `baseSha` 与 manifest 持久化、缺分支整体回滚拒绝、脏目录回收保护与独立验证干净检出（`materializeCleanCheckout`）；
-  - 统一 `ExecutionAdapter` / `ExecutorRegistry`、`PiAdapter`（本机实测 `pi 1.6.0` `probe()` 就绪）与 `T3ExecutionAdapter`、`RunStreamStore`（`.ndjson` 物理隔离 + 实时 pub/sub SSE `/api/tasks/:id/runs/:runId/stream` + `POST /api/tasks/:id/steer` + Watchdog 心跳联动 + Web 侧栏探测状态与实时流下钻）；
-  - 声明式 `VerifierRegistry` + `command_check` 独立隔离验收、候选 SHA 变更自动标记旧证据 `stale`、预算内自动修复闭环（默认最多 2 轮）。
+- [x] **M1.6（Sprint 3）自主 Worktree + 统一执行器（含 Live 运行流）+ 声明式 `VerificationPipeline` + 首单实机 Dogfooding（已通过）**：
+  - `WorkspaceManager` 原生多仓 `git worktree`、精确 `baseSha` 与 manifest 持久化、缺分支整体回滚拒绝、脏目录回收保护、gitignored `node_modules` 符号链接隔离与独立验证干净检出（`materializeCleanCheckout`）；
+  - 统一 `ExecutionAdapter` / `ExecutorRegistry`，接入本地常驻 **`QwenCodeAdapter`**（`qwen 0.25.3`，双向 `stream-json` 实时流 + `steer` + `--resume` + `--mcp-config httpUrl` 直连 Timo Capability MCP Gateway）、`PiAdapter`（`pi 1.6.0`）与 `T3ExecutionAdapter`；
+  - Web 底部输入框与 CLI `timo create --repo` / `timo steer` / `timo executors` 代码交付入口；
+  - **首单实机 Dogfooding（2026-11-27 `REAL`）**：通过 Timo 极简黑白 Web 页面（`http://127.0.0.1:8790`）向 `qwen-code` 下发 Sprint 5 Step 5.1 任务（`d7ae0ae6`），在独立 worktree 中完成 `src/workspace/handoff.ts`、`WorkspaceManager.handoff()` 与 `test/handoff.test.ts`（147/147 通过，提交 `96ef67a` → `6b8dfb7`），并在自用中即时定位并修复了 `100dvh` 顶部 46px 溢出、JSON 卡片横向溢出、Live 流自动滚底及 `node_modules/` symlink 忽略规则 4 项真实摩擦。
 
-**M1 退出条件**：工程、构建与 `FIXTURE` 验收已全部通过；尚待在极简黑白 Web 上执行并留存 1 次针对 `timo` 仓库自身的 `REAL` 低风险研发自用试点记录。
+**M1 退出条件**：已达成（Web 实机自用闭环 + 实时运行流透视 + 强杀重启/并发/分级授权/一级 Watchdog 全部通过）。
 
 ---
 
@@ -61,19 +62,19 @@
 
 ---
 
-## M3：不可变交接、二级 Watchdog 纠偏与未知效果对账
+## M3（Sprint 5）：不可变交接、二级 Watchdog 纠偏与未知效果对账（`FIXTURE` 通过，待 `REAL` 双执行器实机复核）
 
-**依赖**：M2 的多仓交付、Capability MCP Gateway 与外部操作账本；至少两种已接入的原生执行器（如 Codex 与 Pi / OpenCode）。
+**依赖**：M2 的多仓交付、Capability MCP Gateway 与外部操作账本；至少两种已接入的原生执行器（本机已就绪 `qwen-code 0.25.3` 与 `pi 1.6.0`）。
 
 ### 可勾选切片
 
-- [ ] 实现 **不可变目录快照交接（`g1 → g2` worktree）**：换执行器时先发中断并立即作废 `g1` 的 Fencing Token，将 `git diff` 与未跟踪文件迁移至全新 `g2` worktree，生成协议无关的 **Handoff Capsule**（同 Provider 优先原生 Resume，跨 Provider 读胶囊续接）。
-- [ ] 验证“旧进程仍在 `g1` 持续写入或尝试调外部平台”反例：物理上不污染 `g2`，逻辑上被网关以 `GENERATION_REVOKED` 拦截。
-- [ ] 实现 **二级总助理 Watchdog 巡检与自动纠偏**：一级看门狗触发死循环/范围漂移/卡死信号后，唤醒总助理会诊，自动向 Worker 注入纠偏指令（`steer`）、触发换执行器或生成结构化求助卡。
-- [ ] 完整打通 `effect_unknown` 核对闭环（S04）：在平台建单成功但回执丢失的窗口中断连接，重启后先按原操作 ID 查平台事实；可确认则关联继续，无法确认则停在未知态由用户在 Web 核对卡处置，绝不盲目重试。
-- [ ] 完整验证主对话写操作 **Amendment Diff 确认卡**（S03）及多任务防串台，叠加断线、重启、重复事件与旧代次迟到回执组合反例。
+- [x] 实现 **不可变目录快照交接（`g1 → g2` worktree）**：新增 [handoff.ts](../src/workspace/handoff.ts) 与 `WorkspaceManager.handoff()`、`TaskService.handoffTask()`、`POST /api/tasks/:id/handoff` 与 Web 检查器「换执行器」入口；先作废 `g1` Fencing Token 并中断旧运行，将 `git diff`（含 staged + unstaged）与未跟踪文件（二进制安全）迁移至全新 `g2` worktree，生成协议无关的 **Handoff Capsule**（保留剩余预算、已有 MR/CI 与最新失败摘要，绝不重置额度）。
+- [x] 验证“旧进程仍在 `g1` 持续写入或尝试调外部平台”反例（S02）：`g2` 字节零污染、`g1` Token 被网关以 HTTP `403 GENERATION_REVOKED` 拦截、`g1` 迟到验收回调被 `ignored_stale_generation` 拒绝。
+- [x] 实现 **二级总助理 Watchdog 巡检与自动纠偏**：新增 [triage.ts](../src/watchdog/triage.ts)（`WatchdogTriageEngine`），监听 `watchdog_signal`，按上限先自动 `steer` 纠偏或触发 `g1 → g2` 换执行器，无法收敛时收敛为 1 张结构化 `decision_required`（`task_blocked_final`）求助卡并暂停任务，避免烧光预算。
+- [x] 完整打通 `effect_unknown` 核对闭环（S04）：新增 `POST /api/operations/:opId/resolve` 与 Web 对账卡「重新向平台核查 / 人工确认不存在」双动作；丢回执重启后先查平台事实，可确认即关联继续，不可确认则停留 `effect_unknown` 绝不盲重发。
+- [x] 完整验证主对话写操作 **Amendment Diff 确认卡**（S03）多任务隔离与过期版本冲突拒绝（151/151 自动化测试全通过）。
 
-**退出条件**：S02、S03、S04、S08 的故障注入与获准真实交接均有可回读证据；旧代次越权写入、盲目重复建 MR、无进展死循环和收件箱过程刷屏均被确定性拦截。
+**退出条件**：S02、S03、S04、S08 全部 `FIXTURE` 正反例自动化测试已通过；尚待留存 1 次 `qwen-code ↔ pi` 真实双执行器交接与外部平台 `REAL` 复核记录后即可正式关闭 M3。
 
 ---
 

@@ -389,13 +389,27 @@ export class WorkspaceManager {
     const srcNm = join(sourcePath, "node_modules");
     const dstNm = join(targetDir, "node_modules");
     if (!existsSync(srcNm) || existsSync(dstNm)) return;
+    // Check both `node_modules` and `node_modules/` because `.gitignore` often
+    // uses a trailing slash, which matches directories rather than symlinks.
     const ignored = safe(() => {
       this.run(["check-ignore", "-q", "node_modules"], targetDir);
+      return true;
+    }, false) || safe(() => {
+      this.run(["check-ignore", "-q", "node_modules/"], targetDir);
       return true;
     }, false);
     if (!ignored) return;
     try {
       symlinkSync(srcNm, dstNm, "dir");
+      // Ensure git status inside the worktree ignores the symlink too even if
+      // `.gitignore` only listed `node_modules/`.
+      const excludePath = safe(() => this.run(["rev-parse", "--git-path", "info/exclude"], targetDir).trim(), null);
+      if (excludePath && existsSync(dirname(excludePath))) {
+        const current = existsSync(excludePath) ? readFileSync(excludePath, "utf8") : "";
+        if (!current.split("\n").some((line) => line.trim() === "node_modules")) {
+          writeFileSync(excludePath, `${current}${current.endsWith("\n") || current === "" ? "" : "\n"}node_modules\n`);
+        }
+      }
     } catch {
       // Best-effort; if symlinking fails, repo commands fall back to repo setup.
     }

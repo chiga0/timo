@@ -17,7 +17,7 @@ import { T3ExecutionAdapter } from "../adapters/t3-adapter.js";
 import { WorkspaceManager } from "../workspace/manager.js";
 import { RunStreamStore } from "../workspace/run-stream.js";
 import { CapabilityMcpGateway } from "../gateway/mcp-gateway.js";
-import { createPlatformMrVerifier, reconcileMrOperation, registerPlatformTools } from "../gateway/tools.js";
+import { createPlatformMrVerifier, reconcileMrOperation, registerPlatformTools, resolveMrOperation } from "../gateway/tools.js";
 import { GhPlatformAdapter } from "../platform/adapter.js";
 import { acquireServiceLock, ServiceUnavailableError } from "../ipc.js";
 import { Router, newSessionToken, startListener, type RunningListener } from "../http/server.js";
@@ -100,6 +100,7 @@ export async function serve(): Promise<void> {
     verifiers: service.verifiers,
     mcpGateway,
     platformVerifier: createPlatformMrVerifier({ store, service, platform, credentials: gatewayCredentials }),
+    enableWatchdogTriage: true,
     log,
   });
 
@@ -115,6 +116,22 @@ export async function serve(): Promise<void> {
     steer: (taskId: string, message: string) => runner.steerTask(taskId, message),
     reconcileOperation: (operationId: string) =>
       reconcileMrOperation(operationId, { store, service, platform, credentials: gatewayCredentials }),
+    resolveOperation: (
+      operationId: string,
+      input: { resolution: "confirmed_exists" | "confirmed_absent"; mrId?: string; url?: string; headSha?: string; reason?: string },
+    ) => resolveMrOperation(operationId, input, { store, service }),
+    handoff: (taskId: string, input: { executorId: string; model?: string; reason?: string }) => {
+      // Validate requested executor is registered & ready before migrating!
+      executors.require(input.executorId);
+      return service.handoffTask(taskId, {
+        toExecutor: input.executorId,
+        model: input.model,
+        reason: input.reason,
+        workspaces,
+        mcpGateway,
+        interruptActive: (id) => runner.interruptTask(id),
+      });
+    },
   };
 
   const router = new Router();

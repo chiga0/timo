@@ -12,9 +12,11 @@ import type { TypedEventBus } from "../events/bus.js";
 import { toIso, newId } from "../util.js";
 import { SSE_CANDIDATE_SCHEMA } from "../sse/contract.js";
 import { WatchdogMonitor, type WatchdogThresholds } from "../watchdog/monitor.js";
+import { WatchdogTriageEngine } from "../watchdog/triage.js";
 import type { RunStreamStore } from "../workspace/run-stream.js";
 import { ExecutorUnavailableError, type ExecutorRegistry, type RunStreamEvent } from "../adapters/execution.js";
 import { WorkspaceError, type PreparedWorkspace, type WorkspaceManager } from "../workspace/manager.js";
+import { serializeHandoffCapsule, type HandoffCapsule } from "../workspace/handoff.js";
 import {
   VerifierRegistry,
   formatRepairFeedback,
@@ -64,6 +66,8 @@ export interface RunnerOptions {
   platformVerifier?: VerificationContext["platformVerifier"];
   /** Delay between 0-Token CI poll attempts, in ms. */
   ciPollIntervalMs?: number;
+  /** Enables second-level Chief-of-Staff Watchdog triage on `watchdog_signal`. */
+  enableWatchdogTriage?: boolean;
   log: (line: string) => void;
 }
 
@@ -88,12 +92,49 @@ export class TaskRunner {
   private claimedJobs: Array<{ jobId: string; taskId: string; kind: string }> = [];
   /** First-level watchdog: deterministic, injectable clock, zero model calls. */
   private readonly watchdog: WatchdogMonitor | null;
+  /** Second-level Chief-of-Staff triage reacting to `watchdog_signal`. */
+  private readonly triage: WatchdogTriageEngine | null;
   /** Currently active live runs driven through `ExecutionAdapter`, keyed by taskId. */
   private readonly liveRuns = new Map<string, { runId: string; executorId: string; generation: number; seq: number }>();
 
   constructor(private readonly options: RunnerOptions) {
     this.leaseMs = Math.max(options.pollIntervalMs * 10, 30_000);
     this.watchdog = options.watchdog === null ? null : new WatchdogMonitor(options.watchdog ?? {});
+    this.triage =
+      options.enableWatchdogTriage === true
+        ? new WatchdogTriageEngine({
+            store: options.store,
+            writer: options.writer,
+            steer: (taskId, msg) => this.steerTask(taskId, msg),
+            handoff: options.workspaces
+              ? async (taskId, toExecutor, reason) => {
+                  const res = await options.service.handoffTask(taskId, {
+                    toExecutor,
+                    reason,
+                    workspaces: options.workspaces!,
+                    mcpGateway: options.mcpGateway,
+                    interruptActive: (id) => this.interruptTask(id),
+                  });
+                  return { toGeneration: res.toGeneration };
+                }
+              : undefined,
+            availableExecutors: () =>
+              (options.executors?.snapshot() ?? []).filter((e) => e.available).map((e) => e.id),
+            log: options.log,
+          })
+        : null;
+  }
+
+  /** Interrupts an active live run for `taskId` (used during `g1 -> g2` handoff). */
+  async interruptTask(taskId: string): Promise<void> {
+    const live = this.liveRuns.get(taskId);
+    if (!live || !this.options.executors?.has(live.executorId)) return;
+    try {
+      const adapter = this.options.executors.require(live.executorId);
+      await adapter.interrupt(live.runId);
+    } catch {
+      // Best-effort interrupt; fencing token is already revoked.
+    }
   }
 
   /** Returns the active live run for a task, if any. */
@@ -170,10 +211,19 @@ export class TaskRunner {
       this.unsubscribes.push(this.options.bus.on("task_stopping", wake));
       this.unsubscribes.push(
         this.options.bus.on("run_observed", (event) => {
-          const auth = (event.payload as { authorization?: { approved?: boolean } } | null)?.authorization;
-          if (auth?.approved === true) wake();
+          const payload = event.payload as { authorization?: { approved?: boolean }; handoff?: unknown } | null;
+          if (payload?.authorization?.approved === true || payload?.handoff) wake();
         }),
       );
+      if (this.triage) {
+        this.unsubscribes.push(
+          this.options.bus.on("watchdog_signal", (event) => {
+            void this.triage?.handleSignal(event).catch((error) => {
+              this.options.log(`triage error on ${event.taskId}: ${error instanceof Error ? error.message : String(error)}`);
+            });
+          }),
+        );
+      }
     }
     schedule(0);
   }
@@ -775,14 +825,27 @@ export class TaskRunner {
     });
 
     const mcpGatewayUrl = this.options.mcpGateway?.issueUrl(taskId, generation);
-    const maxRounds = task.kind === "repo_delivery" ? Math.max(0, task.maxRepairRounds) : 0;
-    const basePrompt = this.buildAdapterPrompt(taskId, prepared);
+    // Respect remaining task-wide attempts across handoffs (never reset quota!).
+    const maxAttempts = service.standingPolicy.budget.maxAttempts;
+    const alreadyUsed = store.getEvidence<number>(taskId, "attemptsUsed") ?? 0;
+    const remainingBudget = Math.max(0, maxAttempts - alreadyUsed);
+    if (remainingBudget === 0) {
+      this.commitFailure(taskId, { reason: "budget_exhausted", detail: `task exhausted total attempt budget (${maxAttempts})` });
+      return;
+    }
+    const maxRounds = task.kind === "repo_delivery" ? Math.min(Math.max(0, task.maxRepairRounds), remainingBudget - 1) : 0;
+    const basePrompt = this.buildAdapterPrompt(taskId, prepared, generation);
     let currentPrompt = basePrompt;
 
     for (let round = 0; round <= maxRounds; round++) {
       const latestTask = store.get(taskId);
       if (!latestTask || isTerminal(latestTask.status) || latestTask.status === "stopping") return;
       if (latestTask.status === "waiting" && latestTask.waitingReason === "needs_human_decision") return;
+      // Stop immediately if a newer generation took over (handoff fencing).
+      if (store.executionFor(taskId)?.generation !== generation) return;
+
+      const usedNow = (store.getEvidence<number>(taskId, "attemptsUsed") ?? 0) + 1;
+      store.setEvidence(taskId, "attemptsUsed", usedNow, now());
 
       const runId = `${taskId.slice(0, 8)}-g${generation}-r${round + 1}-${newId().slice(0, 6)}`;
       store.setRun(taskId, runId, now());
@@ -852,6 +915,7 @@ export class TaskRunner {
       const currentAfter = store.get(taskId);
       if (!currentAfter || isTerminal(currentAfter.status) || currentAfter.status === "stopping") return;
       if (currentAfter.status === "waiting" && currentAfter.waitingReason === "needs_human_decision") return;
+      if (store.executionFor(taskId)?.generation !== generation) return;
 
       if (spawnResult.status !== "succeeded") {
         this.recordFailureFingerprint(taskId, `executor:${spawnResult.status}:${spawnResult.exitCode ?? "sig"}`, afterRunIso);
@@ -909,7 +973,10 @@ export class TaskRunner {
       });
 
       if (outcome.status === "accepted" || outcome.status === "waiting_external") {
-        service.recordPipelineVerification(taskId, runId, outcome, { ciPollDelayMs: this.options.ciPollIntervalMs ?? 2_000 });
+        service.recordPipelineVerification(taskId, runId, outcome, {
+          ciPollDelayMs: this.options.ciPollIntervalMs ?? 2_000,
+          expectedGeneration: generation,
+        });
         if (outcome.status === "waiting_external") {
           store.setOperationStatus(operation.operationId, "done", { waiting: "waiting_external_ci", runId }, now());
         }
@@ -918,7 +985,7 @@ export class TaskRunner {
 
       // Rejected: bounded in-budget auto-repair up to maxRepairRounds.
       const isFinal = round >= maxRounds;
-      service.recordPipelineVerification(taskId, runId, outcome, { finalFailure: isFinal });
+      service.recordPipelineVerification(taskId, runId, outcome, { finalFailure: isFinal, expectedGeneration: generation });
       if (isFinal) return;
 
       store.setStatus(taskId, "running", null, now());
@@ -976,7 +1043,7 @@ export class TaskRunner {
     }
   }
 
-  private buildAdapterPrompt(taskId: string, workspace: PreparedWorkspace | null): string {
+  private buildAdapterPrompt(taskId: string, workspace: PreparedWorkspace | null, generation = 1): string {
     const view = this.options.store.view(taskId);
     if (!view) return "";
     if (view.task.kind === "sse_log") {
@@ -990,12 +1057,18 @@ export class TaskRunner {
     const repoLines = (workspace?.repos ?? []).map(
       (repo) => `- ${repo.name}: path=${repo.worktreePath} branch=${repo.branch} baseRef=${repo.baseRef} baseSha=${repo.baseSha}`,
     );
+    const capsule =
+      generation > 1 ? this.options.store.getEvidence<HandoffCapsule>(taskId, `handoffCapsule:g${generation}`) : undefined;
+    const capsuleBlock = capsule
+      ? `[Handoff Capsule g${capsule.fromGeneration} -> g${capsule.toGeneration} (${capsule.fromExecutor} -> ${capsule.toExecutor})]\n${serializeHandoffCapsule(capsule)}`
+      : "";
     return [
-      `Task ${taskId} (Brief v${view.briefVersion})`,
+      `Task ${taskId} (Brief v${view.briefVersion}, Generation g${generation})`,
       `Goal: ${view.brief.goal}`,
       `Must:\n${view.brief.must.map((m) => `- ${m}`).join("\n")}`,
       `Must Not:\n${view.brief.mustNot.map((m) => `- ${m}`).join("\n")}`,
       repoLines.length > 0 ? `Worktrees:\n${repoLines.join("\n")}` : "",
+      capsuleBlock,
       "Commit your changes cleanly inside each modified worktree before finishing.",
     ]
       .filter(Boolean)

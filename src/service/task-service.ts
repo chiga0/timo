@@ -30,6 +30,8 @@ import {
   type VerificationFinding,
   type VerificationPlan,
 } from "../verify/pipeline.js";
+import { buildHandoffCapsule, serializeHandoffCapsule, type HandoffCapsule } from "../workspace/handoff.js";
+import type { WorkspaceManager } from "../workspace/manager.js";
 import { basename } from "node:path";
 
 export class TaskNotFoundError extends Error {
@@ -574,7 +576,7 @@ export class TaskService {
     taskId: string,
     taskRunId: string,
     outcome: PipelineOutcome,
-    options: { finalFailure?: boolean; ciPollDelayMs?: number } = {},
+    options: { finalFailure?: boolean; ciPollDelayMs?: number; expectedGeneration?: number } = {},
   ): { status: string; findings: VerificationFinding[] } {
     const view = this.store.view(taskId);
     if (!view) throw new TaskNotFoundError(`task ${taskId} not found`);
@@ -582,6 +584,28 @@ export class TaskService {
       const now = toIso(this.now());
       this.store.setEvidence(taskId, "lateCandidate", { outcome, runId: taskRunId, status: view.task.status, observedAt: now }, now);
       return { status: "ignored_after_stop", findings: [] };
+    }
+    // Generation fencing: a late verification from a revoked older generation
+    // (e.g. g1 after g2 took over) must NEVER overwrite the newer generation.
+    if (
+      options.expectedGeneration !== undefined &&
+      view.execution &&
+      view.execution.generation !== options.expectedGeneration
+    ) {
+      const now = toIso(this.now());
+      this.store.setEvidence(
+        taskId,
+        "lateGenerationCandidate",
+        {
+          expectedGeneration: options.expectedGeneration,
+          currentGeneration: view.execution.generation,
+          runId: taskRunId,
+          candidateDigest: outcome.candidateDigest,
+          observedAt: now,
+        },
+        now,
+      );
+      return { status: "ignored_stale_generation", findings: [] };
     }
 
     const now = toIso(this.now());
@@ -1017,6 +1041,160 @@ export class TaskService {
   /** Inbox projection: only the three attention-worthy classes ever appear here. */
   listInbox(): InboxItem[] {
     return this.inboxStore.list();
+  }
+
+  /**
+   * Immutable generation handoff (`g1 -> g2`, Step 5.1 / S02):
+   * 1. Interrupts the old run (if active) and immediately revokes `g1`'s
+   *    Capability MCP Gateway Fencing Token;
+   * 2. Freezes `g1` staged/unstaged diffs + untracked files and materializes
+   *    them into a brand-new `g2` worktree;
+   * 3. Carries forward the exact remaining budget (never resetting quota),
+   *    existing external MR/CI operations, active grants, and latest verification
+   *    failure inside a protocol-agnostic `HandoffCapsule`;
+   * 4. Advances DB execution generation and enqueues `JOB_DISPATCH` for `g2`.
+   */
+  async handoffTask(
+    taskId: string,
+    input: {
+      toExecutor: string;
+      model?: string;
+      reason?: string;
+      workspaces: WorkspaceManager;
+      mcpGateway?: { revoke(taskId: string, generation?: number): void };
+      interruptActive?: (taskId: string) => Promise<void>;
+    },
+  ): Promise<{
+    taskId: string;
+    fromGeneration: number;
+    toGeneration: number;
+    fromExecutor: string;
+    toExecutor: string;
+    capsule: HandoffCapsule;
+  }> {
+    const view = this.store.view(taskId);
+    if (!view) throw new TaskNotFoundError(`task ${taskId} not found`);
+    if (isTerminal(view.task.status) || view.task.status === "stopping") {
+      throw new TaskConflictError("task_terminated", `task ${taskId} is ${view.task.status} and cannot be handed off`);
+    }
+    const toExecutor = input.toExecutor.trim();
+    if (!toExecutor) throw new InvalidInputError("toExecutor is required");
+
+    const fromGeneration = view.execution?.generation ?? 1;
+    const toGeneration = fromGeneration + 1;
+    const fromExecutor = view.task.executorId ?? view.execution?.providerInstanceId ?? "unknown";
+    const now = toIso(this.now());
+
+    // 1. Immediately revoke g1 Fencing Token BEFORE interrupting/migrating so no
+    //    zombie g1 writer can sneak an external call through the gateway.
+    input.mcpGateway?.revoke(taskId, fromGeneration);
+    if (input.interruptActive) {
+      await input.interruptActive(taskId);
+    }
+
+    // 2. Freeze g1 snapshot and materialize isolated g2 worktree(s).
+    const snapshot = input.workspaces.handoff(taskId, fromGeneration, toGeneration);
+
+    // 3. Compute exact remaining budget across the whole task tree (never reset!).
+    const totalAttemptsLimit = this.loadedPolicy.policy.budget.maxAttempts;
+    const attemptsUsed = this.store.getEvidence<number>(taskId, "attemptsUsed") ?? view.runs.length;
+    const remainingAttempts = Math.max(0, totalAttemptsLimit - attemptsUsed);
+
+    const existingOperations = this.store
+      .listOperations(taskId)
+      .filter((op) => op.kind !== "dispatch")
+      .map((op) => {
+        const receipt = (op.receipt && typeof op.receipt === "object" ? (op.receipt as Record<string, unknown>) : null);
+        const externalIds: Record<string, string | number> = {};
+        if (receipt && typeof receipt.mrId === "string") externalIds.mrId = receipt.mrId;
+        if (receipt && typeof receipt.headSha === "string") externalIds.headSha = receipt.headSha;
+        return {
+          id: op.operationId,
+          kind: op.kind,
+          status: op.status,
+          ...(Object.keys(externalIds).length > 0 ? { externalIds } : {}),
+          ...(op.operationKey ? { detail: op.operationKey } : {}),
+        };
+      });
+
+    const lastVerificationFailure =
+      view.verification && view.verification.result !== "accepted"
+        ? {
+            result: view.verification.result,
+            verifierVersion: view.verification.verifierVersion,
+            createdAt: view.verification.createdAt,
+            findings: view.verification.findings.map((f) => ({ code: f.code, detail: f.detail })),
+            summary: view.verification.findings.map((f) => `${f.code}: ${f.detail}`).join("; "),
+          }
+        : null;
+
+    const capsule = buildHandoffCapsule({
+      taskId,
+      fromGeneration,
+      toGeneration,
+      fromExecutor,
+      toExecutor,
+      briefVersion: view.briefVersion,
+      goal: view.brief.goal,
+      must: view.brief.must,
+      mustNot: view.brief.mustNot,
+      remainingAttempts,
+      grants: view.grants,
+      repos: snapshot.repos,
+      existingOperations,
+      lastVerificationFailure,
+      frozenAt: snapshot.frozenAt,
+    });
+
+    // 4. Advance generation atomically, update repo worktree paths to g2, reset
+    //    dispatch operation so runner dispatches g2, and persist capsule.
+    const nextRepos = view.task.repos.map((repo) => {
+      const migrated = snapshot.repos.find((r) => r.name === repo.name);
+      if (!migrated) return repo;
+      return {
+        ...repo,
+        baseSha: migrated.baseSha,
+        headSha: migrated.headSha,
+        worktreePath: migrated.worktreePath,
+        branch: migrated.branch,
+      };
+    });
+
+    this.writer.commit({
+      taskId,
+      type: "run_observed",
+      payload: {
+        handoff: {
+          fromGeneration,
+          toGeneration,
+          fromExecutor,
+          toExecutor,
+          remainingAttempts,
+          reason: input.reason ?? "executor_switch",
+        },
+      },
+      options: {
+        idempotencyKey: `handoff:g${fromGeneration}->g${toGeneration}`,
+        now,
+        enqueue: [{ kind: JOB_DISPATCH, dedupeKey: `handoff:g${toGeneration}`, runAfter: now }],
+      },
+      project: () => {
+        this.store.advanceExecutionGeneration(taskId, {
+          environment: toExecutor,
+          providerInstanceId: toExecutor,
+          model: input.model ?? view.execution?.model ?? "default",
+          now,
+        });
+        this.store.setRepos(taskId, nextRepos, now);
+        this.store.setEvidence(taskId, `handoffCapsule:g${toGeneration}`, capsule, now);
+        this.store.setEvidence(taskId, "latestHandoffCapsule", serializeHandoffCapsule(capsule), now);
+        this.store.setEvidence(taskId, "attemptsUsed", attemptsUsed, now);
+        this.store.setOperationStatus(`${taskId}:dispatch`, "pending", { handedOffTo: toGeneration }, now);
+        this.store.setStatus(taskId, "waiting", "retrying", now);
+      },
+    });
+
+    return { taskId, fromGeneration, toGeneration, fromExecutor, toExecutor, capsule };
   }
 
   private audit(
