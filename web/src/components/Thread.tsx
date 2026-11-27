@@ -485,7 +485,13 @@ function InlineTaskCard(props: {
             )}
             {status === "completed" && (
               <span className="muted small">
-                {repoLabel ? `${repoLabel} · 已通过独立验收` : "已完成交付"}
+                {task?.kind === "review"
+                  ? repoLabel
+                    ? `${repoLabel} · 已完成只读评审`
+                    : "已完成评审报告"
+                  : repoLabel
+                    ? `${repoLabel} · 已通过独立验收`
+                    : "已完成交付"}
               </span>
             )}
           </>

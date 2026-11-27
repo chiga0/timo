@@ -192,11 +192,13 @@ export class TaskService {
     const kind: TaskKind =
       request.kind === "assistant_chat"
         ? "assistant_chat"
-        : request.kind === "repo_delivery" || (request.repos && request.repos.length > 0)
-          ? "repo_delivery"
-          : "sse_log";
-    if (kind === "assistant_chat") {
-      return this.createAssistantChatTask(requestId, request);
+        : request.kind === "review"
+          ? "review"
+          : request.kind === "repo_delivery" || (request.repos && request.repos.length > 0)
+            ? "repo_delivery"
+            : "sse_log";
+    if (kind === "assistant_chat" || kind === "review") {
+      return this.createConversationalOrReviewTask(requestId, request, kind);
     }
     if (kind === "repo_delivery") {
       return this.createRepoDeliveryTask(requestId, request);
@@ -419,14 +421,25 @@ export class TaskService {
     return { taskId, status: this.store.get(taskId)!.status, reused: false };
   }
 
-  private createAssistantChatTask(requestId: string, request: CreateTaskRequest): CreateTaskResponse & { reused: boolean } {
+  private createConversationalOrReviewTask(
+    requestId: string,
+    request: CreateTaskRequest,
+    kind: "assistant_chat" | "review",
+  ): CreateTaskResponse & { reused: boolean } {
     const requestText = request.requestText?.trim() ?? "";
     if (requestText === "") {
-      throw new InvalidInputError("assistant_chat tasks require a non-empty requestText");
+      throw new InvalidInputError(`${kind} tasks require a non-empty requestText`);
     }
     const defaultExecutor = request.executorId ?? "qwen-code";
+    const normalizedRepos: RepoDeliveryState[] = (request.repos ?? [])
+      .filter((r) => Boolean(r.sourcePath?.trim()))
+      .map((repo) => ({
+        name: repo.name?.trim() || basename(repo.sourcePath),
+        sourcePath: repo.sourcePath,
+        baseRef: repo.baseRef?.trim() || "HEAD",
+      }));
     const specBytes = Buffer.from(
-      stableJson({ kind: "assistant_chat", requestText, executorId: defaultExecutor }),
+      stableJson({ kind, requestText, executorId: defaultExecutor, ...(normalizedRepos.length > 0 ? { repos: normalizedRepos } : {}) }),
       "utf8",
     );
     const inputDigest = sha256Hex(specBytes);
@@ -444,26 +457,45 @@ export class TaskService {
     const now = toIso(this.now());
     const taskId = newId();
 
+    const brief =
+      kind === "review"
+        ? {
+            goal: requestText,
+            must: [
+              "深入只读审查目标 MR/PR 或代码库，基于真实代码和事实输出结构化 Markdown 评审报告",
+              "优先指出真实缺陷、并发/回归风险、边界问题与可落地修改建议",
+            ],
+            mustNot: [
+              "禁止修改、提交或污染原仓库工作目录",
+              "禁止写入、修改或临时改动用户主目录文件（如 ~/.timo、~/.codex、~/.qwen、~/.claude 等）",
+              "禁止生产发布（deploy_prod）",
+            ],
+            evidence: [],
+          }
+        : {
+            goal: requestText,
+            must: ["直接、简洁地回答用户的问题或说明下一步需要确认的信息"],
+            mustNot: ["禁止未经明确指示擅自修改任何代码仓库或执行生产操作"],
+            evidence: [],
+          };
+
     this.store.createTask({
       taskId,
-      kind: "assistant_chat",
+      kind,
       executorId: defaultExecutor,
       requestId,
       requestDigest,
       inputDigest,
       artifactPath: artifact.path,
       requestText,
-      brief: {
-        goal: requestText,
-        must: ["直接、简洁地回答用户的问题或说明下一步需要确认的信息"],
-        mustNot: ["禁止未经明确指示擅自修改任何代码仓库或执行生产操作"],
-        evidence: [],
-      },
+      brief,
       grants: [
         { action: "read_worktree", resource: "*", environment: "dev", identity: "task-executor", expiresAt: null },
-        { action: "write_worktree", resource: "*", environment: "dev", identity: "task-executor", expiresAt: null },
+        ...(kind === "review"
+          ? [{ action: "run_local_tests", resource: "*", environment: "dev", identity: "task-executor", expiresAt: null }]
+          : [{ action: "write_worktree", resource: "*", environment: "dev", identity: "task-executor", expiresAt: null }]),
       ],
-      repos: [],
+      repos: normalizedRepos,
       verificationPlan: null,
       maxRepairRounds: 0,
       environment: defaultExecutor,
@@ -476,11 +508,11 @@ export class TaskService {
       taskId,
       type: "task_created",
       payload: {
-        kind: "assistant_chat",
+        kind,
         inputDigest,
         requestId,
         executorId: defaultExecutor,
-        repos: [],
+        repos: normalizedRepos.map((r) => ({ name: r.name, baseRef: r.baseRef })),
       },
       options: {
         idempotencyKey: "created",

@@ -157,7 +157,7 @@ export interface TaskSummary {
   taskId: string;
   title?: string;
   archivedAt?: string | null;
-  kind?: "sse_log" | "repo_delivery" | "assistant_chat";
+  kind?: "sse_log" | "repo_delivery" | "review" | "assistant_chat";
   executorId?: string | null;
   repoNames?: string[];
   status: string;
@@ -174,7 +174,7 @@ export interface TaskSummary {
 
 export interface TaskDetail extends TaskSummary {
   requestText?: string;
-  kind?: "sse_log" | "repo_delivery" | "assistant_chat";
+  kind?: "sse_log" | "repo_delivery" | "review" | "assistant_chat";
   executorId?: string | null;
   threadId: string | null;
   runId: string | null;

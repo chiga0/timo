@@ -52,7 +52,7 @@ export class MainChatRunner {
       skillRegistry?: SkillRegistry;
       attachments?: AttachmentStore;
       mcpGateway?: CapabilityMcpGateway;
-      /** Per-turn wall-clock timeout in ms for Main Chat (default 10 minutes so deep reviews finish cleanly). */
+      /** Optional per-turn wall-clock timeout in ms for Main Chat; undefined = unlimited (recommended). */
       chatTimeoutMs?: number;
       log?: (line: string) => void;
     },
@@ -164,6 +164,37 @@ export class MainChatRunner {
         repos,
         verificationPlan,
         maxRepairRounds: input.maxRepairRounds ?? settings?.assistant.defaultMaxRepairRounds ?? 2,
+      });
+      const taskCardMessage = this.deps.chatStore.append({
+        role: "task_card",
+        content: text,
+        taskId: created.taskId,
+        executorId: chosenExecutor,
+        model: chosenModel ?? null,
+        status: "done",
+      });
+      this.deps.chatBus.publish({ event: "chat_message", data: taskCardMessage });
+      return { kind: "task", userMessage, taskCardMessage, taskId: created.taskId };
+    }
+
+    // Heavy MR/PR code review URLs or explicit deep async reviews: delegate to a
+    // managed background `review` worker (Task Card + Task Detail + Watchdog, no
+    // artificial wall-clock timeout, Main Chat stays free for concurrent chat).
+    if (!isTimoMgmt && hasHeavyReviewIntent(text)) {
+      const repos = matchedFolders.map((f) => ({
+        sourcePath: f.path,
+        baseRef: resolveValidBaseRef(f.path, f.baseRef),
+        name: f.name,
+      }));
+      const attachmentSection = this.formatAttachmentsSection(resolvedAttachments);
+      const reviewRequestText = attachmentSection ? `${text}\n\n${attachmentSection}` : text;
+      const created = this.deps.service.createTask({
+        requestId: `chat-review-${newId()}`,
+        kind: "review",
+        requestText: reviewRequestText,
+        executorId: chosenExecutor,
+        model: chosenModel,
+        repos,
       });
       const taskCardMessage = this.deps.chatStore.append({
         role: "task_card",
@@ -326,7 +357,7 @@ export class MainChatRunner {
 
     const envTimeout = Number(process.env.TIMO_CHAT_TIMEOUT_MS);
     const chatTimeoutMs =
-      this.deps.chatTimeoutMs ?? (Number.isFinite(envTimeout) && envTimeout >= 10_000 ? envTimeout : 600_000);
+      this.deps.chatTimeoutMs ?? (Number.isFinite(envTimeout) && envTimeout > 0 ? envTimeout : undefined);
 
     try {
       let result = await adapter.spawn(
@@ -337,7 +368,7 @@ export class MainChatRunner {
           prompt,
           model,
           mcpGatewayUrl: chiefToken?.url,
-          timeoutMs: chatTimeoutMs,
+          ...(chatTimeoutMs !== undefined ? { timeoutMs: chatTimeoutMs } : {}),
         },
         handleEvent,
       );
@@ -387,7 +418,7 @@ export class MainChatRunner {
       }
       const friendlyErr =
         result.status === "timed_out"
-          ? `执行超过单轮耗时上限（${Math.round(chatTimeoutMs / 1000)}s），可点击下方「接着继续完成」延续上下文。`
+          ? `执行器触发耗时上限${chatTimeoutMs ? `（${Math.round(chatTimeoutMs / 1000)}s）` : ""}，可点击下方「接着继续完成」延续上下文。`
           : errDetail;
       const finalContent =
         result.status === "succeeded"
@@ -464,7 +495,7 @@ export class MainChatRunner {
           [
             "## Timo 控制面工具（Chief-of-Staff，已就绪）",
             transportNote,
-            "- 派发后台代码修改/修复任务（自动建隔离 worktree + 独立验收 + 主对话插入单张任务卡）→ `timo_delegate_task`（参数：`requestText`, `repoNames: string[]`, 可选 `executorId`, `checkCommand`）；",
+            "- 派发后台代码修改/修复任务（`mode: \"repo_delivery\"`，自动建隔离 worktree + 独立验收）或长耗时只读 MR 评审/深度调研任务（`mode: \"review\"`，无硬超时且不阻塞主对话）→ `timo_delegate_task`（参数：`requestText`, 可选 `mode`, `repoNames`, `executorId`, `checkCommand`）；",
             "- 查询任意任务详情/验收日志/实时进展 → `timo_get_task_detail` / `timo_list_tasks` / `timo_list_inbox`；",
             "- 发现、查看、导入或保存 Timo 统一 Skill → `timo_discover_external_skills` / `timo_import_skills` / `timo_list_skills` / `timo_read_skill` / `timo_save_skill`；",
             "- 修改进行中任务的目标（两阶段 Diff 确认）→ `timo_propose_task_change`；",
@@ -596,6 +627,18 @@ export function isTimoManagementIntent(text: string): boolean {
   );
   if (mentionsSkill && skillMgmtAction) return true;
   if (/(帮我导入|能否导入|可以导入|导入.*skill|导入.*技能)/i.test(lowered)) return true;
+  return false;
+}
+
+/**
+ * Detects heavy MR/PR code review requests (with a codereview / pull / merge_requests URL)
+ * that should be delegated to a managed background `review` worker so they run
+ * asynchronously with Watchdog supervision, collapsible step timelines, and no blocking
+ * of Main Chat.
+ */
+export function hasHeavyReviewIntent(text: string): boolean {
+  const hasReviewUrl = /https?:\/\/[^\s]+\/(?:codereview|merge_requests|pull|pulls|reviews?)\/\d+/i.test(text);
+  if (hasReviewUrl) return true;
   return false;
 }
 

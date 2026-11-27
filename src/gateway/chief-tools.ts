@@ -274,28 +274,43 @@ export function registerChiefTools(gateway: CapabilityMcpGateway, deps: ChiefToo
 
   gateway.registerChiefTool({
     name: "timo_delegate_task",
-    description: "Create a background isolated-worktree engineering delivery task for one or more registered workspace Git repositories and post a single live Task Card into Main Chat.",
+    description:
+      "Delegate a background managed agent task and post a single live Task Card into Main Chat. Use mode='repo_delivery' (default) for isolated-worktree code modifications with verification, or mode='review' for long-running read-only MR/PR code reviews and deep codebase audits.",
     inputSchema: {
       type: "object",
       properties: {
-        requestText: { type: "string", description: "Clear engineering requirement or fix specification" },
+        requestText: { type: "string", description: "Clear engineering requirement, review target, or fix specification" },
+        mode: {
+          type: "string",
+          description: "Optional task mode: 'repo_delivery' (default, requires repoNames) or 'review' (read-only deep review/investigation)",
+        },
         repoNames: {
           type: "array",
           items: { type: "string" },
-          description: "Registered workspace folder names to mount in isolated git worktrees",
+          description: "Registered workspace folder names to mount (required for repo_delivery, optional read-only context for review)",
         },
         executorId: { type: "string", description: "Optional executor id (qwen-code|pi|codex|opencode)" },
-        checkCommand: { type: "string", description: "Optional custom verification command" },
+        checkCommand: { type: "string", description: "Optional custom verification command (repo_delivery only)" },
       },
-      required: ["requestText", "repoNames"],
+      required: ["requestText"],
     },
     handler: async (args) => {
       const requestText = typeof args.requestText === "string" ? args.requestText.trim() : "";
+      const mode = args.mode === "review" ? "review" : "repo_delivery";
       const repoNames = Array.isArray(args.repoNames)
         ? args.repoNames.filter((n): n is string => typeof n === "string" && n.trim() !== "").map((n) => n.trim())
         : [];
-      if (!requestText || repoNames.length === 0) {
-        return { isError: true, data: { code: "INVALID_INPUT", message: "requestText and non-empty repoNames are required" } };
+      if (!requestText || (mode === "repo_delivery" && repoNames.length === 0)) {
+        return {
+          isError: true,
+          data: {
+            code: "INVALID_INPUT",
+            message:
+              mode === "repo_delivery"
+                ? "requestText and non-empty repoNames are required for repo_delivery (or pass mode: 'review')"
+                : "requestText is required",
+          },
+        };
       }
       const settings = deps.settingsStore?.load();
       const folders = settings?.folders ?? [];
@@ -319,19 +334,6 @@ export function registerChiefTools(gateway: CapabilityMcpGateway, deps: ChiefToo
         const f = m.folder!;
         return { sourcePath: f.path, baseRef: resolveValidBaseRef(f.path, f.baseRef), name: f.name };
       });
-      const checkCmd = typeof args.checkCommand === "string" ? args.checkCommand.trim() : "";
-      const verificationPlan: VerificationPlan = checkCmd
-        ? {
-            version: "chief-check-v1",
-            steps: [{ type: "command_check", name: "verify", command: checkCmd, ...(repos.length === 1 ? { repo: repos[0]!.name } : {}) }],
-          }
-        : {
-            version: "auto-workspace-v1",
-            steps: matched
-              .map((m) => ({ repo: m.folder!.name, cmd: m.folder!.checkCommand || inspectLocalFolder(m.folder!.path).detectedCheckCommand }))
-              .filter((s): s is { repo: string; cmd: string } => Boolean(s.cmd))
-              .map((s) => ({ type: "command_check" as const, name: `verify-${s.repo}`, command: s.cmd, repo: s.repo })),
-          };
 
       const executorId =
         (typeof args.executorId === "string" && args.executorId.trim() !== "" ? args.executorId.trim() : undefined) ||
@@ -339,16 +341,43 @@ export function registerChiefTools(gateway: CapabilityMcpGateway, deps: ChiefToo
         "qwen-code";
       const model = settings?.assistant.executorModels[executorId] || undefined;
 
-      const created = deps.service.createTask({
-        requestId: `chief-task-${newId()}`,
-        kind: "repo_delivery",
-        requestText,
-        executorId,
-        model,
-        repos,
-        verificationPlan,
-        maxRepairRounds: settings?.assistant.defaultMaxRepairRounds ?? 2,
-      });
+      const created =
+        mode === "review"
+          ? deps.service.createTask({
+              requestId: `chief-review-${newId()}`,
+              kind: "review",
+              requestText,
+              executorId,
+              model,
+              repos,
+            })
+          : (() => {
+              const checkCmd = typeof args.checkCommand === "string" ? args.checkCommand.trim() : "";
+              const verificationPlan: VerificationPlan = checkCmd
+                ? {
+                    version: "chief-check-v1",
+                    steps: [
+                      { type: "command_check", name: "verify", command: checkCmd, ...(repos.length === 1 ? { repo: repos[0]!.name } : {}) },
+                    ],
+                  }
+                : {
+                    version: "auto-workspace-v1",
+                    steps: matched
+                      .map((m) => ({ repo: m.folder!.name, cmd: m.folder!.checkCommand || inspectLocalFolder(m.folder!.path).detectedCheckCommand }))
+                      .filter((s): s is { repo: string; cmd: string } => Boolean(s.cmd))
+                      .map((s) => ({ type: "command_check" as const, name: `verify-${s.repo}`, command: s.cmd, repo: s.repo })),
+                  };
+              return deps.service.createTask({
+                requestId: `chief-task-${newId()}`,
+                kind: "repo_delivery",
+                requestText,
+                executorId,
+                model,
+                repos,
+                verificationPlan,
+                maxRepairRounds: settings?.assistant.defaultMaxRepairRounds ?? 2,
+              });
+            })();
 
       if (deps.chatStore && deps.chatBus) {
         const card = deps.chatStore.append({

@@ -19,7 +19,7 @@ export interface ServiceConfig {
 /** Re-exported so the service config and the adapter share one config type. */
 export type T3RuntimeConfig = T3Config;
 
-export type TaskKind = "sse_log" | "repo_delivery" | "assistant_chat";
+export type TaskKind = "sse_log" | "repo_delivery" | "review" | "assistant_chat";
 
 export interface CreateTaskRequest {
   requestId: string;
@@ -115,7 +115,8 @@ export function defaultConfig(env: NodeJS.ProcessEnv, home: string): ServiceConf
     socketPath: join(home, "timo.sock"),
     pollIntervalMs: positiveInt(env.TIMO_POLL_INTERVAL_MS, 500),
     waitTimeoutMs: positiveInt(env.TIMO_WAIT_TIMEOUT_MS, 5_000),
-    runDeadlineMs: positiveInt(env.TIMO_RUN_DEADLINE_MS, 120_000),
+    // 0 = no artificial wall-clock kill; live agent runs are supervised by Watchdog + user Stop.
+    runDeadlineMs: positiveInt(env.TIMO_RUN_DEADLINE_MS, 0),
   };
 }
 

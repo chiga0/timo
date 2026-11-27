@@ -265,4 +265,66 @@ describe("Chat Attachments: storage, safety, persistence and prompt injection", 
       }
     });
   });
+
+  it("imposes no artificial wall-clock timeout by default and delegates MR/PR review URLs to background review tasks", async () => {
+    await withTempDir(async (dir) => {
+      const cfg = defaultConfig({}, dir);
+      assert.equal(cfg.runDeadlineMs, 0, "defaultConfig should not impose an arbitrary 120s kill limit");
+
+      const { service, db } = TaskService.open(cfg);
+      const chatStore = new ChatStore(db);
+      const chatBus = new ChatStreamBus();
+
+      let seenTimeoutMs: number | undefined = -1;
+      const fakeAdapter: ExecutionAdapter = {
+        id: "no-timeout-exec",
+        probe: async () => ({
+          id: "no-timeout-exec",
+          kind: "cli",
+          available: true,
+          capabilities: { streaming: true, resume: false, steer: false, mcpGateway: false, handoff: false, structuredOutput: false },
+        }),
+        spawn: async (req) => {
+          seenTimeoutMs = req.timeoutMs;
+          return { runId: req.runId, externalId: null, status: "succeeded", output: "ok", exitCode: 0 };
+        },
+        resume: async (runId) => ({ runId, externalId: null, status: "failed", output: "", exitCode: 1 }),
+        steer: async () => ({ accepted: false }),
+        interrupt: async () => ({ interrupted: true }),
+      };
+
+      const executors = new ExecutorRegistry();
+      executors.register(fakeAdapter);
+      await executors.probeAll();
+
+      const chatRunner = new MainChatRunner({
+        home: dir,
+        chatStore,
+        chatBus,
+        service,
+        executors,
+      });
+
+      try {
+        // 1. Regular chat turn must not pass any artificial timeoutMs
+        chatRunner.send({ text: "帮我解释一下这个设计原则", executorId: "no-timeout-exec" });
+        await new Promise((r) => setTimeout(r, 40));
+        assert.equal(seenTimeoutMs, undefined, "Main Chat should not impose an artificial timeoutMs by default");
+
+        // 2. Heavy MR/PR review URL delegates cleanly to a background managed `review` task
+        const reviewRes = chatRunner.send({
+          text: "帮我review: https://code.example.com/org/demo-repo/codereview/31525692",
+          executorId: "no-timeout-exec",
+        });
+        assert.equal(reviewRes.kind, "task");
+        if (reviewRes.kind === "task") {
+          const detail = service.getTask(reviewRes.taskId);
+          assert.equal(detail.kind, "review");
+          assert.equal(reviewRes.taskCardMessage.role, "task_card");
+        }
+      } finally {
+        service.close();
+      }
+    });
+  });
 });

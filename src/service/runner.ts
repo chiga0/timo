@@ -1,3 +1,4 @@
+import { existsSync } from "node:fs";
 import type { T3Client, T3ClientFactory } from "../adapters/t3.js";
 import { T3Error, buildPrompt } from "../adapters/t3.js";
 import { RetryTracker, failureFingerprint, DEFAULT_RETRY_POLICY, type RetryPolicy } from "../adapters/retry.js";
@@ -565,9 +566,9 @@ export class TaskRunner {
     const task = store.get(taskId);
     if (!task || !this.isTaskRunnable(task)) return;
 
-    // Route repo_delivery tasks or explicitly selected native executors through
+    // Route repo_delivery / review tasks or explicitly selected native executors through
     // the unified ExecutionAdapter + WorkspaceManager + VerificationPipeline.
-    if (task.kind === "repo_delivery" || (task.executorId && task.executorId !== "t3")) {
+    if (task.kind === "repo_delivery" || task.kind === "review" || (task.executorId && task.executorId !== "t3")) {
       await this.advanceWithAdapter(taskId);
       return;
     }
@@ -689,7 +690,7 @@ export class TaskRunner {
 
       // 3. Bounded wait on the fixed runId. Each re-issued wait is a fresh
       //    server-side timeout, so the local deadline bounds the loop.
-      const deadline = startedAt + this.options.runDeadlineMs;
+      const deadline = this.options.runDeadlineMs > 0 ? startedAt + this.options.runDeadlineMs : Number.POSITIVE_INFINITY;
       let finalStatus: string | null = null;
       while (Date.now() < deadline) {
         if (store.get(taskId)?.status === "stopping") {
@@ -818,6 +819,8 @@ export class TaskRunner {
         this.commitFailure(taskId, { reason: code, detail });
         return;
       }
+    } else if (task.kind === "review" && task.repos.length === 1 && existsSync(task.repos[0]!.sourcePath)) {
+      cwd = task.repos[0]!.sourcePath;
     } else {
       cwd = this.options.workspaces?.rootFor(taskId, generation) ?? process.cwd();
       if (this.options.workspaces && !this.options.workspaces.load(taskId, generation)) {
@@ -913,7 +916,7 @@ export class TaskRunner {
             cwd,
             prompt: currentPrompt,
             model: resolvedModel,
-            timeoutMs: this.options.runDeadlineMs,
+            ...(this.options.runDeadlineMs > 0 ? { timeoutMs: this.options.runDeadlineMs } : {}),
             mcpGatewayUrl,
           },
           handleEvent,
@@ -951,8 +954,8 @@ export class TaskRunner {
         return;
       }
 
-      // Zero-repo conversational / read-only assistant turn.
-      if (task.kind === "assistant_chat") {
+      // Zero-commit conversational or deep read-only review/audit background task.
+      if (task.kind === "assistant_chat" || task.kind === "review") {
         service.completeAssistantChat(taskId, runId, spawnResult.output ?? "", generation);
         return;
       }
@@ -1082,12 +1085,33 @@ export class TaskRunner {
         logText: input ? new TextDecoder().decode(input) : "",
       });
     }
-    if (view.task.kind === "assistant_chat") {
+    if (view.task.kind === "assistant_chat" || view.task.kind === "review") {
       const settings = this.options.settingsStore?.load();
       const skills = this.options.skillRegistry?.list(settings);
+      const repoPaths = view.task.repos.map((r) => r.sourcePath);
+      const repoNames = view.task.repos.map((r) => r.name);
       const settingsBlock = settings
-        ? formatAssembledContext(assembleTaskContext(settings, [], { skills, target: "chat" }))
+        ? formatAssembledContext(
+            assembleTaskContext(settings, repoPaths, {
+              skills,
+              target: view.task.kind === "review" ? "task" : "chat",
+              repoNames,
+            }),
+          )
         : "";
+      if (view.task.kind === "review") {
+        return [
+          settingsBlock,
+          `Review Task ${taskId} (Brief v${view.briefVersion}, Generation g${generation})`,
+          `Goal: ${view.brief.goal}`,
+          `Must:\n${view.brief.must.map((m) => `- ${m}`).join("\n")}`,
+          `Must Not:\n${view.brief.mustNot.map((m) => `- ${m}`).join("\n")}`,
+          repoPaths.length > 0 ? `Read-only Context Repos:\n${view.task.repos.map((r) => `- ${r.name}: ${r.sourcePath}`).join("\n")}` : "",
+          "Hard Safety Boundary: This is a read-only review/investigation task. NEVER modify or commit changes to any existing local repository checkout or user home directory. If you need to inspect a remote branch or MR diff, use read-only git commands or a temporary mkdtemp directory and clean it up afterwards. Output a clear, thorough, well-structured Markdown report in the user's language.",
+        ]
+          .filter(Boolean)
+          .join("\n\n");
+      }
       return [
         settingsBlock,
         `User Request: ${view.brief.goal}`,

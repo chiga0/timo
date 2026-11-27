@@ -623,7 +623,7 @@ export function TaskDetailView(props: {
                 </section>
               )}
 
-              {detail.kind !== "assistant_chat" && (
+              {detail.kind !== "assistant_chat" && detail.kind !== "review" && (
                 <section className="card">
                   <header className="card-head">
                     <span>独立验收</span>
