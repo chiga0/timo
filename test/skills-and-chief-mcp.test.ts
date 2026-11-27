@@ -9,7 +9,7 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 import { defaultConfig } from "../src/config.js";
 import { TaskService } from "../src/service/task-service.js";
 import { SettingsStore } from "../src/settings.js";
-import { SkillRegistry, parseSlashSkillInvocation, selectActiveSkills } from "../src/skills/registry.js";
+import { SkillRegistry, parseSkillMarkdown, parseSlashSkillInvocation, selectActiveSkills } from "../src/skills/registry.js";
 import { ChatStore, ChatStreamBus } from "../src/store/chat.js";
 import { MainChatRunner, isTimoManagementIntent } from "../src/service/chat-runner.js";
 import { resolveValidBaseRef, selectFoldersForRequest } from "../src/workspace/inspect.js";
@@ -435,6 +435,112 @@ describe("Timo Unified Skills, Main Chat Context Engine & Chief-of-Staff MCP", (
         assert.deepEqual(impJson.notFound, ["missing-skill"]);
         await client.close();
         gateway.revokeChief(chief.nonce);
+      } finally {
+        await gateway.close();
+        service.close();
+      }
+    });
+  });
+
+  it("supports all 6 YAML block scalars in parseSkillMarkdown, Chief HTTP /call bridge for non-MCP adapters (Pi), and full recent chat memory", async () => {
+    // 1. YAML block scalars (|, |-, |+, >, >-, >+)
+    const literal = parseSkillMarkdown("---\nname: s1\ndescription: |\n  第一行\n  第二行\nscope: global\n---\nBody", "s1");
+    assert.equal(literal.description, "第一行\n第二行");
+    assert.equal(literal.scope, "global");
+
+    const foldedStrip = parseSkillMarkdown("---\nname: s2\ndescription: >-\n  用于智能变更与发布，\n  支持回滚。\n\n  第二段说明。\nscope: chat\n---\nBody", "s2");
+    assert.equal(foldedStrip.description, "用于智能变更与发布， 支持回滚。\n第二段说明。");
+    assert.equal(foldedStrip.scope, "chat");
+
+    const literalStrip = parseSkillMarkdown("---\nname: s3\ndescription: |-\n    缩进四格\n      缩进六格\n---\nBody", "s3");
+    assert.equal(literalStrip.description, "缩进四格\n  缩进六格");
+
+    const folded = parseSkillMarkdown("---\nname: s4\ndescription: >\n  line one\n  line two\n---\nBody", "s4");
+    assert.equal(folded.description, "line one line two");
+
+    // 2. Chief HTTP JSON shortcut `/mcp/chief/:nonce/call` + Pi prompt bridge + long recent chat history
+    await withTempDir(async (dir) => {
+      const home = join(dir, "home");
+      const repoDir = join(dir, "timo");
+      mkdirSync(repoDir, { recursive: true });
+      writeFileSync(join(repoDir, "README.md"), "# timo\n", "utf8");
+      execFileSync("git", ["init", "-b", "main"], { cwd: repoDir });
+      execFileSync("git", ["config", "user.email", "test@example.com"], { cwd: repoDir });
+      execFileSync("git", ["config", "user.name", "Test"], { cwd: repoDir });
+      execFileSync("git", ["add", "README.md"], { cwd: repoDir });
+      execFileSync("git", ["commit", "-m", "init"], { cwd: repoDir });
+
+      const { service, db } = TaskService.open(defaultConfig({}, home));
+      const settingsStore = new SettingsStore(home, {});
+      settingsStore.save({ ...settingsStore.load(), folders: [{ id: "timo", name: "timo", path: repoDir, kind: "git", baseRef: "main" }] });
+      const chatStore = new ChatStore(db);
+      const chatBus = new ChatStreamBus();
+      const gateway = new CapabilityMcpGateway({ service, port: 0 });
+      registerChiefTools(gateway, { service, settingsStore, chatStore, chatBus });
+      await gateway.start();
+
+      // Seed a long >1000-char previous assistant message whose tail holds Option A/B
+      const longPrev = `${"背景分析 ".repeat(110)}\n\n## 方案选项\n- **A**: 修复 parseSkillMarkdown\n- **B**: 清理重复源`;
+      chatStore.append({ role: "user", content: "分析问题" });
+      chatStore.append({ role: "assistant", content: longPrev, status: "done" });
+
+      let capturedPrompt = "";
+      let capturedUrl = "";
+      const piLikeAdapter: ExecutionAdapter = {
+        id: "pi",
+        async probe() {
+          return { id: "pi", kind: "cli", available: true, capabilities: { stream: true, mcpGateway: false } };
+        },
+        async spawn(req: SpawnRequest): Promise<SpawnResult> {
+          capturedPrompt = req.prompt;
+          capturedUrl = req.mcpGatewayUrl ?? "";
+          // Simulate Pi calling the Chief HTTP shortcut via curl/fetch during the turn!
+          const callRes = await fetch(`${capturedUrl}/call`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({
+              tool: "timo_delegate_task",
+              args: { requestText: "修复 parseSkillMarkdown 块标量解析", repoNames: ["timo"] },
+            }),
+          });
+          assert.equal(callRes.status, 200);
+          const payload = (await callRes.json()) as { data?: { taskId?: string } };
+          assert.ok(payload.data?.taskId);
+          return { runId: req.runId, externalId: "pi-1", status: "succeeded", exitCode: 0, output: "已派发后台修复任务。" };
+        },
+        async resume() {
+          throw new Error("unused");
+        },
+        async steer() {
+          return { accepted: false };
+        },
+        async interrupt() {
+          return { interrupted: true };
+        },
+      };
+      const executors = new ExecutorRegistry();
+      executors.register(piLikeAdapter);
+      await executors.probeAll();
+
+      try {
+        const runner = new MainChatRunner({ home, chatStore, chatBus, service, executors, settingsStore, mcpGateway: gateway });
+        runner.send({ text: "A", executorId: "pi" });
+        await new Promise((r) => setTimeout(r, 80));
+
+        // Latest assistant message tail MUST NOT be truncated at 400 chars!
+        assert.match(capturedPrompt, /修复 parseSkillMarkdown/);
+        // Pi MUST receive HTTP `/call` bridge instructions instead of native MCP claim
+        assert.match(capturedPrompt, /TIMO_MCP_GATEWAY_URL\/call/);
+        // Delegated task + inline card MUST exist
+        assert.equal(service.listTasks(20, undefined, { archived: "all" }).length, 1);
+        assert.equal(chatStore.list(30).filter((m) => m.role === "task_card").length, 1);
+        // After turn finishes, `/call` with the old nonce MUST return 403 SESSION_REVOKED
+        const afterRes = await fetch(`${capturedUrl}/call`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ tool: "timo_list_tasks", args: {} }),
+        });
+        assert.equal(afterRes.status, 403);
       } finally {
         await gateway.close();
         service.close();

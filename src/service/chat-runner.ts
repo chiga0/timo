@@ -230,7 +230,10 @@ export class MainChatRunner {
     const chatCwd = readOnlyCwd || join(this.deps.home, "chat-cwd");
     mkdirSync(chatCwd, { recursive: true, mode: 0o700 });
     const chiefToken = this.deps.mcpGateway?.issueChiefToken();
-    const prompt = this.buildChatPrompt(userText, messageId, readOnlyCwd, Boolean(chiefToken));
+    const adapterDesc = this.deps.executors.snapshot().find((d) => d.id === adapter.id);
+    const hasNativeMcp = Boolean(chiefToken && adapterDesc?.capabilities?.mcpGateway);
+    const hasHttpBridge = Boolean(chiefToken && !hasNativeMcp);
+    const prompt = this.buildChatPrompt(userText, messageId, readOnlyCwd, { hasNativeMcp, hasHttpBridge });
 
     this.activeTurns.set(messageId, { executorId: adapter.id, runId });
     let accumulated = "";
@@ -322,7 +325,12 @@ export class MainChatRunner {
     }
   }
 
-  private buildChatPrompt(userText: string, currentAssistantMsgId: string, readOnlyCwd?: string, hasChiefMcp = false): string {
+  private buildChatPrompt(
+    userText: string,
+    currentAssistantMsgId: string,
+    readOnlyCwd?: string,
+    chiefAccess: { hasNativeMcp: boolean; hasHttpBridge: boolean } = { hasNativeMcp: false, hasHttpBridge: false },
+  ): string {
     const settings = this.deps.settingsStore?.load();
     const allSkills = this.deps.skillRegistry ? this.deps.skillRegistry.list(settings) : undefined;
     const slashMatch = allSkills ? parseSlashSkillInvocation(userText, allSkills) : null;
@@ -334,29 +342,40 @@ export class MainChatRunner {
 
     const sections: string[] = [
       "你是 Timo（提莫），用户的本地个人研发总助理（Chief of Staff）。",
-      "当前处于「主对话」会话中：请用简洁、清晰的中文 Markdown 直接回答用户问题；严禁在主对话中直接修改任何业务代码仓库文件、严禁创建 commit、严禁运行耗时的全量测试或破坏性命令。",
+      "核心行事原则（默认自主推进、少打扰人）：",
+      "- **直接行动，拒绝官僚式反复确认**：当用户已经表达明确意图（如「帮我搞定 / 帮我修复 / 托管 agent 完成 / 确认 / 全部搞定」）且不触及生产发布、合主干或删除数据等 Tier 2 红线时，**直接调用 `timo_delegate_task` 派发后台隔离 worktree 任务**（由后台执行器改代码并自动跑独立验收），不要再抛出“方案 A/B 选哪一个”“兼容策略请确认”之类的多余反问！只有在存在真正无法推断的业务歧义或红线风险时才向用户提问一次。",
+      "- **代码改动走后台任务，禁止在主对话直接改业务仓库**：严禁在主对话直接编辑本地 Git 业务代码文件或创建 commit；需要改代码时，请用 `timo_delegate_task` 派发后台 worktree 任务，让用户在主对话实时看到任务卡进展并在后台自动完成独立验收。",
       ...(managedSkillsDir
         ? [
-            `唯一的管理写操作例外：当用户明确要求导入、新建或更新 Timo 统一 Skill 时，优先调用 MCP 工具 \`timo_discover_external_skills\` / \`timo_import_skills\` / \`timo_save_skill\`；若当前执行器（例如 Pi）未原生挂载 MCP，你可以直接只读查看下方本机外部 Agent Skill 目录，并将对应 \`SKILL.md\` 脱敏复制或写入到 Timo 托管目录 \`${managedSkillsDir}/<skill-id>/SKILL.md\`，完成后向用户清晰汇报已导入清单与未找到项。`,
+            `- **Skill 资产管理可直接就地完成**：当用户要求导入、新建或修正 Timo 统一 Skill 时，优先调用 \`timo_discover_external_skills\` / \`timo_import_skills\` / \`timo_save_skill\`，或直接脱敏维护 \`${managedSkillsDir}/<skill-id>/SKILL.md\`。`,
           ]
         : []),
       ...(readOnlyCwd
-        ? [`本次对话的工作目录已定位到 \`${readOnlyCwd}\`，你可以直接只读查看其中的 git log、文档或代码文件来精准回答用户问题，但不要修改任何文件。`]
-        : ["当用户明确要求开发、修复或修改某个工作区仓库代码时，可通过 `timo_delegate_task` 或系统自动路由创建后台独立 Worktree 交付任务；否则你只需直接给出高质量回答或建议。"]),
+        ? [`- 本次对话的工作目录已定位到 \`${readOnlyCwd}\`，你可以直接只读查看其中的 git log、文档或代码文件来精准回答用户问题，但不要直接修改业务文件。`]
+        : []),
     ];
 
-    if (hasChiefMcp && this.deps.mcpGateway) {
+    if ((chiefAccess.hasNativeMcp || chiefAccess.hasHttpBridge) && this.deps.mcpGateway) {
       const toolNames = this.deps.mcpGateway.listChiefToolNames();
       if (toolNames.length > 0) {
+        const transportNote = chiefAccess.hasNativeMcp
+          ? `你已通过原生 MCP 连接到运行中的 Timo 控制面（可用工具：${toolNames.map((n) => `\`${n}\``).join("、")}）。`
+          : [
+              `Timo 控制面正在运行，且已向当前进程环境变量注入 \`TIMO_MCP_GATEWAY_URL\`（可用工具：${toolNames.map((n) => `\`${n}\``).join("、")}）。`,
+              "当前执行器未启用原生 MCP，请直接通过 bash 执行 HTTP POST 调用控制面工具（10ms 即时生效，严禁声称控制面未运行）：",
+              "```bash",
+              'curl -sS -X POST "$TIMO_MCP_GATEWAY_URL/call" -H "content-type: application/json" -d \'{"tool":"timo_delegate_task","args":{"requestText":"完整清晰的修复需求与验收标准","repoNames":["timo"]}}\'',
+              "```",
+            ].join("\n");
         sections.push(
           [
-            "## Timo 控制面工具（Chief-of-Staff MCP，已挂载）",
-            `你已连接到 Timo 本地控制面 MCP（可用工具：${toolNames.map((n) => `\`${n}\``).join("、")}）：`,
-            "- 查询任意任务详情/验收日志/实时进展 → 调用 `timo_get_task_detail` / `timo_list_tasks` / `timo_list_inbox`；",
-            "- 发现、查看、导入或保存 Timo 统一 Skill → 调用 `timo_discover_external_skills` / `timo_import_skills` / `timo_list_skills` / `timo_read_skill` / `timo_save_skill`；",
-            "- 用户明确要求派发代码改动任务 → 调用 `timo_delegate_task`（自动建隔离 worktree 并在主对话插入单张任务卡）；",
-            "- 用户要求修改进行中任务的目标 → 调用 `timo_propose_task_change`（生成两阶段 Diff 确认卡，由人拍板生效）；",
-            "- 用户要求重试失败任务或切换执行器交接 → 调用 `timo_retry_or_handoff_task`。",
+            "## Timo 控制面工具（Chief-of-Staff，已就绪）",
+            transportNote,
+            "- 派发后台代码修改/修复任务（自动建隔离 worktree + 独立验收 + 主对话插入单张任务卡）→ `timo_delegate_task`（参数：`requestText`, `repoNames: string[]`, 可选 `executorId`, `checkCommand`）；",
+            "- 查询任意任务详情/验收日志/实时进展 → `timo_get_task_detail` / `timo_list_tasks` / `timo_list_inbox`；",
+            "- 发现、查看、导入或保存 Timo 统一 Skill → `timo_discover_external_skills` / `timo_import_skills` / `timo_list_skills` / `timo_read_skill` / `timo_save_skill`；",
+            "- 修改进行中任务的目标（两阶段 Diff 确认）→ `timo_propose_task_change`；",
+            "- 重试失败任务或切换执行器交接（`g1 → g2`）→ `timo_retry_or_handoff_task`。",
           ].join("\n"),
         );
       }
@@ -425,17 +444,23 @@ export class MainChatRunner {
       );
     }
 
-    // Recent multi-turn Main Chat memory (last 8 messages before the current turn).
+    // Recent multi-turn Main Chat memory: preserve the latest 2 turns generously
+    // (up to 2,400 chars each) so Timo never forgets options/plans it just proposed!
     const history = this.deps.chatStore
       .list(24)
       .filter((m) => m.messageId !== currentAssistantMsgId && m.role !== "task_card" && m.content.trim() !== "")
       .slice(-9, -1);
     if (history.length > 0) {
+      const total = history.length;
       sections.push(
         "## 最近主对话上下文\n" +
           history
-            .map((m) => `${m.role === "user" ? "用户" : "Timo"}: ${m.content.slice(0, 400)}`)
-            .join("\n"),
+            .map((m, idx) => {
+              const limit = idx >= total - 2 ? 2400 : 800;
+              const clipped = m.content.length > limit ? `${m.content.slice(0, limit)}…（已截断）` : m.content;
+              return `${m.role === "user" ? "用户" : "Timo"}: ${clipped}`;
+            })
+            .join("\n\n"),
       );
     }
 

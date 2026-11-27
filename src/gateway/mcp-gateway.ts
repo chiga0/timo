@@ -79,6 +79,7 @@ export interface CapabilityMcpGatewayOptions {
 
 const MCP_PATH_RE = /^\/mcp\/([^/]+)\/(\d+)\/([^/]+)$/;
 const CHIEF_MCP_PATH_RE = /^\/mcp\/chief\/([^/]+)$/;
+const CHIEF_CALL_PATH_RE = /^\/mcp\/chief\/([^/]+)\/call$/;
 
 export class CapabilityMcpGateway {
   private readonly tools = new Map<string, GatewayToolDefinition>();
@@ -256,6 +257,62 @@ export class CapabilityMcpGateway {
 
   private async handleHttp(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const url = new URL(req.url ?? "/", `http://${this.host}`);
+
+    // Chief-of-Staff HTTP JSON shortcut (`/mcp/chief/:nonce/call`) so CLI adapters
+    // without native MCP config flags (e.g. Pi) can invoke the exact same scoped
+    // Chief-of-Staff tools via `$TIMO_MCP_GATEWAY_URL/call` with the same short-lived nonce.
+    const chiefCallMatch = CHIEF_CALL_PATH_RE.exec(url.pathname);
+    if (chiefCallMatch) {
+      const nonce = decodeURIComponent(chiefCallMatch[1]!);
+      if (!this.hasChiefNonce(nonce)) {
+        res.writeHead(403, { "content-type": "application/json; charset=utf-8" });
+        res.end(JSON.stringify({ error: { code: "SESSION_REVOKED", message: "chief session token is invalid or revoked" } }));
+        return;
+      }
+      if (req.method !== "POST") {
+        res.writeHead(405, { "content-type": "application/json; charset=utf-8" });
+        res.end(JSON.stringify({ error: { code: "method_not_allowed", message: "use POST" } }));
+        return;
+      }
+      let rawBody = "";
+      for await (const chunk of req) {
+        rawBody += typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8");
+        if (rawBody.length > 256 * 1024) {
+          res.writeHead(413, { "content-type": "application/json; charset=utf-8" });
+          res.end(JSON.stringify({ error: { code: "payload_too_large", message: "request body too large" } }));
+          return;
+        }
+      }
+      let body: Record<string, unknown>;
+      try {
+        body = JSON.parse(rawBody || "{}") as Record<string, unknown>;
+      } catch {
+        res.writeHead(400, { "content-type": "application/json; charset=utf-8" });
+        res.end(JSON.stringify({ error: { code: "invalid_json", message: "invalid JSON body" } }));
+        return;
+      }
+      const name = typeof body.tool === "string" ? body.tool.trim() : "";
+      const args = body.args && typeof body.args === "object" && !Array.isArray(body.args) ? (body.args as Record<string, unknown>) : {};
+      const tool = this.chiefTools.get(name);
+      if (!tool) {
+        res.writeHead(404, { "content-type": "application/json; charset=utf-8" });
+        res.end(JSON.stringify({ isError: true, code: "TOOL_NOT_FOUND", message: `unknown chief tool ${name}`, available: this.listChiefToolNames() }));
+        return;
+      }
+      try {
+        const result = await tool.handler(args, {
+          nonce,
+          service: this.options.service,
+          credentials: this.options.credentialsProvider ? this.options.credentialsProvider() : this.credentials,
+        });
+        res.writeHead(result.isError ? 400 : 200, { "content-type": "application/json; charset=utf-8" });
+        res.end(JSON.stringify(result));
+      } catch (error) {
+        res.writeHead(500, { "content-type": "application/json; charset=utf-8" });
+        res.end(JSON.stringify({ isError: true, data: { code: "TOOL_ERROR", message: error instanceof Error ? error.message : String(error) } }));
+      }
+      return;
+    }
 
     // Chief-of-Staff Main Chat MCP endpoint (isolated from Worker tools).
     const chiefMatch = CHIEF_MCP_PATH_RE.exec(url.pathname);

@@ -431,22 +431,107 @@ export function parseSkillMarkdown(
       body: normalized.trim(),
     };
   }
-  const fmText = fmMatch[1] ?? "";
+  const fmLines = (fmMatch[1] ?? "").split("\n");
   const body = (fmMatch[2] ?? "").trim();
   const meta: Record<string, string> = {};
-  for (const line of fmText.split("\n")) {
+
+  let i = 0;
+  while (i < fmLines.length) {
+    const line = fmLines[i]!;
     const kv = line.match(/^([A-Za-z0-9_-]+)\s*:\s*(.*)$/);
-    if (!kv) continue;
+    if (!kv) {
+      i += 1;
+      continue;
+    }
     const key = kv[1]!.toLowerCase();
-    const val = kv[2]!.trim().replace(/^["']|["']$/g, "");
-    meta[key] = val;
+    const rawVal = kv[2]!.trim();
+
+    // Support YAML block scalars: |, |-, |+, >, >-, >+
+    const blockHeader = rawVal.match(/^([|>])([+-])?$/);
+    if (blockHeader) {
+      const style = blockHeader[1]!;
+      const chomp = blockHeader[2] ?? "";
+      const blockLines: string[] = [];
+      i += 1;
+      while (i < fmLines.length) {
+        const next = fmLines[i]!;
+        if (next.trim() === "") {
+          blockLines.push("");
+          i += 1;
+          continue;
+        }
+        // Indented continuation line belongs to this block; top-level line ends the block.
+        if (/^[ \t]+/.test(next)) {
+          blockLines.push(next);
+          i += 1;
+          continue;
+        }
+        break;
+      }
+      meta[key] = decodeYamlBlockScalar(blockLines, style as "|" | ">", chomp as "" | "-" | "+").trim();
+      continue;
+    }
+
+    meta[key] = rawVal.replace(/^["']|["']$/g, "");
+    i += 1;
   }
+
   return {
     name: meta.name || fallbackName,
     description: meta.description || firstNonEmptyLine(body) || fallbackName,
     scope: meta.scope || "global",
     body,
   };
+}
+
+function decodeYamlBlockScalar(lines: string[], style: "|" | ">", chomp: "" | "-" | "+"): string {
+  // Trim trailing blank lines unless chomp is "+"
+  const work = [...lines];
+  let trailingBlanks = 0;
+  while (work.length > 0 && work[work.length - 1]!.trim() === "") {
+    work.pop();
+    trailingBlanks += 1;
+  }
+  if (work.length === 0) return "";
+
+  let minIndent = Infinity;
+  for (const l of work) {
+    if (l.trim() === "") continue;
+    const match = l.match(/^[ \t]*/);
+    const len = match ? match[0].length : 0;
+    if (len < minIndent) minIndent = len;
+  }
+  if (!Number.isFinite(minIndent)) minIndent = 0;
+  const stripped = work.map((l) => (l.trim() === "" ? "" : l.slice(minIndent)));
+
+  let joined: string;
+  if (style === "|") {
+    joined = stripped.join("\n");
+  } else {
+    // Folded scalar (`>`): consecutive non-empty lines fold with a single space;
+    // empty lines separate paragraphs with a newline.
+    const out: string[] = [];
+    for (let idx = 0; idx < stripped.length; idx += 1) {
+      const cur = stripped[idx]!;
+      if (cur === "") {
+        out.push("\n");
+      } else {
+        if (out.length > 0 && out[out.length - 1] !== "\n") {
+          out.push(" ");
+        }
+        out.push(cur);
+      }
+    }
+    joined = out.join("");
+  }
+
+  if (chomp === "+") {
+    return joined + "\n".repeat(trailingBlanks + 1);
+  }
+  if (chomp === "-") {
+    return joined;
+  }
+  return joined;
 }
 
 function serializeSkillMarkdown(input: { name: string; description: string; scope: string; body: string }): string {
