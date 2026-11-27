@@ -1,3 +1,5 @@
+import { TimoLogo } from "./TimoLogo.js";
+
 export function Topbar(props: {
   leftOpen: boolean;
   view: "chat" | "task" | "settings";
@@ -15,7 +17,7 @@ export function Topbar(props: {
           onClick={props.onGoHome}
           title="返回主对话"
         >
-          <span className="brand-mark">T</span>
+          <TimoLogo size={22} className="brand-logo" />
           <span>Timo</span>
         </button>
         {props.view !== "settings" && (

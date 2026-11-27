@@ -9,6 +9,7 @@ import {
 } from "../api.js";
 import { AgentLogo, agentLabel } from "./AgentIcons.js";
 import { Markdown } from "./Markdown.js";
+import { TimoLogo } from "./TimoLogo.js";
 import {
   ConversationMinimap,
   ScrollToBottomButton,
@@ -145,7 +146,7 @@ export function Thread(props: {
         <div className="thread-inner" ref={innerRef}>
         {props.messages.length === 0 ? (
           <div className="welcome">
-            <div className="welcome-mark">T</div>
+            <TimoLogo size={60} className="welcome-logo" />
             <h1 className="welcome-title">我是 Timo，一切交给我，除了隐私。</h1>
             <div className="starter-row">
               {STARTER_PROMPTS.map((prompt) => (
@@ -241,7 +242,7 @@ export function Thread(props: {
             return (
               <div key={msg.messageId} className="msg-assistant">
                 <div className="msg-assistant-head">
-                  <span className="msg-avatar">T</span>
+                  <TimoLogo size={20} className="msg-avatar-logo" />
                   <span className="msg-assistant-name">Timo</span>
                   {msg.executorId && (
                     <span className="msg-agent-tag">

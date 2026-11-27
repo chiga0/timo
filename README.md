@@ -1,4 +1,8 @@
-# Timo · 提莫
+<p align="center">
+  <img src="docs/assets/timo-logo.svg" alt="Timo Logo" width="64" height="64" />
+</p>
+
+<h1 align="center">Timo</h1>
 
 <p align="center">
   <a href="https://github.com/chiga0/timo/actions/workflows/ci.yml"><img src="https://github.com/chiga0/timo/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
@@ -15,7 +19,7 @@
 
 Timo 是一个运行在你本机的研发总助理（Chief of Staff）与异步交付控制面。它**绝不自研 Agent Loop / Harness**，而是通过统一的 `ExecutionAdapter` 调度你本机已安装并登录的成熟 Coding Agent（**Pi**、**Qwen Code**、**Codex**、**OpenCode** 及可选 **T3 Code**），由 Timo 掌控全局主对话、自主多仓 Git Worktree、三层分级授权与本地 Capability MCP Gateway、两级 Watchdog 巡检、不可变交接（`g1 → g2`）以及独立验收门禁。
 
-> “提莫，帮我查一下 `order-api` 的超时重试问题，顺便补齐单测，等验证通过再告诉我。这次不要发布。”
+> “Timo，帮我查一下 `order-api` 的超时重试问题，顺便补齐单测，等验证通过再告诉我。这次不要发布。”
 
 <p align="center">
   <img src="docs/assets/workbench-light.png" alt="Timo 极简黑白 Web 工作台（浅色模式）" width="100%" />

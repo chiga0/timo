@@ -127,6 +127,11 @@ button {
   background: var(--muted-bg);
 }
 
+.brand-logo {
+  display: block;
+  flex-shrink: 0;
+}
+
 .brand-mark {
   display: grid;
   place-items: center;
@@ -1186,6 +1191,12 @@ button {
   gap: 14px;
 }
 
+.welcome-logo {
+  display: block;
+  border-radius: 15px;
+  box-shadow: var(--shadow-sm);
+}
+
 .welcome-mark {
   display: grid;
   place-items: center;
@@ -1603,6 +1614,11 @@ button {
   align-items: center;
   gap: 7px;
   font-size: 12px;
+}
+
+.msg-avatar-logo {
+  display: block;
+  flex-shrink: 0;
 }
 
 .msg-avatar {

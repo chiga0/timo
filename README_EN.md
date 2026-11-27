@@ -1,4 +1,8 @@
-# Timo
+<p align="center">
+  <img src="docs/assets/timo-logo.svg" alt="Timo Logo" width="64" height="64" />
+</p>
+
+<h1 align="center">Timo</h1>
 
 <p align="center">
   <a href="https://github.com/chiga0/timo/actions/workflows/ci.yml"><img src="https://github.com/chiga0/timo/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
