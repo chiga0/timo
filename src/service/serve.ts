@@ -13,6 +13,8 @@ import { createMcpT3Client } from "../adapters/t3.js";
 import { ExecutorRegistry } from "../adapters/execution.js";
 import { PiAdapter } from "../adapters/pi.js";
 import { QwenCodeAdapter } from "../adapters/qwen-code.js";
+import { CodexAdapter } from "../adapters/codex.js";
+import { OpenCodeAdapter } from "../adapters/opencode.js";
 import { T3ExecutionAdapter } from "../adapters/t3-adapter.js";
 import { WorkspaceManager } from "../workspace/manager.js";
 import { RunStreamStore } from "../workspace/run-stream.js";
@@ -55,9 +57,11 @@ export async function serve(): Promise<void> {
   const workspaces = new WorkspaceManager({ home: join(home, "workspaces") });
   const runStreams = new RunStreamStore(home);
   const executors = new ExecutorRegistry();
-  // Register local qwen-code first as the primary resident coding agent, plus pi & optional t3.
-  executors.register(new QwenCodeAdapter());
+  // Register the 4 resident native CLI agents: pi, qwen-code, codex, opencode (+ optional t3).
   executors.register(new PiAdapter());
+  executors.register(new QwenCodeAdapter());
+  executors.register(new CodexAdapter());
+  executors.register(new OpenCodeAdapter());
   if (t3) {
     executors.register(new T3ExecutionAdapter({ clientFactory: () => Promise.resolve(createMcpT3Client(t3)) }));
   }

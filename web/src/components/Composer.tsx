@@ -63,8 +63,10 @@ export function Composer(props: {
     props.executors.length > 0
       ? props.executors
       : [
-          { id: "qwen-code", kind: "cli" as const, available: true, capabilities: {} },
           { id: "pi", kind: "cli" as const, available: true, capabilities: {} },
+          { id: "qwen-code", kind: "cli" as const, available: true, capabilities: {} },
+          { id: "codex", kind: "cli" as const, available: true, capabilities: {} },
+          { id: "opencode", kind: "cli" as const, available: true, capabilities: {} },
         ];
 
   return (
