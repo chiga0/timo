@@ -13,16 +13,24 @@ import {
   type WaitingReason,
 } from "../store/tasks.js";
 import { ArtifactStore } from "../store/artifacts.js";
-import { analyzeLog, verifyCandidate, SSE_VERIFIER_VERSION, type Finding } from "../sse/contract.js";
+import { analyzeLog, verifyCandidate as verifyCandidateSync, SSE_VERIFIER_VERSION, type Finding } from "../sse/contract.js";
 import { sha256Hex, newId, toIso, stableJson } from "../util.js";
 import { ensureHome } from "../home.js";
 import { TypedEventBus } from "../events/bus.js";
-import { TransitionWriter, JOB_DISPATCH } from "../events/writer.js";
-import type { ServiceConfig, CreateTaskRequest, CreateTaskResponse, GetTaskResponse } from "../config.js";
+import { TransitionWriter, JOB_DISPATCH, JOB_POLL_CI } from "../events/writer.js";
+import type { ServiceConfig, CreateTaskRequest, CreateTaskResponse, GetTaskResponse, RepoDeliveryState, TaskKind } from "../config.js";
 import { AuthorizationEvaluator } from "../auth/evaluator.js";
-import { DEFAULT_POLICY, describePolicy, parsePolicy, type LoadedPolicy } from "../auth/policy.js";
-import { Inbox, type DecisionKey, type InboxItem } from "../auth/inbox.js";
+import { DEFAULT_POLICY, describePolicy, type LoadedPolicy, type StandingPolicy } from "../auth/policy.js";
+import { Inbox, type InboxItem } from "../auth/inbox.js";
 import { ProposalStore, ProposalConflictError, type Proposal, type ProposalChange } from "../auth/proposals.js";
+import {
+  VerifierRegistry,
+  computeRepoCandidateDigest,
+  type PipelineOutcome,
+  type VerificationFinding,
+  type VerificationPlan,
+} from "../verify/pipeline.js";
+import { basename } from "node:path";
 
 export class TaskNotFoundError extends Error {
   override readonly name = "TaskNotFoundError";
@@ -41,6 +49,8 @@ export interface TaskServiceDeps {
   writer: TransitionWriter;
   /** Loaded standing policy; defaults apply when no file is present. */
   policy?: LoadedPolicy;
+  /** Declarative verification registry; defaults to built-in plugins. */
+  verifiers?: VerifierRegistry;
   now?: () => Date;
 }
 
@@ -61,6 +71,7 @@ export class TaskService {
   private readonly evaluator: AuthorizationEvaluator;
   private readonly proposalStore: ProposalStore;
   private readonly inboxStore: Inbox;
+  private readonly verifierRegistry: VerifierRegistry;
 
   constructor(private readonly deps: TaskServiceDeps) {
     this.db = deps.db;
@@ -72,6 +83,7 @@ export class TaskService {
     this.evaluator = new AuthorizationEvaluator(this.loadedPolicy.policy);
     this.proposalStore = new ProposalStore(this.db);
     this.inboxStore = new Inbox(this.db);
+    this.verifierRegistry = deps.verifiers ?? new VerifierRegistry();
   }
 
   static open(
@@ -136,20 +148,42 @@ export class TaskService {
     return this.writer.outbox;
   }
 
+  get verifiers(): VerifierRegistry {
+    return this.verifierRegistry;
+  }
+
+  get standingPolicy(): StandingPolicy {
+    return this.loadedPolicy.policy;
+  }
+
+  /** Read-only view of the task's current grants & execution generation (for Capability MCP Gateway). */
+  getTaskView(taskId: string) {
+    return this.store.view(taskId);
+  }
+
   close(): void {
     this.db.close();
   }
 
   /**
-   * Accepts a task and freezes its input. Dedupes on `requestId`: identical
-   * bytes return the original task, different bytes conflict.
+   * Accepts a task and freezes its input. Supports both legacy zero-repo SSE
+   * log diagnosis (`sse_log`) and multi-repo delivery (`repo_delivery`).
+   * Dedupes on `requestId`: identical payload returns the original task,
+   * different payload conflicts.
    */
   createTask(request: CreateTaskRequest): CreateTaskResponse & { reused: boolean } {
     const requestId = request.requestId.trim();
     if (requestId === "" || requestId.length > 200 || /[\r\n]/.test(requestId)) {
       throw new InvalidInputError("--request-id must be a non-empty single-line string of at most 200 characters");
     }
+
+    const kind: TaskKind = request.kind ?? (request.repos && request.repos.length > 0 ? "repo_delivery" : "sse_log");
+    if (kind === "repo_delivery") {
+      return this.createRepoDeliveryTask(requestId, request);
+    }
+
     const input = request.log;
+    if (!input) throw new InvalidInputError("log input is required for sse_log tasks");
     if (input.byteLength > 32 * 1024) throw new InvalidInputError("log input exceeds 32 KiB");
     if (!isValidUtf8(input)) throw new InvalidInputError("log input is not valid UTF-8");
 
@@ -171,8 +205,14 @@ export class TaskService {
 
     const now = toIso(this.now());
     const taskId = newId();
+    const verificationPlan: VerificationPlan = request.verificationPlan ?? {
+      version: SSE_VERIFIER_VERSION,
+      steps: [{ type: "log_citation", name: "sse-v1" }],
+    };
     const { task } = this.store.createTask({
       taskId,
+      kind: "sse_log",
+      executorId: request.executorId ?? null,
       requestId,
       requestDigest,
       inputDigest,
@@ -187,10 +227,19 @@ export class TaskService {
       grants: [
         { action: "read_log", resource: `artifact:${inputDigest}`, environment: null, identity: null, expiresAt: null },
         { action: "dispatch_analysis", resource: "t3:thread", environment: null, identity: "task-executor", expiresAt: null },
+        ...(request.grants ?? []).map((g) => ({
+          action: g.action,
+          resource: g.resource,
+          environment: g.environment ?? null,
+          identity: g.identity ?? null,
+          expiresAt: g.expiresAt ?? null,
+        })),
       ],
-      environment: "t3-mcp",
+      verificationPlan,
+      maxRepairRounds: request.maxRepairRounds ?? 0,
+      environment: request.executorId ?? "t3-mcp",
       providerInstanceId: "pending",
-      model: "pending",
+      model: request.model ?? "pending",
       now,
     });
 
@@ -199,7 +248,7 @@ export class TaskService {
     this.writer.commit({
       taskId,
       type: "task_created",
-      payload: { inputDigest, requestId, artifactPath: artifact.path },
+      payload: { inputDigest, requestId, artifactPath: artifact.path, kind: "sse_log" },
       options: {
         idempotencyKey: "created",
         now,
@@ -234,12 +283,124 @@ export class TaskService {
     return { taskId, status: this.store.get(taskId)!.status, reused: false };
   }
 
+  private createRepoDeliveryTask(requestId: string, request: CreateTaskRequest): CreateTaskResponse & { reused: boolean } {
+    const repos = request.repos ?? [];
+    if (repos.length === 0) {
+      throw new InvalidInputError("repo_delivery tasks require at least one repo");
+    }
+    const requestText = request.requestText?.trim() ?? "";
+    if (requestText === "") {
+      throw new InvalidInputError("repo_delivery tasks require a non-empty requestText");
+    }
+    const normalizedRepos: RepoDeliveryState[] = repos.map((repo) => {
+      if (!repo.sourcePath?.trim() || !repo.baseRef?.trim()) {
+        throw new InvalidInputError("each repo must specify sourcePath and baseRef");
+      }
+      return {
+        name: repo.name?.trim() || basename(repo.sourcePath),
+        sourcePath: repo.sourcePath,
+        baseRef: repo.baseRef,
+      };
+    });
+    const verificationPlan: VerificationPlan = request.verificationPlan ?? {
+      version: "pipeline-v1",
+      steps: [{ type: "command_check", name: "default-check", command: "npm test" }],
+    };
+    const specBytes = Buffer.from(
+      stableJson({
+        kind: "repo_delivery",
+        requestText,
+        executorId: request.executorId ?? "pi",
+        repos: normalizedRepos,
+        verificationPlan,
+      }),
+      "utf8",
+    );
+    const inputDigest = sha256Hex(specBytes);
+    const requestDigest = sha256Hex(Buffer.from(stableJson({ requestId, inputDigest, requestText }), "utf8"));
+
+    const existing = this.store.findByRequestId(requestId);
+    if (existing) {
+      if (existing.requestDigest !== requestDigest) {
+        throw new RequestConflictError(`request id ${requestId} was already used with different content`);
+      }
+      return { taskId: existing.taskId, status: existing.status, reused: true };
+    }
+
+    const artifact = this.artifacts.put(new Uint8Array(specBytes));
+    const now = toIso(this.now());
+    const taskId = newId();
+    const maxRepairRounds =
+      typeof request.maxRepairRounds === "number" && Number.isInteger(request.maxRepairRounds) && request.maxRepairRounds >= 0
+        ? Math.min(request.maxRepairRounds, this.loadedPolicy.policy.budget.maxAttempts)
+        : 2;
+
+    this.store.createTask({
+      taskId,
+      kind: "repo_delivery",
+      executorId: request.executorId ?? "pi",
+      requestId,
+      requestDigest,
+      inputDigest,
+      artifactPath: artifact.path,
+      requestText,
+      brief: {
+        goal: requestText,
+        must: ["在独立 worktree 中完成修改并提交候选 commit", "通过声明式独立验收管线且绑定精确候选 SHA"],
+        mustNot: ["禁止生产发布（deploy_prod）", "禁止修改原仓库工作目录", "禁止绕过独立验收自报通过"],
+        evidence: verificationPlan.steps.map((step) => `${step.type}:${step.name ?? ("repo" in step ? step.repo ?? "all" : "check")}`),
+      },
+      grants: [
+        { action: "read_worktree", resource: "*", environment: "dev", identity: "task-executor", expiresAt: null },
+        { action: "write_worktree", resource: "*", environment: "dev", identity: "task-executor", expiresAt: null },
+        { action: "run_local_tests", resource: "*", environment: "dev", identity: "task-executor", expiresAt: null },
+        { action: "read_ci_status", resource: "*", environment: "dev", identity: "task-executor", expiresAt: null },
+        ...(request.grants ?? []).map((g) => ({
+          action: g.action,
+          resource: g.resource,
+          environment: g.environment ?? null,
+          identity: g.identity ?? null,
+          expiresAt: g.expiresAt ?? null,
+        })),
+      ],
+      repos: normalizedRepos,
+      verificationPlan,
+      maxRepairRounds,
+      environment: request.executorId ?? "pi",
+      providerInstanceId: request.executorId ?? "pi",
+      model: request.model ?? "default",
+      now,
+    });
+
+    this.writer.commit({
+      taskId,
+      type: "task_created",
+      payload: {
+        kind: "repo_delivery",
+        inputDigest,
+        requestId,
+        executorId: request.executorId ?? "pi",
+        repos: normalizedRepos.map((r) => ({ name: r.name, baseRef: r.baseRef })),
+      },
+      options: {
+        idempotencyKey: "created",
+        now,
+        enqueue: [{ kind: JOB_DISPATCH, dedupeKey: "initial" }],
+      },
+    });
+
+    return { taskId, status: this.store.get(taskId)!.status, reused: false };
+  }
+
   getTask(taskId: string): GetTaskResponse {
     const view = this.store.view(taskId);
     if (!view) throw new TaskNotFoundError(`task ${taskId} not found`);
     const { task } = view;
+    const operations = this.store.listOperations(taskId);
     return {
       taskId: task.taskId,
+      kind: task.kind,
+      executorId: task.executorId,
       status: task.status,
       waitingReason: task.waitingReason,
       inputDigest: task.inputDigest,
@@ -248,8 +409,26 @@ export class TaskService {
       result: task.result,
       failureReason: task.failureReason,
       verification: view.verification
-        ? { result: view.verification.result, verifierVersion: view.verification.verifierVersion, findings: view.verification.findings, createdAt: view.verification.createdAt }
+        ? {
+            result: view.verification.result,
+            verifierVersion: view.verification.verifierVersion,
+            findings: view.verification.findings,
+            createdAt: view.verification.createdAt,
+            stale: view.verification.stale,
+            candidateDigest: view.verification.candidateDigest,
+          }
         : null,
+      repos: task.repos,
+      verificationPlan: task.verificationPlan,
+      operations: operations.map((op) => ({
+        operationId: op.operationId,
+        kind: op.kind,
+        status: op.status,
+        operationKey: op.operationKey,
+        clientRequestId: op.clientRequestId,
+        receipt: op.receipt,
+        reconciledAt: op.reconciledAt,
+      })),
       lastObservedAt: task.updatedAt,
       // Callers need this to send a correct `expectedBriefVersion` to amend.
       briefVersion: view.briefVersion,
@@ -283,7 +462,7 @@ export class TaskService {
     }
     const input = this.artifacts.get(view.task.artifactPath);
     const now = toIso(this.now());
-    const outcome = verifyCandidate(input, view.task.inputDigest, candidate);
+    const outcome = verifyCandidateSync(input, view.task.inputDigest, candidate);
     const candidateDigest = sha256Hex(Buffer.from(stableJson(candidate), "utf8"));
 
     const verification = {
@@ -316,6 +495,7 @@ export class TaskService {
             : { reason: "candidate rejected by sse-v1 verifier", findings: rejectedFindings },
       options: { idempotencyKey: `verification:${outcome.status}:${candidateDigest.slice(0, 16)}`, now },
       project: () => {
+        this.store.invalidateStaleVerifications(taskId, candidateDigest);
         this.store.recordCandidate({
           taskId,
           taskRunId,
@@ -328,7 +508,7 @@ export class TaskService {
         this.store.setEvidence(
           taskId,
           "lastVerification",
-          { result: outcome.status, verifierVersion: outcome.verifierVersion, at: now },
+          { result: outcome.status, verifierVersion: outcome.verifierVersion, candidateDigest, at: now },
           now,
         );
         if (outcome.status === "accepted" && seal) {
@@ -348,6 +528,167 @@ export class TaskService {
       },
     });
     return { status: outcome.status, findings: rejectedFindings };
+  }
+
+  /**
+   * Updates per-repo delivery state (baseSha, headSha, MR/CI metadata). When
+   * any repo's candidate headSha changes, all prior verifications bound to the
+   * older candidate combination are automatically marked `stale = 1` so stale
+   * evidence can never satisfy completion.
+   */
+  updateRepoStates(taskId: string, repos: RepoDeliveryState[]): { candidateDigest: string | null; invalidated: number } {
+    const view = this.store.view(taskId);
+    if (!view) throw new TaskNotFoundError(`task ${taskId} not found`);
+    const now = toIso(this.now());
+    this.store.setRepos(taskId, repos, now);
+    const withHead = repos.filter((r): r is RepoDeliveryState & { headSha: string } => typeof r.headSha === "string" && r.headSha.trim() !== "");
+    if (withHead.length === 0) return { candidateDigest: null, invalidated: 0 };
+    const candidateDigest = computeRepoCandidateDigest(withHead);
+    const invalidated = this.store.invalidateStaleVerifications(taskId, candidateDigest);
+    if (invalidated > 0) {
+      this.store.setEvidence(taskId, "lastInvalidatedDigest", { candidateDigest, invalidated, at: now }, now);
+    }
+    return { candidateDigest, invalidated };
+  }
+
+  /**
+   * Explicitly checks whether the latest verification for `taskId` is fresh
+   * (non-stale, `accepted`) and matches `expectedCandidateDigest`.
+   */
+  hasFreshAcceptedVerification(taskId: string, expectedCandidateDigest: string): boolean {
+    const verifications = this.store.listVerifications(taskId);
+    const latest = verifications[0];
+    if (!latest) return false;
+    return !latest.stale && latest.result === "accepted" && latest.candidateDigest === expectedCandidateDigest;
+  }
+
+  /**
+   * Commits the outcome of a declarative `VerificationPipeline` run for a
+   * `repo_delivery` task. Rejects stale candidates, parks `waiting_external`
+   * tasks in `waiting_external_ci` with a 0-Token outbox poller job, and only
+   * transitions to `completed` when all verification steps pass on the exact
+   * current candidate commits.
+   */
+  recordPipelineVerification(
+    taskId: string,
+    taskRunId: string,
+    outcome: PipelineOutcome,
+    options: { finalFailure?: boolean; ciPollDelayMs?: number } = {},
+  ): { status: string; findings: VerificationFinding[] } {
+    const view = this.store.view(taskId);
+    if (!view) throw new TaskNotFoundError(`task ${taskId} not found`);
+    if (view.task.status === "stopping" || view.task.status === "stopped") {
+      const now = toIso(this.now());
+      this.store.setEvidence(taskId, "lateCandidate", { outcome, runId: taskRunId, status: view.task.status, observedAt: now }, now);
+      return { status: "ignored_after_stop", findings: [] };
+    }
+
+    const now = toIso(this.now());
+    const currentRepos = view.task.repos.filter((r): r is RepoDeliveryState & { headSha: string } => typeof r.headSha === "string" && r.headSha !== "");
+    const currentDigest = currentRepos.length > 0 ? computeRepoCandidateDigest(currentRepos) : outcome.candidateDigest;
+    const isStaleCandidate = outcome.candidateDigest !== currentDigest;
+    const effectiveStatus = isStaleCandidate ? "rejected" : outcome.status;
+    const effectiveFindings: VerificationFinding[] = isStaleCandidate
+      ? [
+          ...outcome.findings,
+          {
+            code: "stale_candidate",
+            detail: `verification bound to ${outcome.candidateDigest.slice(0, 12)} but current candidate is ${currentDigest.slice(0, 12)}`,
+          },
+        ]
+      : outcome.findings;
+
+    const seal: TaskResult | null =
+      effectiveStatus === "accepted"
+        ? {
+            verdict: "verified",
+            inputDigest: view.task.inputDigest,
+            verifierVersion: outcome.verifierVersion,
+            candidateDigest: outcome.candidateDigest,
+            boundCommits: outcome.boundCommits,
+            steps: outcome.steps.map((s) => ({
+              stepName: s.stepName,
+              stepType: s.stepType,
+              status: s.status,
+              exitCode: s.exitCode ?? null,
+              boundCommits: s.boundCommits,
+            })),
+            productionDeployed: false,
+          }
+        : null;
+
+    const eventType =
+      effectiveStatus === "accepted"
+        ? "task_completed"
+        : effectiveStatus === "waiting_external"
+          ? "task_waiting"
+          : options.finalFailure
+            ? "task_failed"
+            : "verification_recorded";
+
+    const pollRunAfter = toIso(new Date(this.now().getTime() + (options.ciPollDelayMs ?? 2_000)));
+    const nonce = newId().slice(0, 8);
+
+    this.writer.commit({
+      taskId,
+      type: eventType,
+      payload:
+        effectiveStatus === "accepted"
+          ? { result: seal }
+          : effectiveStatus === "waiting_external"
+            ? { waitingReason: "waiting_external_ci", boundCommits: outcome.boundCommits, findings: effectiveFindings }
+            : { status: effectiveStatus, candidateDigest: outcome.candidateDigest, findings: effectiveFindings },
+      options: {
+        idempotencyKey: `pipeline:${effectiveStatus}:${outcome.candidateDigest.slice(0, 12)}:${nonce}`,
+        now,
+        enqueue:
+          effectiveStatus === "waiting_external"
+            ? [{ kind: JOB_POLL_CI, dedupeKey: `ci:${outcome.candidateDigest.slice(0, 12)}:${nonce}`, runAfter: pollRunAfter }]
+            : [],
+      },
+      project: () => {
+        this.store.invalidateStaleVerifications(taskId, currentDigest);
+        this.store.recordCandidate({
+          taskId,
+          taskRunId,
+          briefVersion: view.briefVersion,
+          candidate: { boundCommits: outcome.boundCommits, steps: outcome.steps },
+          candidateDigest: outcome.candidateDigest,
+          verification: {
+            result: effectiveStatus,
+            verifierVersion: outcome.verifierVersion,
+            findings: effectiveFindings,
+            environment: "isolated-worktree",
+          },
+          now,
+        });
+        if (isStaleCandidate) {
+          this.store.invalidateStaleVerifications(taskId, currentDigest);
+        }
+        this.store.setEvidence(
+          taskId,
+          "lastVerification",
+          { result: effectiveStatus, verifierVersion: outcome.verifierVersion, candidateDigest: outcome.candidateDigest, boundCommits: outcome.boundCommits, at: now },
+          now,
+        );
+        if (effectiveStatus === "accepted" && seal) {
+          this.store.setResult(taskId, seal, now);
+          this.store.setStatus(taskId, "completed", null, now);
+          this.store.setOperationStatus(`${taskId}:dispatch`, "done", { result: "completed", candidateDigest: outcome.candidateDigest }, now);
+          this.store.enqueueNotification(taskId, "task_completed", seal, now);
+        } else if (effectiveStatus === "waiting_external") {
+          this.store.setStatus(taskId, "waiting", "waiting_external_ci", now);
+          this.store.enqueueNotification(taskId, "waiting_external_ci", { boundCommits: outcome.boundCommits }, now);
+        } else if (options.finalFailure) {
+          const reason = effectiveFindings.map((f) => `${f.code}: ${f.detail}`).join("; ") || "verification failed";
+          this.store.setStatus(taskId, "failed", null, now);
+          this.store.setFailure(taskId, reason, now);
+          this.store.setOperationStatus(`${taskId}:dispatch`, "done", { result: "failed", reason }, now);
+          this.store.enqueueNotification(taskId, "task_failed", { findings: effectiveFindings }, now);
+        }
+      },
+    });
+    return { status: effectiveStatus, findings: effectiveFindings };
   }
 
   markWaiting(taskId: string, reason: WaitingReason, now = toIso(this.now())): void {

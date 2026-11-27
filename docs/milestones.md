@@ -4,7 +4,7 @@
 
 **架构定案原则**：绝不自研 Agent Loop / Harness，不 Fork T3 Code；基于当前 `timo` 仓库自主演进事件驱动控制面、总助理分级委派授权、两级 Watchdog、自主多仓 Worktree、本地 Capability MCP Gateway 与极简黑白（Tailwind + shadcn/ui）Web 工作台，并通过统一 `ExecutionAdapter` 复用成熟外部运行时（Codex / OpenCode / Pi，以及保留为可选适配器的 T3 Code）。
 
-**当前状态（2026-11-26）：M0、M1.1–M1.5（Sprint 1–2）均已通过工程与构建验收（`npm run typecheck && npm run build && npm test` 103 项全通过）；即将启动 Sprint 3（M1.6：自主 Worktree + 原生 CLI 适配器 + 真实单测验收，开启 Timo 自用）。** 关联文档：[README](../README.md)、[架构](architecture.md)、[领域模型](domain-model.md)、[技术设计](technical-design.md)、[执行器与 T3 决策](t3-adoption.md)、[托管开发任务书](implementation-plan.md)、[验收剧本](acceptance.md)、[产品设计 HTML](product.html)。
+**当前状态（2026-11-26）：M0、M1.1–M1.6（Sprint 1–3）与 M2（Sprint 4）的工程实现及 `FIXTURE` 全套自动化验收均已通过（`npm run typecheck && npm run build && npm test` 138 项全通过，本机 `pi 1.6.0` Preflight 探测就绪）；待在获准账号与网络环境下完成 1 次 M1.6 真实自用试点与 M2 真实双仓 MR/CI `REAL` 复核后，即可勾选对应真实退出条件并推进 Sprint 5（M3）。** 关联文档：[README](../README.md)、[架构](architecture.md)、[领域模型](domain-model.md)、[技术设计](technical-design.md)、[执行器与 T3 决策](t3-adoption.md)、[托管开发任务书](implementation-plan.md)、[验收剧本](acceptance.md)、[产品设计 HTML](product.html)。
 
 > **托管开发派发入口**：每个冲刺与里程碑已进一步拆解为可直接托管给外部 Agent 的原子任务包（含前置依赖、改动边界、禁止越界项、必含反例测试与可执行验收命令），详见 [托管开发任务书与逐阶段验收合同](implementation-plan.md)。
 
@@ -29,37 +29,35 @@
 
 ## M1：从本地 CLI 闭环演进到事件驱动控制面与极简黑白 Web 自用
 
-### 已完成切片（M1.1–M1.5）
+### 已完成切片（M1.1–M1.6 工程闭环）
 
 - [x] **M1.1 持久化接单**：单包 TS + SQLite WAL 迁移 + 幂等 `requestId` 去重与冲突退出码 4 + CLI `create/get` 与重启读回。
 - [x] **M1.2 T3 MCP 适配器**：锁定 `@modelcontextprotocol/sdk` 1.32.2，完成 `launch / wait / read / stop`、错误分类与替换传输测试。
 - [x] **M1.3 零仓 SSE 独立验收**：串起 `sse-v1` 独立重算验收器；并在隔离 T3 `v0.1.12` + Pi 上通过 `disconnect.log` 正例、重启原样读回、幂等冲突与 T3 拒绝路径验证。详细证据与待补项见 [M1.1–M1.3 开发合同](m1-delivery.md)。
 - [x] **M1.4（Sprint 1）底座加固 + 事件驱动 HTTP/SSE 控制面**：修复 5 项底座缺陷（二进制制品、真实重启 `reconcile`、非阻塞并发池、原子锁与残留 `.sock` 自愈、通知去重与执行元信息回写）；引入 `task_events`、`TypedEventBus` 在线唤醒与 `outbox_jobs`；升级 `node:http`（Unix Socket + Loopback REST/SSE 分页断点续传）及 CLI `list` / `amend` / `stop`（含运行中实时中断与防复活）。
-- [x] **M1.5（Sprint 2）极简黑白 Web 工作台 + 分级授权 + 一级 Watchdog**：实现 `StandingPolicy` 三层分级授权（Tier 0/1 总助理静默放行、Tier 2 红线挂起与批准原地恢复）、注意力防火墙 3 枚举白名单与 Inbox 结构化 `action` Upsert、两阶段 Amendment Diff 确认卡、一级 0-Token Watchdog（4 类检测与冷却去重），以及 React 19 + Vite 极简黑白三栏可折叠控制台（静态托管 + 实时 SSE + JSON 快照读取 + `⌘K` + 中文 IME 兼容）。`npm run typecheck && npm run build && npm test` 103 项全通过（注：Web 样式当前以轻量化原生 Zinc CSS 实现，无外部 CSS 框架负担）。
+- [x] **M1.5（Sprint 2）极简黑白 Web 工作台 + 分级授权 + 一级 Watchdog**：实现 `StandingPolicy` 三层分级授权（Tier 0/1 总助理静默放行、Tier 2 红线挂起与批准原地恢复）、注意力防火墙 3 枚举白名单与 Inbox 结构化 `action` Upsert、两阶段 Amendment Diff 确认卡、一级 0-Token Watchdog（4 类检测与冷却去重），以及 React 19 + Vite 极简黑白三栏可折叠控制台（静态托管 + 实时 SSE + JSON 快照读取 + `⌘K` + 中文 IME 兼容）。
+- [x] **M1.6（Sprint 3）自主 Worktree + 统一执行器（含 Live 运行流）+ 声明式 `VerificationPipeline`（工程与 `FIXTURE` 通过，待留存 `REAL` 自用记录）**：
+  - `WorkspaceManager` 原生多仓 `git worktree`、精确 `baseSha` 与 manifest 持久化、缺分支整体回滚拒绝、脏目录回收保护与独立验证干净检出（`materializeCleanCheckout`）；
+  - 统一 `ExecutionAdapter` / `ExecutorRegistry`、`PiAdapter`（本机实测 `pi 1.6.0` `probe()` 就绪）与 `T3ExecutionAdapter`、`RunStreamStore`（`.ndjson` 物理隔离 + 实时 pub/sub SSE `/api/tasks/:id/runs/:runId/stream` + `POST /api/tasks/:id/steer` + Watchdog 心跳联动 + Web 侧栏探测状态与实时流下钻）；
+  - 声明式 `VerifierRegistry` + `command_check` 独立隔离验收、候选 SHA 变更自动标记旧证据 `stale`、预算内自动修复闭环（默认最多 2 轮）。
 
-### 下一短冲刺（M1.6，目标：正式开启 Timo 自用）
-
-| 切片 | 冲刺 | 核心改动与依赖 | 可执行的通过条件 |
-| --- | --- | --- | --- |
-| **M1.6 自主 Worktree + 统一执行器（含 Live 运行流）+ 真实单测验收** | Sprint 3（3–4 天） | 1. 实现自主 `WorkspaceManager`（原生多仓 `git worktree`、精确 `baseSha` 校验、禁止静默 fallback）；<br>2. 抽离统一 `ExecutionAdapter` 与归一化 `RunStreamEvent`：保留 `T3Adapter`，新增至少 1 个直连原生 CLI 适配器（Codex / OpenCode / Pi），接通前端「实时运行流」SSE 透视与人工纠偏注入；<br>3. 抽离声明式 `VerifierRegistry`，在保留 `sse-v1` 的同时新增真实 `command_check`（隔离目录跑 `npm run typecheck && npm test`）。 | 1. 从极简黑白 Web 交办一项 `timo` 仓库自身的真实低风险开发需求；<br>2. 可在右侧检查器一键切到「实时运行流」看到真实工具调用与测试输出；<br>3. 独立验收在干净 worktree 跑通真实测试并附原文证据，进入日常自用试点。 |
-
-**M1 退出条件**：用户从独立 Timo Web 工作台完成真实研发任务（含单测独立验收与实时流透视），且强杀重启、多任务并发、分级授权与一级 Watchdog 均有 `FIXTURE` + `REAL` 证据。
+**M1 退出条件**：工程、构建与 `FIXTURE` 验收已全部通过；尚待在极简黑白 Web 上执行并留存 1 次针对 `timo` 仓库自身的 `REAL` 低风险研发自用试点记录。
 
 ---
 
-## M2（Sprint 4）：Capability MCP Gateway + 多仓 MR/CI 0-Token 闭环
+## M2（Sprint 4）：Capability MCP Gateway + 多仓 MR/CI 0-Token 闭环（`FIXTURE` 通过，待 `REAL` 平台复核）
 
 **依赖**：M1 退出条件通过；本地模拟平台可用；真实 MR/CI 操作依赖对应获准账号与网络。
 
 ### 可勾选切片
 
-- [ ] 上线本地 **Capability MCP Gateway**（基于 `@modelcontextprotocol/sdk`），为每个执行代次签发短命 Endpoint 与 `Fencing Token`。
-- [ ] 实现 **工具可见性裁剪（Tool Visibility Pruning）**：`tools/list` 仅返回当前 `GrantRevision` 允许的工具，禁止发布的任务对 Worker 隐藏发布工具；缺权时支持 `Pause & Resume` 原地挂起等待授权。
-- [ ] 接入一种只读日志身份与 GitHub / 内部 Aone（`a1`）MR 能力，真实凭据仅由网关进程从 Keychain / CLI 读取，不暴露给 Worker。
-- [ ] 在网关内严格落实 `Intent-Before-Effect`：持久化操作意图与稳定幂等键，按原 MR ID 与精确候选 `head SHA` 进行 0-Token 后台 CI 轮询（或 Webhook 接收），重试不重复建 MR。
-- [ ] 在自主 `WorkspaceManager` 上串通前后端双仓修复 → 两个 MR → 两份 CI + 独立组合行为验收（`command_check` + `platform_mr`），显式禁止生产发布；任一仓新提交自动令旧组合证据失效。
+- [x] 上线本地 **Capability MCP Gateway**（基于 `@modelcontextprotocol/sdk` `StreamableHTTPServerTransport`），路由 `/mcp/:taskId/:generation/:nonce`，作废代次即刻返回 `403 GENERATION_REVOKED`。
+- [x] 实现 **工具可见性裁剪（Tool Visibility Pruning）**：`tools/list` 仅返回当前 `GrantRevision` / Tier 0 允许的工具，未授权发布工具隐藏且硬调被拒；`timo_request_grant` 支持 Tier 1 静默放行与 Tier 2 `Pause & Resume` 原地挂起。
+- [x] 接入受控只读日志工具（含脱敏与体积上限）与 MR 创建/更新工具（含真实 `GhPlatformAdapter` 与测试 `FakePlatformAdapter`），真实凭据仅由网关进程持有，Worker 启动环境剥离敏感业务 Token（`buildIsolatedWorkerEnv`）。
+- [x] 在网关内严格落实 `Intent-Before-Effect`：先持久化 `operations` 意图与稳定幂等键，按原 MR ID 与精确候选 `head SHA` 进行 0-Token 后台 `JOB_POLL_CI` 轮询；第 1 个 MR 成功后第 2 个失败重试不重复建第 1 个 MR；丢回执进入 `effect_unknown` 拒绝盲重发并通过 `/api/operations/:opId/reconcile` 核查恢复。
+- [x] 在自主 `WorkspaceManager` 上串通前后端双仓修复 → 两个 MR → 两份 CI + 独立组合行为验收（`command_check` + `platform_mr`），Web 检查器接入「跨仓交付矩阵」与 `effect_unknown` 对账卡；显式标注 `productionDeployed: false`；任一仓新提交自动令旧证据失效。
 
-**退出条件**：模拟全链与故障反例通过（S01、S05、S06），并在获准测试仓库跑通真实双仓诊断、双 MR、对应 CI 与组合验收。若真实平台尚不可用，仅记录模拟通过，M2 保持待真实验收。
+**退出条件**：S01、S05、S06（及 S04 丢回执对账）`FIXTURE` 全套正反例自动化测试已全部通过（138/138）。因当前未连接获准真实试验双仓与真实 MR/CI 凭据，`REAL` 外部平台验收诚实记为待验，M2 保持「`FIXTURE` 通过 / 待 `REAL` 复核」状态。
 
 ---
 

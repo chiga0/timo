@@ -1,3 +1,4 @@
+import { join } from "node:path";
 import { closeSync, openSync, writeSync } from "node:fs";
 import { constants } from "node:fs";
 import type { ServiceConfig, T3RuntimeConfig } from "../config.js";
@@ -9,6 +10,14 @@ import { TaskStore } from "../store/tasks.js";
 import { ArtifactStore } from "../store/artifacts.js";
 import { TaskRunner } from "./runner.js";
 import { createMcpT3Client } from "../adapters/t3.js";
+import { ExecutorRegistry } from "../adapters/execution.js";
+import { PiAdapter } from "../adapters/pi.js";
+import { T3ExecutionAdapter } from "../adapters/t3-adapter.js";
+import { WorkspaceManager } from "../workspace/manager.js";
+import { RunStreamStore } from "../workspace/run-stream.js";
+import { CapabilityMcpGateway } from "../gateway/mcp-gateway.js";
+import { createPlatformMrVerifier, reconcileMrOperation, registerPlatformTools } from "../gateway/tools.js";
+import { GhPlatformAdapter } from "../platform/adapter.js";
 import { acquireServiceLock, ServiceUnavailableError } from "../ipc.js";
 import { Router, newSessionToken, startListener, type RunningListener } from "../http/server.js";
 import { registerWeb, resolveWebDir } from "../http/web.js";
@@ -42,6 +51,35 @@ export async function serve(): Promise<void> {
 
   const store = new TaskStore(db);
   const artifacts = ArtifactStore.create(home);
+  const workspaces = new WorkspaceManager({ home: join(home, "workspaces") });
+  const runStreams = new RunStreamStore(home);
+  const executors = new ExecutorRegistry();
+  executors.register(new PiAdapter());
+  if (t3) {
+    executors.register(new T3ExecutionAdapter({ clientFactory: () => Promise.resolve(createMcpT3Client(t3)) }));
+  }
+  const probed = await executors.probeAll();
+  log(`executors probed: ${probed.map((e) => `${e.id}=${e.available ? "ready" : "unavailable"}`).join(", ")}`);
+
+  // Local Capability MCP Gateway (Step 4.1 + 4.2): holds platform credentials
+  // strictly inside the gateway process, never exposed to Worker subprocesses.
+  const platform = new GhPlatformAdapter();
+  const gatewayCredentials: Record<string, string | undefined> = {
+    GH_TOKEN: env.GH_TOKEN,
+    GITHUB_TOKEN: env.GITHUB_TOKEN,
+    A1_TOKEN: env.A1_TOKEN,
+  };
+  const mcpPort = Number(env.TIMO_MCP_PORT);
+  const mcpGateway = new CapabilityMcpGateway({
+    service,
+    port: Number.isInteger(mcpPort) && mcpPort > 0 ? mcpPort : 0,
+    credentials: gatewayCredentials,
+    onError: (error) => log(`mcp gateway: ${String(error)}`),
+  });
+  registerPlatformTools(mcpGateway, { store, service, platform });
+  const mcpBound = await mcpGateway.start();
+  log(`capability mcp gateway listening on http://${mcpBound.host}:${mcpBound.port}/mcp/:taskId/:generation/:nonce`);
+
   const runner = new TaskRunner({
     store,
     service,
@@ -53,17 +91,31 @@ export async function serve(): Promise<void> {
     pollIntervalMs: config.pollIntervalMs,
     waitTimeoutMs: config.waitTimeoutMs,
     runDeadlineMs: config.runDeadlineMs,
+    runStreams,
+    executors,
+    workspaces,
+    verifiers: service.verifiers,
+    mcpGateway,
+    platformVerifier: createPlatformMrVerifier({ store, service, platform, credentials: gatewayCredentials }),
     log,
   });
 
-  const router = new Router();
-  registerApi(router, {
+  const startedAt = new Date().toISOString();
+  const apiDeps = {
     service,
     ledger: writer.ledger,
     bus,
-    startedAt: new Date().toISOString(),
+    startedAt,
     t3Configured: t3 !== null,
-  });
+    executors,
+    runStreams,
+    steer: (taskId: string, message: string) => runner.steerTask(taskId, message),
+    reconcileOperation: (operationId: string) =>
+      reconcileMrOperation(operationId, { store, service, platform, credentials: gatewayCredentials }),
+  };
+
+  const router = new Router();
+  registerApi(router, apiDeps);
 
   const listeners: RunningListener[] = [];
   try {
@@ -75,13 +127,7 @@ export async function serve(): Promise<void> {
       const token = env.TIMO_SESSION_TOKEN?.trim() || newSessionToken();
       const webDir = resolveWebDir(home);
       const webRouter = new Router();
-      registerApi(webRouter, {
-        service,
-        ledger: writer.ledger,
-        bus,
-        startedAt: new Date().toISOString(),
-        t3Configured: t3 !== null,
-      });
+      registerApi(webRouter, apiDeps);
       registerWeb(webRouter, webDir, token);
       const loopback = await startListener({
         router: webRouter,
@@ -99,6 +145,7 @@ export async function serve(): Promise<void> {
       if (env.TIMO_SESSION_TOKEN) log("session token taken from TIMO_SESSION_TOKEN");
     }
   } catch (error) {
+    await mcpGateway.close().catch(() => undefined);
     for (const listener of listeners.reverse()) await listener.close().catch(() => undefined);
     service.close();
     lock.release();
@@ -113,6 +160,7 @@ export async function serve(): Promise<void> {
     closing = true;
     log(`received ${signal}, stopping`);
     await runner.stop();
+    await mcpGateway.close().catch(() => undefined);
     for (const listener of listeners.reverse()) await listener.close().catch(() => undefined);
     lock.release();
     service.close();

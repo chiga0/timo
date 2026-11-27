@@ -11,6 +11,8 @@ import type { RunStreamEvent } from "../adapters/execution.js";
  * (docs/architecture.md "写入通道物理隔离").
  */
 export class RunStreamStore {
+  private readonly listeners = new Map<string, Set<(event: RunStreamEvent) => void>>();
+
   constructor(private readonly home: string) {}
 
   pathFor(taskId: string, runId: string): string {
@@ -21,6 +23,34 @@ export class RunStreamStore {
     const path = this.pathFor(event.taskId, event.runId);
     mkdirSync(join(this.home, "runs", sanitize(event.taskId)), { recursive: true, mode: 0o700 });
     appendFileSync(path, `${JSON.stringify(event)}\n`, { mode: 0o600 });
+    const key = streamKey(event.taskId, event.runId);
+    const subs = this.listeners.get(key);
+    if (subs) {
+      for (const listener of [...subs]) {
+        try {
+          listener(event);
+        } catch {
+          // A broken subscriber must never interrupt stream persistence.
+        }
+      }
+    }
+  }
+
+  /** Subscribes to live events appended for one `(taskId, runId)` stream. */
+  subscribe(taskId: string, runId: string, listener: (event: RunStreamEvent) => void): () => void {
+    const key = streamKey(taskId, runId);
+    let set = this.listeners.get(key);
+    if (!set) {
+      set = new Set();
+      this.listeners.set(key, set);
+    }
+    set.add(listener);
+    return () => {
+      const current = this.listeners.get(key);
+      if (!current) return;
+      current.delete(listener);
+      if (current.size === 0) this.listeners.delete(key);
+    };
   }
 
   /** Reads a run back from disk, oldest first. */
@@ -56,6 +86,10 @@ export class RunStreamStore {
  * Keeps a task/run id from escaping the runs directory. Dots are collapsed so a
  * crafted id like `../..` cannot produce a traversal segment.
  */
+function streamKey(taskId: string, runId: string): string {
+  return `${sanitize(taskId)}:${sanitize(runId)}`;
+}
+
 function sanitize(value: string): string {
   const cleaned = value.replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 128);
   return cleaned === "" ? "_" : cleaned;

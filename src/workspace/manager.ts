@@ -1,6 +1,6 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, readdirSync, rmSync, statSync } from "node:fs";
-import { basename, join } from "node:path";
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { basename, dirname, join } from "node:path";
 
 /**
  * Autonomous multi-repo worktrees. One task owns one generation directory with
@@ -95,13 +95,21 @@ export class WorkspaceManager {
       throw new WorkspaceError("exists", `workspace ${root} already exists`);
     }
     const resolved = repos.map((repo) => this.resolveRepo(repo));
+    const names = new Set<string>();
+    for (const repo of resolved) {
+      if (names.has(repo.name)) {
+        throw new WorkspaceError("exists", `duplicate repo name ${repo.name} in workspace ${taskId}`);
+      }
+      names.add(repo.name);
+    }
 
     mkdirSync(root, { recursive: true, mode: 0o700 });
     const prepared: PreparedRepo[] = [];
     try {
       for (const repo of resolved) {
         const worktreePath = join(root, repo.name);
-        const branch = `timo/${taskId.slice(0, 8)}/g${generation}/${repo.name}`;
+        const safeTask = taskId.replace(/[^A-Za-z0-9_-]/g, "-").slice(0, 32) || "task";
+        const branch = `timo/${safeTask}/g${generation}/${repo.name}`;
         this.run(["worktree", "add", "-b", branch, worktreePath, repo.baseSha], repo.sourcePath);
         prepared.push({
           name: repo.name,
@@ -112,11 +120,19 @@ export class WorkspaceManager {
           baseSha: repo.baseSha,
         });
       }
+      const manifest: PreparedWorkspace = { taskId, generation, root, repos: prepared };
+      writeFileSync(join(root, ".timo-workspace.json"), JSON.stringify(manifest, null, 2), { mode: 0o600 });
+      return manifest;
     } catch (error) {
-      // Roll back: prune worktrees we registered, then drop the directory.
-      for (const repo of resolved) {
+      // Roll back: prune worktrees and branches we created, then drop the directory.
+      for (const repo of prepared) {
         try {
-          this.run(["worktree", "remove", "--force", join(root, repo.name)], repo.sourcePath);
+          this.run(["worktree", "remove", "--force", repo.worktreePath], repo.sourcePath);
+        } catch {
+          // best effort during failure cleanup
+        }
+        try {
+          this.run(["branch", "-D", repo.branch], repo.sourcePath);
         } catch {
           // best effort during failure cleanup
         }
@@ -124,7 +140,6 @@ export class WorkspaceManager {
       rmSync(root, { recursive: true, force: true });
       throw error instanceof WorkspaceError ? error : new WorkspaceError("git_failed", String(error));
     }
-    return { taskId, generation, root, repos: prepared };
   }
 
   /**
@@ -175,10 +190,20 @@ export class WorkspaceManager {
     }
     if (workspace) {
       for (const repo of workspace.repos) {
-        try {
-          this.run(["worktree", "remove", "--force", repo.worktreePath], repo.sourcePath);
-        } catch {
-          // The directory may already be gone; removal below is authoritative.
+        const sourcePath = repo.sourcePath || this.inferSourcePath(repo.worktreePath);
+        if (sourcePath) {
+          try {
+            this.run(["worktree", "remove", "--force", repo.worktreePath], sourcePath);
+          } catch {
+            // The directory may already be gone; removal below is authoritative.
+          }
+          if (repo.branch && repo.branch.startsWith("timo/")) {
+            try {
+              this.run(["branch", "-D", repo.branch], sourcePath);
+            } catch {
+              // Branch may already be removed or checked out elsewhere.
+            }
+          }
         }
       }
     }
@@ -187,15 +212,55 @@ export class WorkspaceManager {
   }
 
   /**
-   * Rebuilds the workspace record from disk. Worktrees are discovered by reading
-   * each subdirectory's `git worktree` bookkeeping, so a restart can inspect and
-   * clean up a generation created by an earlier process.
+   * Materializes a clean detached worktree for independent verification at an
+   * exact candidate commit SHA. The author's worktree and the source repo's
+   * working directory are never touched.
+   */
+  materializeCleanCheckout(sourcePath: string, sha: string, targetDir: string): string {
+    if (!existsSync(sourcePath)) {
+      throw new WorkspaceError("repo_missing", `repo ${sourcePath} does not exist`);
+    }
+    const verified = safe(() => this.run(["rev-parse", "--verify", `${sha}^{commit}`], sourcePath).trim(), null);
+    if (!verified) {
+      throw new WorkspaceError("base_ref_missing", `${sourcePath} has no commit ${sha}`);
+    }
+    mkdirSync(dirname(targetDir), { recursive: true, mode: 0o700 });
+    this.run(["worktree", "add", "--detach", targetDir, verified], sourcePath);
+    return targetDir;
+  }
+
+  /** Removes a detached verification checkout created by `materializeCleanCheckout`. */
+  cleanupCheckout(sourcePath: string, targetDir: string): void {
+    if (sourcePath && existsSync(sourcePath)) {
+      try {
+        this.run(["worktree", "remove", "--force", targetDir], sourcePath);
+      } catch {
+        // Fallback to rmSync below.
+      }
+    }
+    rmSync(targetDir, { recursive: true, force: true });
+  }
+
+  /**
+   * Rebuilds the workspace record from disk. Reads the generation manifest
+   * written by `prepare` so `sourcePath`, `baseRef`, and exact `baseSha` survive
+   * restarts, falling back to scanning subdirectories when absent.
    */
   load(taskId: string, generation = 1): PreparedWorkspace | null {
     const root = this.rootFor(taskId, generation);
     if (!existsSync(root)) return null;
+    const manifestPath = join(root, ".timo-workspace.json");
+    if (existsSync(manifestPath)) {
+      try {
+        const parsed = JSON.parse(readFileSync(manifestPath, "utf8")) as PreparedWorkspace;
+        if (parsed && Array.isArray(parsed.repos)) return parsed;
+      } catch {
+        // Fall through to directory scan if manifest is damaged.
+      }
+    }
     const repos: PreparedRepo[] = [];
     for (const entry of readdirSync(root)) {
+      if (entry.startsWith(".")) continue;
       const worktreePath = join(root, entry);
       if (!statSync(worktreePath).isDirectory()) continue;
       if (!existsSync(join(worktreePath, ".git"))) continue;
@@ -203,7 +268,7 @@ export class WorkspaceManager {
       const baseSha = safe(() => this.run(["rev-parse", "HEAD"], worktreePath).trim(), null);
       repos.push({
         name: entry,
-        sourcePath: "",
+        sourcePath: this.inferSourcePath(worktreePath) ?? "",
         worktreePath,
         branch: branch ?? "",
         baseRef: branch ?? "",
@@ -211,6 +276,12 @@ export class WorkspaceManager {
       });
     }
     return { taskId, generation, root, repos };
+  }
+
+  private inferSourcePath(worktreePath: string): string | null {
+    const commonDir = safe(() => this.run(["rev-parse", "--path-format=absolute", "--git-common-dir"], worktreePath).trim(), null);
+    if (!commonDir) return null;
+    return commonDir.endsWith("/.git") ? commonDir.slice(0, -5) : commonDir;
   }
 
   /**

@@ -16,7 +16,7 @@ const GIT_ENV = {
 };
 
 function git(args: string[], cwd: string): string {
-  return execFileSync("git", args, { cwd, encoding: "utf8", env: GIT_ENV }).trim();
+  return execFileSync("git", ["-c", "core.hooksPath=/dev/null", ...args], { cwd, encoding: "utf8", env: GIT_ENV }).trim();
 }
 
 /** Creates a repo with one commit on `main` plus a `feature` branch. */
@@ -70,7 +70,7 @@ test("a multi-repo generation records the exact baseSha for every repo", () => {
     for (const repo of workspace.repos) {
       assert.ok(existsSync(repo.worktreePath));
       assert.equal(git(["rev-parse", "HEAD"], repo.worktreePath), repo.baseSha);
-      assert.match(repo.branch, /^timo\/task-mul\/g1\//);
+      assert.match(repo.branch, /^timo\/task-multi\/g1\//);
     }
     // The generation lives under <home>/<taskId>/g1/<repo>.
     assert.equal(workspace.root, join(f.workspaceHome, "task-multi", "g1"));
@@ -226,6 +226,54 @@ test("preparing an already-existing generation is refused", () => {
       () => f.manager.prepare("task-dup", [{ sourcePath: f.repoA, baseRef: "main" }]),
       (error: Error) => error instanceof WorkspaceError && error.code === "exists",
     );
+  } finally {
+    f.dispose();
+  }
+});
+
+test("load() preserves original baseSha and sourcePath after commits, and teardown cleans git worktree metadata", () => {
+  const f = fixture();
+  try {
+    const initialSha = git(["rev-parse", "HEAD"], f.repoA);
+    const workspace = f.manager.prepare("task-manifest", [{ sourcePath: f.repoA, baseRef: "main", name: "a" }]);
+    const wt = workspace.repos[0]!.worktreePath;
+    writeFileSync(join(wt, "extra.txt"), "hello\n");
+    git(["add", "."], wt);
+    git(["commit", "-qm", "work"], wt);
+
+    const reloaded = new WorkspaceManager({ home: f.workspaceHome }).load("task-manifest", 1);
+    assert.ok(reloaded);
+    assert.equal(reloaded.repos[0]!.baseSha, initialSha);
+    assert.equal(reloaded.repos[0]!.sourcePath, f.repoA);
+    assert.notEqual(f.manager.headSha(wt), initialSha);
+
+    f.manager.teardown("task-manifest", 1);
+    const remainingWorktrees = git(["worktree", "list", "--porcelain"], f.repoA);
+    assert.equal(remainingWorktrees.includes("task-manifest"), false);
+  } finally {
+    f.dispose();
+  }
+});
+
+test("materializeCleanCheckout creates an isolated checkout at the exact candidate SHA", () => {
+  const f = fixture();
+  try {
+    const workspace = f.manager.prepare("task-verify-co", [{ sourcePath: f.repoA, baseRef: "main", name: "a" }]);
+    const wt = workspace.repos[0]!.worktreePath;
+    writeFileSync(join(wt, "feature.txt"), "committed\n");
+    git(["add", "."], wt);
+    git(["commit", "-qm", "candidate"], wt);
+    const sha = f.manager.headSha(wt);
+    // Dirty file in author worktree must NOT leak into clean verification checkout.
+    writeFileSync(join(wt, "FAKE_PASS"), "forged\n");
+
+    const verifyDir = join(f.root, "clean-check");
+    f.manager.materializeCleanCheckout(f.repoA, sha, verifyDir);
+    assert.equal(readFileSync(join(verifyDir, "feature.txt"), "utf8"), "committed\n");
+    assert.equal(existsSync(join(verifyDir, "FAKE_PASS")), false);
+
+    f.manager.cleanupCheckout(f.repoA, verifyDir);
+    assert.equal(existsSync(verifyDir), false);
   } finally {
     f.dispose();
   }

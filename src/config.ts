@@ -1,5 +1,7 @@
 import { join } from "node:path";
 import type { T3Config } from "./adapters/t3.js";
+import type { RepoRequest } from "./workspace/manager.js";
+import type { VerificationPlan } from "./verify/pipeline.js";
 
 export interface ServiceConfig {
   home: string;
@@ -17,11 +19,28 @@ export interface ServiceConfig {
 /** Re-exported so the service config and the adapter share one config type. */
 export type T3RuntimeConfig = T3Config;
 
+export type TaskKind = "sse_log" | "repo_delivery";
+
 export interface CreateTaskRequest {
   requestId: string;
-  log: Uint8Array;
+  /** Legacy/zero-repo SSE log input (required when kind is omitted or 'sse_log'). */
+  log?: Uint8Array;
+  /** Task kind: defaults to 'sse_log' when `log` is provided, or 'repo_delivery' when `repos` is provided. */
+  kind?: TaskKind;
   /** Human request text sent by the caller (the assistant or the user). */
   requestText?: string;
+  /** Explicit executor id (e.g. 'pi', 't3'). Missing executor is rejected, never silently substituted. */
+  executorId?: string;
+  /** Model override forwarded to the executor. */
+  model?: string;
+  /** Repositories for `repo_delivery` tasks. */
+  repos?: RepoRequest[];
+  /** Declarative verification pipeline; defaults to `log_citation` for sse_log. */
+  verificationPlan?: VerificationPlan;
+  /** Bounded in-budget auto-repair rounds on verification failure (default 2). */
+  maxRepairRounds?: number;
+  /** Additional task-specific initial grants. */
+  grants?: Array<{ action: string; resource: string; environment?: string | null; identity?: string | null; expiresAt?: string | null }>;
 }
 
 export interface CreateTaskResponse {
@@ -29,8 +48,26 @@ export interface CreateTaskResponse {
   status: string;
 }
 
+export interface RepoDeliveryState {
+  name: string;
+  sourcePath: string;
+  baseRef: string;
+  baseSha?: string | null;
+  headSha?: string | null;
+  worktreePath?: string | null;
+  branch?: string | null;
+  mrId?: string | null;
+  mrUrl?: string | null;
+  mrHeadSha?: string | null;
+  ciStatus?: "pending" | "passed" | "failed" | "stale" | "unknown" | null;
+  ciHeadSha?: string | null;
+  ciChecks?: Array<{ name: string; status: string }>;
+}
+
 export interface GetTaskResponse {
   taskId: string;
+  kind?: TaskKind;
+  executorId?: string | null;
   status: string;
   waitingReason: string | null;
   inputDigest: string | null;
@@ -38,7 +75,25 @@ export interface GetTaskResponse {
   runId: string | null;
   result: unknown;
   failureReason: string | null;
-  verification: { result: string; verifierVersion: string; findings: unknown[]; createdAt: string } | null;
+  verification: {
+    result: string;
+    verifierVersion: string;
+    findings: unknown[];
+    createdAt: string;
+    stale?: boolean;
+    candidateDigest?: string | null;
+  } | null;
+  repos?: RepoDeliveryState[];
+  verificationPlan?: VerificationPlan | null;
+  operations?: Array<{
+    operationId: string;
+    kind: string;
+    status: string;
+    operationKey: string | null;
+    clientRequestId: string;
+    receipt: unknown;
+    reconciledAt: string | null;
+  }>;
   lastObservedAt: string | null;
   /** Current brief revision; callers must echo it back when amending. */
   briefVersion: number;

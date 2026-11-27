@@ -261,6 +261,26 @@ const MIGRATIONS: ReadonlyArray<{ id: string; sql: string }> = [
       ALTER TABLE inbox_items ADD COLUMN action TEXT;
     `,
   },
+  {
+    // Step 3.3 & Step 4.2: decouple tasks from hardcoded sse-v1, track multi-repo
+    // checkouts, declarative verification plans, stale verification invalidation,
+    // and idempotent external operations (MR/CI) with reconciliation timestamps.
+    id: "0007-task-pipeline",
+    sql: `
+      ALTER TABLE tasks ADD COLUMN kind TEXT NOT NULL DEFAULT 'sse_log';
+      ALTER TABLE tasks ADD COLUMN executor_id TEXT;
+      ALTER TABLE tasks ADD COLUMN repos_json TEXT;
+      ALTER TABLE tasks ADD COLUMN verification_plan_json TEXT;
+      ALTER TABLE tasks ADD COLUMN max_repair_rounds INTEGER NOT NULL DEFAULT 2;
+
+      ALTER TABLE verifications ADD COLUMN stale INTEGER NOT NULL DEFAULT 0;
+      ALTER TABLE verifications ADD COLUMN candidate_digest TEXT;
+
+      ALTER TABLE operations ADD COLUMN operation_key TEXT;
+      ALTER TABLE operations ADD COLUMN reconciled_at TEXT;
+      CREATE UNIQUE INDEX IF NOT EXISTS operations_key_uniq ON operations (operation_key) WHERE operation_key IS NOT NULL;
+    `,
+  },
 ];
 
 export interface MigrationResult {

@@ -7,13 +7,21 @@ import { isTerminal } from "../store/tasks.js";
 import type { ArtifactStore } from "../store/artifacts.js";
 import type { TaskService } from "../service/task-service.js";
 import type { TransitionWriter } from "../events/writer.js";
-import { JOB_DISPATCH, JOB_STOP } from "../events/writer.js";
+import { JOB_DISPATCH, JOB_POLL_CI, JOB_STOP } from "../events/writer.js";
 import type { TypedEventBus } from "../events/bus.js";
 import { toIso, newId } from "../util.js";
 import { SSE_CANDIDATE_SCHEMA } from "../sse/contract.js";
 import { WatchdogMonitor, type WatchdogThresholds } from "../watchdog/monitor.js";
 import type { RunStreamStore } from "../workspace/run-stream.js";
-import type { ExecutorRegistry } from "../adapters/execution.js";
+import { ExecutorUnavailableError, type ExecutorRegistry, type RunStreamEvent } from "../adapters/execution.js";
+import { WorkspaceError, type PreparedWorkspace, type WorkspaceManager } from "../workspace/manager.js";
+import {
+  VerifierRegistry,
+  formatRepairFeedback,
+  type RepoCandidateRef,
+  type VerificationContext,
+} from "../verify/pipeline.js";
+import type { RepoDeliveryState } from "../config.js";
 
 const NON_RUNNABLE_WAIT_REASONS: ReadonlySet<string> = new Set([
   "needs_human_decision",
@@ -42,9 +50,20 @@ export interface RunnerOptions {
   retryPolicy?: RetryPolicy;
   /** Watchdog thresholds; `null` disables the first-level scan. */
   watchdog?: Partial<WatchdogThresholds> | null;
-  /** Live run stream sink + executor registry (Step 3.2). Absent disables both. */
+  /** Live run stream sink + executor registry + workspace manager + verifier pipeline. */
   runStreams?: RunStreamStore;
   executors?: ExecutorRegistry;
+  workspaces?: WorkspaceManager;
+  verifiers?: VerifierRegistry;
+  /** Optional Capability MCP Gateway hook (Step 4.1). */
+  mcpGateway?: {
+    issueUrl(taskId: string, generation: number): string;
+    revoke(taskId: string, generation?: number): void;
+  };
+  /** Optional platform MR/CI verifier hook (Step 4.2). */
+  platformVerifier?: VerificationContext["platformVerifier"];
+  /** Delay between 0-Token CI poll attempts, in ms. */
+  ciPollIntervalMs?: number;
   log: (line: string) => void;
 }
 
@@ -69,10 +88,51 @@ export class TaskRunner {
   private claimedJobs: Array<{ jobId: string; taskId: string; kind: string }> = [];
   /** First-level watchdog: deterministic, injectable clock, zero model calls. */
   private readonly watchdog: WatchdogMonitor | null;
+  /** Currently active live runs driven through `ExecutionAdapter`, keyed by taskId. */
+  private readonly liveRuns = new Map<string, { runId: string; executorId: string; generation: number; seq: number }>();
 
   constructor(private readonly options: RunnerOptions) {
     this.leaseMs = Math.max(options.pollIntervalMs * 10, 30_000);
     this.watchdog = options.watchdog === null ? null : new WatchdogMonitor(options.watchdog ?? {});
+  }
+
+  /** Returns the active live run for a task, if any. */
+  activeRunFor(taskId: string): { runId: string; executorId: string; generation: number } | null {
+    const entry = this.liveRuns.get(taskId);
+    return entry ? { runId: entry.runId, executorId: entry.executorId, generation: entry.generation } : null;
+  }
+
+  /**
+   * Sends a human/chief-of-staff steering instruction to a live run and records
+   * it in the run stream without polluting `task_events` or Inbox.
+   */
+  async steerTask(taskId: string, message: string): Promise<{ accepted: boolean; runId: string | null; reason?: string }> {
+    const trimmed = message.trim();
+    if (trimmed === "") return { accepted: false, runId: null, reason: "steer message cannot be empty" };
+    const live = this.liveRuns.get(taskId);
+    if (!live) return { accepted: false, runId: null, reason: "task has no active live run" };
+    const registry = this.options.executors;
+    if (!registry) return { accepted: false, runId: live.runId, reason: "no executor registry configured" };
+    let adapter;
+    try {
+      adapter = registry.require(live.executorId);
+    } catch (error) {
+      return { accepted: false, runId: live.runId, reason: error instanceof Error ? error.message : String(error) };
+    }
+    const result = await adapter.steer(live.runId, trimmed);
+    const now = Date.now();
+    live.seq += 1;
+    this.options.runStreams?.append({
+      seq: live.seq,
+      runId: live.runId,
+      taskId,
+      type: "status",
+      at: now,
+      summary: result.accepted ? `[steer accepted] ${trimmed}` : `[steer rejected] ${result.reason ?? "unsupported"}: ${trimmed}`,
+      data: { steer: true, accepted: result.accepted, message: trimmed, reason: result.reason },
+    });
+    this.options.store.setEvidence(taskId, "lastActivityAt", toIso(new Date(now)), toIso(new Date(now)));
+    return { accepted: result.accepted, runId: live.runId, ...(result.reason ? { reason: result.reason } : {}) };
   }
 
   private get concurrency(): number {
@@ -141,20 +201,22 @@ export class TaskRunner {
     try {
       // First-level watchdog: deterministic, zero model calls, before any work.
       this.scanWatchdog();
-      const work = new Map<string, "dispatch" | "reconcile" | "stop">();
+      const work = new Map<string, "dispatch" | "reconcile" | "stop" | "poll_ci">();
       const claimed = this.options.writer.outbox.claim({
         owner: this.owner,
         now: toIso(new Date()),
         limit: this.concurrency * 4,
         leaseMs: this.leaseMs,
-        kinds: [JOB_DISPATCH, JOB_STOP],
+        kinds: [JOB_DISPATCH, JOB_STOP, JOB_POLL_CI],
       });
       this.claimedJobs = claimed.map((job) => ({ jobId: job.jobId, taskId: job.taskId, kind: job.kind }));
       for (const job of claimed) {
         const task = this.options.store.get(job.taskId);
         if (!task) continue;
         if (task.status === "stopping") work.set(job.taskId, "stop");
-        else if (this.isTaskRunnable(task)) {
+        else if (job.kind === JOB_POLL_CI && task.status === "waiting" && task.waitingReason === "waiting_external_ci") {
+          work.set(job.taskId, "poll_ci");
+        } else if (this.isTaskRunnable(task)) {
           if (!work.has(job.taskId) || work.get(job.taskId) === "reconcile") work.set(job.taskId, "dispatch");
         }
       }
@@ -184,7 +246,13 @@ export class TaskRunner {
           this.active.add(taskId);
           let threwError: string | null = null;
           const promise = (
-            mode === "dispatch" ? this.advance(taskId) : mode === "stop" ? this.stopTask(taskId) : this.reconcileTask(taskId)
+            mode === "dispatch"
+              ? this.advance(taskId)
+              : mode === "stop"
+                ? this.stopTask(taskId)
+                : mode === "poll_ci"
+                  ? this.pollExternalCi(taskId)
+                  : this.reconcileTask(taskId)
           )
             .catch((error: unknown) => {
               threwError = error instanceof Error ? error.message : String(error);
@@ -276,9 +344,23 @@ export class TaskRunner {
     // Only a task parked in `stopping` needs the interrupt + finalise step; any
     // other state means the stop already finished or was never requested.
     if (task.status !== "stopping") return;
+    // Revoke any active MCP Gateway fencing token immediately.
+    this.options.mcpGateway?.revoke(taskId);
+
     let interrupted = true;
     let message: string | undefined;
-    if (task.threadId) {
+    const live = this.liveRuns.get(taskId);
+    if (live && this.options.executors?.has(live.executorId)) {
+      try {
+        const adapter = this.options.executors.require(live.executorId);
+        const res = await adapter.interrupt(live.runId);
+        interrupted = res.interrupted;
+        if (!res.interrupted && res.reason) message = res.reason;
+      } catch (error) {
+        interrupted = false;
+        message = error instanceof Error ? error.message : String(error);
+      }
+    } else if (task.threadId) {
       if (!t3) {
         interrupted = false;
         message = "t3 not configured; the local run was revoked but the remote thread could not be interrupted";
@@ -344,7 +426,6 @@ export class TaskRunner {
       await client?.close().catch(() => undefined);
     }
   }
-
   /** Records a definite non-completed remote outcome and fails the task. */
   private async finishRemoteRun(taskId: string, threadId: string, runId: string, status: string): Promise<void> {
     const { store } = this.options;
@@ -405,7 +486,6 @@ export class TaskRunner {
       await client?.close().catch(() => undefined);
     }
   }
-
   private async connect(t3: T3RuntimeConfig): Promise<T3Client> {
     try {
       return await this.options.clientFactory(t3);
@@ -418,6 +498,14 @@ export class TaskRunner {
     const { store, t3 } = this.options;
     const task = store.get(taskId);
     if (!task || !this.isTaskRunnable(task)) return;
+
+    // Route repo_delivery tasks or explicitly selected native executors through
+    // the unified ExecutionAdapter + WorkspaceManager + VerificationPipeline.
+    if (task.kind === "repo_delivery" || (task.executorId && task.executorId !== "t3")) {
+      await this.advanceWithAdapter(taskId);
+      return;
+    }
+
     const now = () => toIso(new Date());
 
     if (!t3) {
@@ -590,6 +678,328 @@ export class TaskRunner {
     } finally {
       await client?.close().catch(() => undefined);
     }
+  }
+
+  /**
+   * Unified ExecutionAdapter dispatch path (Steps 3.1, 3.2, 3.3, 4.1, 4.2).
+   * Prepares isolated multi-repo worktrees, streams live RunStreamEvents to
+   * `.ndjson` without touching `task_events` or Inbox, feeds Watchdog heartbeats,
+   * executes declarative VerificationPipeline in clean checkouts, and supports
+   * bounded in-budget auto-repair.
+   */
+  private async advanceWithAdapter(taskId: string): Promise<void> {
+    const { store, service, executors, workspaces, runStreams } = this.options;
+    const task = store.get(taskId);
+    if (!task || !this.isTaskRunnable(task)) return;
+    const now = () => toIso(new Date());
+    const executorId = task.executorId ?? "pi";
+
+    if (!executors) {
+      this.commitFailure(taskId, { reason: "executor_unavailable", detail: `executor ${executorId} requested but no ExecutorRegistry configured` });
+      return;
+    }
+
+    let adapter;
+    try {
+      adapter = executors.require(executorId);
+    } catch (error) {
+      const detail = error instanceof ExecutorUnavailableError ? error.message : String(error);
+      this.commitFailure(taskId, { reason: "executor_unavailable", detail });
+      return;
+    }
+
+    const operation = store.getOperation(taskId, "dispatch");
+    if (!operation) return;
+    if (operation.status === "done") return;
+
+    const execution = store.executionFor(taskId);
+    const generation = execution?.generation ?? 1;
+
+    // 1. Prepare or reload isolated worktrees for repo_delivery tasks.
+    let prepared: PreparedWorkspace | null = null;
+    let cwd = process.cwd();
+    if (task.kind === "repo_delivery") {
+      if (!workspaces) {
+        this.commitFailure(taskId, { reason: "workspace_unavailable", detail: "WorkspaceManager is required for repo_delivery tasks" });
+        return;
+      }
+      try {
+        prepared = workspaces.load(taskId, generation);
+        if (!prepared) {
+          prepared = workspaces.prepare(
+            taskId,
+            task.repos.map((r) => ({ sourcePath: r.sourcePath, baseRef: r.baseRef, name: r.name })),
+            generation,
+          );
+        }
+        const updatedRepos: RepoDeliveryState[] = task.repos.map((repo) => {
+          const match = prepared!.repos.find((p) => p.name === repo.name);
+          if (!match) return repo;
+          return {
+            ...repo,
+            baseSha: match.baseSha,
+            headSha: workspaces.headSha(match.worktreePath),
+            worktreePath: match.worktreePath,
+            branch: match.branch,
+          };
+        });
+        service.updateRepoStates(taskId, updatedRepos);
+        cwd = prepared.repos.length === 1 ? prepared.repos[0]!.worktreePath : prepared.root;
+      } catch (error) {
+        const code = error instanceof WorkspaceError ? error.code : "workspace_failed";
+        const detail = error instanceof Error ? error.message : String(error);
+        store.setOperationStatus(operation.operationId, "failed", { reason: code, detail }, now());
+        this.commitFailure(taskId, { reason: code, detail });
+        return;
+      }
+    } else {
+      cwd = this.options.workspaces?.rootFor(taskId, generation) ?? process.cwd();
+      if (this.options.workspaces && !this.options.workspaces.load(taskId, generation)) {
+        prepared = this.options.workspaces.prepare(taskId, [], generation);
+        cwd = prepared.root;
+      }
+    }
+
+    const startedIso = now();
+    this.options.writer.commit({
+      taskId,
+      type: "dispatch_started",
+      payload: { operationId: operation.operationId, executorId, generation },
+      options: { idempotencyKey: `dispatch:${operation.operationId}:g${generation}`, now: startedIso },
+      project: () => {
+        store.setStatus(taskId, "running", null, startedIso);
+        store.setOperationStatus(operation.operationId, "in_flight", { executorId, generation }, startedIso);
+        if (!store.getEvidence<string>(taskId, "runStartedAt")) store.setEvidence(taskId, "runStartedAt", startedIso, startedIso);
+        store.setEvidence(taskId, "lastActivityAt", startedIso, startedIso);
+      },
+    });
+
+    const mcpGatewayUrl = this.options.mcpGateway?.issueUrl(taskId, generation);
+    const maxRounds = task.kind === "repo_delivery" ? Math.max(0, task.maxRepairRounds) : 0;
+    const basePrompt = this.buildAdapterPrompt(taskId, prepared);
+    let currentPrompt = basePrompt;
+
+    for (let round = 0; round <= maxRounds; round++) {
+      const latestTask = store.get(taskId);
+      if (!latestTask || isTerminal(latestTask.status) || latestTask.status === "stopping") return;
+      if (latestTask.status === "waiting" && latestTask.waitingReason === "needs_human_decision") return;
+
+      const runId = `${taskId.slice(0, 8)}-g${generation}-r${round + 1}-${newId().slice(0, 6)}`;
+      store.setRun(taskId, runId, now());
+      store.bindExecution(taskId, adapter.id, execution?.model ?? "default", now());
+      store.upsertRunReference({
+        taskId,
+        executionId: execution?.executionId ?? `${taskId}:g${generation}`,
+        threadId: taskId,
+        runId,
+        providerInstanceId: adapter.id,
+        status: "running",
+        now: now(),
+      });
+
+      const liveState = { runId, executorId: adapter.id, generation, seq: 0 };
+      this.liveRuns.set(taskId, liveState);
+
+      const handleEvent = (event: RunStreamEvent) => {
+        liveState.seq = Math.max(liveState.seq, event.seq);
+        // Live telemetry goes ONLY to RunStreamStore (.ndjson + Live SSE),
+        // never to `task_events` or `inbox_items`.
+        runStreams?.append(event);
+        const eventIso = toIso(new Date(event.at));
+        store.setEvidence(taskId, "lastActivityAt", eventIso, eventIso);
+        if (event.type === "error") {
+          this.recordFailureFingerprint(taskId, event.summary.slice(0, 120), eventIso);
+        }
+        if (event.type === "patch" && event.data && typeof event.data === "object") {
+          const files = (event.data as { files?: unknown }).files;
+          if (Array.isArray(files)) {
+            const existing = store.getEvidence<string[]>(taskId, "changedFiles") ?? [];
+            const merged = [...new Set([...existing, ...files.filter((f): f is string => typeof f === "string")])];
+            store.setEvidence(taskId, "changedFiles", merged, eventIso);
+          }
+        }
+      };
+
+      let spawnResult;
+      try {
+        spawnResult = await adapter.spawn(
+          {
+            taskId,
+            runId,
+            cwd,
+            prompt: currentPrompt,
+            model: execution?.model && execution.model !== "pending" && execution.model !== "default" ? execution.model : undefined,
+            timeoutMs: this.options.runDeadlineMs,
+            mcpGatewayUrl,
+          },
+          handleEvent,
+        );
+      } finally {
+        this.liveRuns.delete(taskId);
+      }
+
+      const afterRunIso = now();
+      store.upsertRunReference({
+        taskId,
+        executionId: execution?.executionId ?? `${taskId}:g${generation}`,
+        threadId: spawnResult.externalId ?? taskId,
+        runId,
+        providerInstanceId: adapter.id,
+        status: spawnResult.status,
+        now: afterRunIso,
+      });
+
+      const currentAfter = store.get(taskId);
+      if (!currentAfter || isTerminal(currentAfter.status) || currentAfter.status === "stopping") return;
+      if (currentAfter.status === "waiting" && currentAfter.waitingReason === "needs_human_decision") return;
+
+      if (spawnResult.status !== "succeeded") {
+        this.recordFailureFingerprint(taskId, `executor:${spawnResult.status}:${spawnResult.exitCode ?? "sig"}`, afterRunIso);
+        if (round < maxRounds) {
+          currentPrompt = `${basePrompt}\n\n[Previous execution attempt ${round + 1} failed with status=${spawnResult.status}, exitCode=${spawnResult.exitCode ?? "null"}. Retry carefully.]`;
+          continue;
+        }
+        this.commitFailure(taskId, {
+          reason: `executor_${spawnResult.status}`,
+          detail: `executor ${adapter.id} ended with ${spawnResult.status} (exitCode=${spawnResult.exitCode ?? "null"})`,
+        });
+        return;
+      }
+
+      // Zero-repo SSE log diagnosis run via native adapter.
+      if (task.kind === "sse_log") {
+        const parsed = extractJsonObject(spawnResult.output);
+        if (parsed === undefined) {
+          this.commitFailure(taskId, { reason: "invalid_candidate", detail: "executor completed without a structured JSON candidate" });
+          return;
+        }
+        service.acceptCandidate(taskId, parsed, runId);
+        return;
+      }
+
+      // Repo delivery: freeze exact candidate SHAs and run independent VerificationPipeline.
+      const refreshedRepos: RepoDeliveryState[] = currentAfter.repos.map((repo) => {
+        if (!repo.worktreePath || !workspaces) return repo;
+        return { ...repo, headSha: workspaces.headSha(repo.worktreePath) };
+      });
+      service.updateRepoStates(taskId, refreshedRepos);
+      store.setStatus(taskId, "verifying", null, afterRunIso);
+      store.setEvidence(taskId, "hasProgress", true, afterRunIso);
+      store.setEvidence(taskId, "lastActivityAt", afterRunIso, afterRunIso);
+
+      const candidateRefs: RepoCandidateRef[] = refreshedRepos.map((repo) => ({
+        name: repo.name,
+        sourcePath: repo.sourcePath,
+        baseRef: repo.baseRef,
+        baseSha: repo.baseSha ?? "",
+        headSha: repo.headSha ?? repo.baseSha ?? "",
+        worktreePath: repo.worktreePath ?? undefined,
+        branch: repo.branch ?? undefined,
+      }));
+
+      const verifiers = this.options.verifiers ?? service.verifiers;
+      const plan = currentAfter.verificationPlan ?? { version: "pipeline-v1", steps: [] };
+      const view = store.view(taskId);
+      const outcome = await verifiers.run(plan, {
+        taskId,
+        briefVersion: view?.briefVersion ?? 1,
+        repos: candidateRefs,
+        workspaces,
+        platformVerifier: this.options.platformVerifier,
+      });
+
+      if (outcome.status === "accepted" || outcome.status === "waiting_external") {
+        service.recordPipelineVerification(taskId, runId, outcome, { ciPollDelayMs: this.options.ciPollIntervalMs ?? 2_000 });
+        if (outcome.status === "waiting_external") {
+          store.setOperationStatus(operation.operationId, "done", { waiting: "waiting_external_ci", runId }, now());
+        }
+        return;
+      }
+
+      // Rejected: bounded in-budget auto-repair up to maxRepairRounds.
+      const isFinal = round >= maxRounds;
+      service.recordPipelineVerification(taskId, runId, outcome, { finalFailure: isFinal });
+      if (isFinal) return;
+
+      store.setStatus(taskId, "running", null, now());
+      currentPrompt = `${basePrompt}\n\n${formatRepairFeedback(outcome, round + 1, maxRounds)}`;
+    }
+  }
+
+  /**
+   * 0-Token CI polling (Step 4.2): re-runs the declarative verification
+   * pipeline for a task waiting on external CI without ever invoking an LLM or
+   * ExecutionAdapter.
+   */
+  private async pollExternalCi(taskId: string): Promise<void> {
+    const { store, service, workspaces } = this.options;
+    const task = store.get(taskId);
+    if (!task || task.status !== "waiting" || task.waitingReason !== "waiting_external_ci") return;
+    if (!task.verificationPlan) return;
+
+    const candidateRefs: RepoCandidateRef[] = task.repos.map((repo) => ({
+      name: repo.name,
+      sourcePath: repo.sourcePath,
+      baseRef: repo.baseRef,
+      baseSha: repo.baseSha ?? "",
+      headSha: repo.headSha ?? repo.baseSha ?? "",
+      worktreePath: repo.worktreePath ?? undefined,
+      branch: repo.branch ?? undefined,
+    }));
+
+    const verifiers = this.options.verifiers ?? service.verifiers;
+    const view = store.view(taskId);
+    const outcome = await verifiers.run(task.verificationPlan, {
+      taskId,
+      briefVersion: view?.briefVersion ?? 1,
+      repos: candidateRefs,
+      workspaces,
+      platformVerifier: this.options.platformVerifier,
+    });
+
+    const runId = task.runId ?? `ci-poll-${newId().slice(0, 6)}`;
+    if (outcome.status === "accepted") {
+      service.recordPipelineVerification(taskId, runId, outcome);
+    } else if (outcome.status === "rejected") {
+      service.recordPipelineVerification(taskId, runId, outcome, { finalFailure: true });
+    } else if (outcome.status === "waiting_external") {
+      // Keep waiting without consuming model tokens; schedule next poll.
+      const delay = this.options.ciPollIntervalMs ?? 2_000;
+      const runAfter = toIso(new Date(Date.now() + delay));
+      this.options.writer.outbox.enqueue({
+        taskId,
+        kind: JOB_POLL_CI,
+        dedupeKey: `ci-poll:${Date.now()}:${newId().slice(0, 6)}`,
+        runAfter,
+        now: toIso(new Date()),
+      });
+    }
+  }
+
+  private buildAdapterPrompt(taskId: string, workspace: PreparedWorkspace | null): string {
+    const view = this.options.store.view(taskId);
+    if (!view) return "";
+    if (view.task.kind === "sse_log") {
+      const input = this.options.artifacts.get(view.task.artifactPath);
+      return buildPrompt({
+        taskId,
+        digest: view.task.inputDigest,
+        logText: input ? new TextDecoder().decode(input) : "",
+      });
+    }
+    const repoLines = (workspace?.repos ?? []).map(
+      (repo) => `- ${repo.name}: path=${repo.worktreePath} branch=${repo.branch} baseRef=${repo.baseRef} baseSha=${repo.baseSha}`,
+    );
+    return [
+      `Task ${taskId} (Brief v${view.briefVersion})`,
+      `Goal: ${view.brief.goal}`,
+      `Must:\n${view.brief.must.map((m) => `- ${m}`).join("\n")}`,
+      `Must Not:\n${view.brief.mustNot.map((m) => `- ${m}`).join("\n")}`,
+      repoLines.length > 0 ? `Worktrees:\n${repoLines.join("\n")}` : "",
+      "Commit your changes cleanly inside each modified worktree before finishing.",
+    ]
+      .filter(Boolean)
+      .join("\n\n");
   }
 
   /**

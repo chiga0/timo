@@ -1,18 +1,24 @@
 import { useState } from "react";
-import type { InboxItem, Proposal, TaskDetail, TaskEvent } from "../api.js";
+import type { InboxItem, Proposal, RunStreamEvent, TaskDetail, TaskEvent } from "../api.js";
 
 type Tab = "overview" | "live";
 
 /**
- * Right-hand inspector: a read-only delivery overview plus the live run stream.
- * Destructive actions (stop) require a second confirmation click; brief edits
- * go through two-phase Amendment Diff proposals.
+ * Right-hand inspector: a read-only delivery overview (including multi-repo
+ * delivery matrix and effect_unknown reconciliation) plus the live NDJSON run
+ * stream with manual steering.
  */
 export function Inspector(props: {
   detail: TaskDetail | null;
   events: TaskEvent[];
+  runIds: string[];
+  activeRunId: string | null;
+  runEvents: RunStreamEvent[];
   inbox: InboxItem[];
   proposals: Proposal[];
+  onSelectRun: (runId: string) => void;
+  onSteer: (taskId: string, message: string) => Promise<{ accepted: boolean; reason?: string }>;
+  onReconcileOperation: (operationId: string) => void;
   onStop: (taskId: string) => void;
   onProposeGoal: (taskId: string, goal: string) => void;
   onConfirmProposal: (proposalId: string) => void;
@@ -23,8 +29,11 @@ export function Inspector(props: {
   const [confirmStop, setConfirmStop] = useState(false);
   const [showProof, setShowProof] = useState(false);
   const [goal, setGoal] = useState("");
+  const [steerText, setSteerText] = useState("");
+  const [steerFeedback, setSteerFeedback] = useState<string | null>(null);
   const detail = props.detail;
   const decision = props.inbox.find((item) => item.taskId === detail?.taskId && item.decisionKey === "decision_required");
+  const unknownOps = (detail?.operations ?? []).filter((op) => op.status === "unknown");
 
   if (!detail) {
     return (
@@ -141,6 +150,61 @@ export function Inspector(props: {
             </div>
           </section>
 
+          {unknownOps.map((op) => (
+            <section key={op.operationId} className="card">
+              <header className="card-head">
+                <span>外部效果未知 · 对账核查</span>
+                <span className="mono muted small">{op.kind}</span>
+              </header>
+              <div className="card-body stack small">
+                <div className="muted">回执丢失，系统已阻止盲目重发。请先向平台核查真实状态：</div>
+                <div className="card-box mono">
+                  <div>op: {op.operationId}</div>
+                  <div>key: {op.operationKey ?? op.clientRequestId}</div>
+                  {op.reconciledAt && <div className="muted">上次核查: {new Date(op.reconciledAt).toLocaleTimeString()}</div>}
+                </div>
+                <button
+                  type="button"
+                  className="btn btn-outline-muted btn-sm"
+                  onClick={() => props.onReconcileOperation(op.operationId)}
+                >
+                  重新向平台核查
+                </button>
+              </div>
+            </section>
+          ))}
+
+          {detail.repos && detail.repos.length > 0 && (
+            <section className="card">
+              <header className="card-head">
+                <span>跨仓交付矩阵</span>
+                <span className="mono muted small">
+                  {(detail.result as { productionDeployed?: boolean } | null)?.productionDeployed === false ? "生产未发布" : `${detail.repos.length} 仓`}
+                </span>
+              </header>
+              <div className="card-body stack small">
+                {detail.repos.map((repo) => (
+                  <div key={repo.name} className="card-box stack" style={{ gap: 4 }}>
+                    <div className="row">
+                      <span className={ciDot(repo.ciStatus)} />
+                      <span className="mono">{repo.name}</span>
+                      <span className="muted mono" style={{ marginLeft: "auto", fontSize: 11 }}>
+                        {repo.baseRef}
+                      </span>
+                    </div>
+                    <div className="muted mono" style={{ fontSize: 11 }}>
+                      base {shortSha(repo.baseSha)} → head {shortSha(repo.headSha)}
+                    </div>
+                    <div className="row mono" style={{ fontSize: 11 }}>
+                      <span>MR: {repo.mrId ?? "—"}</span>
+                      <span style={{ marginLeft: "auto" }}>CI: {repo.ciStatus ?? "—"}</span>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </section>
+          )}
+
           <section className="card">
             <header className="card-head">
               <span>验收证据</span>
@@ -154,9 +218,18 @@ export function Inspector(props: {
               {detail.verification ? (
                 <>
                   <div className="row">
-                    <span className={detail.verification.result === "accepted" ? "dot dot-success" : "dot dot-warning"} />
+                    <span
+                      className={
+                        detail.verification.stale
+                          ? "dot dot-warning"
+                          : detail.verification.result === "accepted"
+                            ? "dot dot-success"
+                            : "dot dot-warning"
+                      }
+                    />
                     <span>
-                      {detail.verification.result} · {detail.verification.verifierVersion}
+                      {detail.verification.result}
+                      {detail.verification.stale ? " (stale)" : ""} · {detail.verification.verifierVersion}
                     </span>
                   </div>
                   <div className="muted">{new Date(detail.verification.createdAt).toLocaleString()}</div>
@@ -232,18 +305,100 @@ export function Inspector(props: {
         </div>
       ) : (
         <div className="stack">
-          <div className="muted small">归一化事件流（与主对话同一账本，不重复播报）</div>
-          <div className="event-log">
-            {props.events.length === 0 && <div className="empty-box">暂无事件</div>}
-            {props.events.map((event) => (
-              <div key={event.eventId} className="event-line">
-                <span className="seq mono">{event.seq}</span>
-                <span className="mono">{event.type}</span>
-              </div>
-            ))}
+          <div className="row">
+            <span className="muted small">
+              {props.activeRunId ? `实时运行流 (${props.activeRunId})` : "归一化账本事件（尚无 NDJSON 运行流）"}
+            </span>
           </div>
+          {props.runIds.length > 1 && (
+            <select
+              className="card-box mono small"
+              style={{ border: "1px solid var(--border)" }}
+              value={props.activeRunId ?? ""}
+              onChange={(event) => props.onSelectRun(event.target.value)}
+            >
+              {props.runIds.map((id) => (
+                <option key={id} value={id}>
+                  {id}
+                </option>
+              ))}
+            </select>
+          )}
+          <div className="event-log">
+            {props.activeRunId ? (
+              props.runEvents.length === 0 ? (
+                <div className="empty-box">等待执行器输出…</div>
+              ) : (
+                props.runEvents.map((ev) => (
+                  <div key={`${ev.runId}:${ev.seq}`} className="event-line" style={{ alignItems: "flex-start" }}>
+                    <span className="seq mono">{ev.seq}</span>
+                    <span className="mono" style={{ minWidth: 68, opacity: 0.7 }}>{ev.type}</span>
+                    <span style={{ wordBreak: "break-word" }}>{ev.summary}</span>
+                  </div>
+                ))
+              )
+            ) : props.events.length === 0 ? (
+              <div className="empty-box">暂无事件</div>
+            ) : (
+              props.events.map((event) => (
+                <div key={event.eventId} className="event-line">
+                  <span className="seq mono">{event.seq}</span>
+                  <span className="mono">{event.type}</span>
+                </div>
+              ))
+            )}
+          </div>
+          {!isTerminal && (
+            <section className="card">
+              <header className="card-head">人工纠偏（Steer）</header>
+              <div className="card-body stack small">
+                <input
+                  className="card-box"
+                  style={{ border: "1px solid var(--border)" }}
+                  placeholder="向当前运行注入纠偏指令…"
+                  value={steerText}
+                  onChange={(event) => setSteerText(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter" && !event.nativeEvent.isComposing && steerText.trim() !== "") {
+                      event.preventDefault();
+                      const msg = steerText.trim();
+                      setSteerText("");
+                      void props.onSteer(detail.taskId, msg).then((res) => {
+                        setSteerFeedback(res.accepted ? "纠偏指令已送达当前运行" : `未送达：${res.reason ?? "执行器不支持实时纠偏"}`);
+                      });
+                    }
+                  }}
+                />
+                <button
+                  type="button"
+                  className="btn btn-outline-muted btn-sm"
+                  disabled={steerText.trim() === ""}
+                  onClick={() => {
+                    const msg = steerText.trim();
+                    setSteerText("");
+                    void props.onSteer(detail.taskId, msg).then((res) => {
+                      setSteerFeedback(res.accepted ? "纠偏指令已送达当前运行" : `未送达：${res.reason ?? "执行器不支持实时纠偏"}`);
+                    });
+                  }}
+                >
+                  发送纠偏指令
+                </button>
+                {steerFeedback && <div className="muted mono" style={{ fontSize: 11 }}>{steerFeedback}</div>}
+              </div>
+            </section>
+          )}
         </div>
       )}
     </div>
   );
+}
+
+function shortSha(sha: string | null | undefined): string {
+  return sha ? sha.slice(0, 8) : "—";
+}
+
+function ciDot(status: string | null | undefined): string {
+  if (status === "passed") return "dot dot-success";
+  if (status === "failed" || status === "stale") return "dot dot-warning";
+  return "dot";
 }

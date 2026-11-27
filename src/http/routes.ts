@@ -8,6 +8,10 @@ import { CommandError } from "../ipc.js";
 import type { EventLedger } from "../events/ledger.js";
 import type { TypedEventBus } from "../events/bus.js";
 import type { TaskEvent } from "../events/types.js";
+import type { ExecutorRegistry, RunStreamEvent } from "../adapters/execution.js";
+import type { RunStreamStore } from "../workspace/run-stream.js";
+import type { RepoRequest } from "../workspace/manager.js";
+import type { VerificationPlan } from "../verify/pipeline.js";
 
 export interface ApiDeps {
   service: TaskService;
@@ -18,6 +22,14 @@ export interface ApiDeps {
   /** Human-readable service start time, for `/api/health`. */
   startedAt: string;
   t3Configured: boolean;
+  /** Probed executor registry (Step 3.2). */
+  executors?: ExecutorRegistry;
+  /** Live run stream store (Step 3.2). */
+  runStreams?: RunStreamStore;
+  /** Live steering hook into the runner (Step 3.2). */
+  steer?: (taskId: string, message: string) => Promise<{ accepted: boolean; runId: string | null; reason?: string }>;
+  /** Operation reconciliation hook (Step 4.2). */
+  reconcileOperation?: (operationId: string) => Promise<unknown>;
 }
 
 const SSE_HEADERS = {
@@ -41,7 +53,12 @@ export function registerApi(router: Router, deps: ApiDeps): void {
       startedAt: deps.startedAt,
       latestSeq: deps.ledger.latestSeq(),
       t3: deps.t3Configured ? "configured" : "unconfigured",
+      executors: deps.executors?.snapshot() ?? [],
     },
+  }));
+
+  router.add("GET", "/api/executors", () => ({
+    body: { executors: deps.executors?.snapshot() ?? [] },
   }));
 
   router.add("GET", "/api/tasks", (context) => {
@@ -53,6 +70,23 @@ export function registerApi(router: Router, deps: ApiDeps): void {
   router.add("POST", "/api/tasks", (context) => {
     const body = asRecord(context.body);
     const requestId = requireString(body.requestId, "requestId");
+    const kind = body.kind === "repo_delivery" || Array.isArray(body.repos) ? "repo_delivery" : "sse_log";
+    if (kind === "repo_delivery") {
+      const repos = Array.isArray(body.repos) ? (body.repos as RepoRequest[]) : [];
+      const created = withMappedErrors(() =>
+        deps.service.createTask({
+          requestId,
+          kind: "repo_delivery",
+          requestText: typeof body.requestText === "string" ? body.requestText : undefined,
+          executorId: typeof body.executorId === "string" ? body.executorId : undefined,
+          model: typeof body.model === "string" ? body.model : undefined,
+          repos,
+          verificationPlan: body.verificationPlan as VerificationPlan | undefined,
+          maxRepairRounds: typeof body.maxRepairRounds === "number" ? body.maxRepairRounds : undefined,
+        }),
+      );
+      return { status: 201, body: { taskId: created.taskId, status: created.status, reused: created.reused } };
+    }
     const rawLog = body.log;
     if (typeof rawLog !== "string") throw new RouteError(400, "invalid_input", "log (base64) is required");
     const bytes = Uint8Array.from(Buffer.from(rawLog, "base64"));
@@ -61,6 +95,7 @@ export function registerApi(router: Router, deps: ApiDeps): void {
         requestId,
         log: bytes,
         requestText: typeof body.requestText === "string" ? body.requestText : undefined,
+        executorId: typeof body.executorId === "string" ? body.executorId : undefined,
       }),
     );
     return { status: 201, body: { taskId: created.taskId, status: created.status, reused: created.reused } };
@@ -203,6 +238,104 @@ export function registerApi(router: Router, deps: ApiDeps): void {
   router.add("POST", "/api/proposals/:pid/cancel", (context) => {
     return { body: withMappedErrors(() => deps.service.cancelProposal(context.params.pid!)) };
   });
+
+  // ---- Step 3.2: Live RunStream NDJSON replay/SSE & live steering ----
+
+  router.add("GET", "/api/tasks/:id/runs", (context) => {
+    const taskId = context.params.id!;
+    withMappedErrors(() => deps.service.getTask(taskId));
+    return { body: { taskId, runs: deps.runStreams?.listRuns(taskId) ?? [] } };
+  });
+
+  router.add("GET", "/api/tasks/:id/runs/:runId/stream", (context) => {
+    const taskId = context.params.id!;
+    const runId = context.params.runId!;
+    const afterSeq = parseNonNegativeInt(context.query.get("afterSeq"), 0);
+    const wantsJson = context.query.get("format") === "json" || !context.accept.includes("text/event-stream");
+    if (wantsJson) {
+      return { body: { taskId, runId, events: deps.runStreams?.read(taskId, runId, afterSeq) ?? [] } };
+    }
+    return {
+      stream: async (res, signal) => {
+        await streamRunEvents(deps.runStreams, res, signal, { taskId, runId, afterSeq, heartbeatMs });
+      },
+    };
+  });
+
+  router.add("POST", "/api/tasks/:id/steer", async (context) => {
+    const taskId = context.params.id!;
+    withMappedErrors(() => deps.service.getTask(taskId));
+    const body = asRecord(context.body);
+    const message = requireString(body.message, "message");
+    if (!deps.steer) {
+      return { body: { taskId, accepted: false, runId: null, reason: "steering is not enabled on this server" } };
+    }
+    const result = await deps.steer(taskId, message);
+    return { body: { taskId, ...result } };
+  });
+
+  // ---- Step 4.2: Operation reconciliation for effect_unknown ----
+
+  router.add("POST", "/api/operations/:opId/reconcile", async (context) => {
+    if (!deps.reconcileOperation) {
+      throw new RouteError(501, "unsupported", "operation reconciliation is not configured");
+    }
+    const opId = context.params.opId!;
+    try {
+      const result = await deps.reconcileOperation(opId);
+      return { body: result };
+    } catch (error) {
+      throw toRouteError(error);
+    }
+  });
+}
+
+async function streamRunEvents(
+  runStreams: RunStreamStore | undefined,
+  res: import("node:http").ServerResponse,
+  signal: AbortSignal,
+  options: { taskId: string; runId: string; afterSeq: number; heartbeatMs: number },
+): Promise<void> {
+  res.writeHead(200, SSE_HEADERS);
+  res.flushHeaders?.();
+  if (!runStreams) {
+    res.end();
+    return;
+  }
+  let last = options.afterSeq;
+  const write = (event: RunStreamEvent) => {
+    if (event.seq <= last) return;
+    last = event.seq;
+    res.write(`id: ${event.seq}\nevent: run_event\ndata: ${JSON.stringify(event)}\n\n`);
+  };
+  const pending: RunStreamEvent[] = [];
+  let replaying = true;
+  const unsubscribe = runStreams.subscribe(options.taskId, options.runId, (event) => {
+    if (replaying) pending.push(event);
+    else write(event);
+  });
+  try {
+    for (const event of runStreams.read(options.taskId, options.runId, options.afterSeq)) write(event);
+    replaying = false;
+    for (const event of pending) write(event);
+    pending.length = 0;
+
+    const heartbeat = setInterval(() => {
+      if (signal.aborted) return;
+      res.write(`: heartbeat ${Date.now()}\n\n`);
+    }, options.heartbeatMs);
+    heartbeat.unref?.();
+
+    await new Promise<void>((resolve) => {
+      signal.addEventListener("abort", () => resolve(), { once: true });
+      res.on("close", () => resolve());
+    });
+    clearInterval(heartbeat);
+  } finally {
+    replaying = false;
+    unsubscribe();
+    if (!res.writableEnded) res.end();
+  }
 }
 
 interface StreamOptions {

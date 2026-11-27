@@ -8,6 +8,7 @@ import type { TaskEvent, EventType } from "./types.js";
 export const JOB_DISPATCH = "dispatch";
 export const JOB_RECONCILE = "reconcile";
 export const JOB_STOP = "stop";
+export const JOB_POLL_CI = "poll_ci";
 
 export interface TransitionOptions {
   /** Stable fact key; replays and retries with the same key are no-ops. */

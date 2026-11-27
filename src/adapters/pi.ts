@@ -1,7 +1,15 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync } from "node:fs";
 import { execFileSync } from "node:child_process";
-import type { ExecutionAdapter, ExecutorDescriptor, RunStreamEvent, RunStreamEventType, SpawnRequest, SpawnResult } from "./execution.js";
+import {
+  buildIsolatedWorkerEnv,
+  type ExecutionAdapter,
+  type ExecutorDescriptor,
+  type RunStreamEvent,
+  type RunStreamEventType,
+  type SpawnRequest,
+  type SpawnResult,
+} from "./execution.js";
 
 /**
  * Native CLI executor for `pi` (Pi), driving it as a mature runtime rather than
@@ -25,6 +33,7 @@ export interface PiAdapterOptions {
 interface ActiveRun {
   child: ChildProcess;
   interrupted: boolean;
+  timedOut: boolean;
 }
 
 export class PiAdapter implements ExecutionAdapter {
@@ -74,15 +83,20 @@ export class PiAdapter implements ExecutionAdapter {
     if (request.model) args.push("--model", request.model);
     args.push(request.prompt);
 
+    const workerEnv = buildIsolatedWorkerEnv(process.env, {
+      ...(request.mcpGatewayUrl ? { TIMO_MCP_GATEWAY_URL: request.mcpGatewayUrl } : {}),
+      ...(request.env ?? {}),
+    });
+
     const child = spawn(this.command, args, {
       cwd: request.cwd,
-      env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
+      env: workerEnv,
       stdio: ["ignore", "pipe", "pipe"],
       // Its own process group, so an interrupt can signal the whole tree without
       // ever reaching this service's own group.
       detached: true,
     });
-    const run: ActiveRun = { child, interrupted: false };
+    const run: ActiveRun = { child, interrupted: false, timedOut: false };
     this.active.set(request.runId, run);
 
     let seq = 0;
@@ -99,7 +113,7 @@ export class PiAdapter implements ExecutionAdapter {
     const timer =
       request.timeoutMs && request.timeoutMs > 0
         ? setTimeout(() => {
-            run.interrupted = true;
+            run.timedOut = true;
             this.terminate(child);
           }, request.timeoutMs)
         : null;
@@ -121,7 +135,7 @@ export class PiAdapter implements ExecutionAdapter {
             if (!parsed) continue;
             if (parsed.externalId) externalId = parsed.externalId;
             if (parsed.finalText) output = parsed.finalText;
-            if (parsed.event) emit(parsed.event.type, parsed.event.summary, parsed.event.data);
+            for (const event of parsed.events) emit(event.type, event.summary, event.data);
           }
         });
         child.stderr.setEncoding("utf8");
@@ -140,7 +154,7 @@ export class PiAdapter implements ExecutionAdapter {
     }
 
     const exitCode = child.exitCode;
-    const status = run.interrupted ? "interrupted" : exitCode === 0 ? "succeeded" : "failed";
+    const status = run.timedOut ? "timed_out" : run.interrupted ? "interrupted" : exitCode === 0 ? "succeeded" : "failed";
     if (status !== "succeeded") {
       emit("error", stderrTail.trim() !== "" ? stderrTail.trim() : `executor exited with ${exitCode ?? "signal"}`);
     }
@@ -177,8 +191,8 @@ export class PiAdapter implements ExecutionAdapter {
    */
   private translate(
     line: string,
-    request: SpawnRequest,
-  ): { event?: { type: RunStreamEventType; summary: string; data?: unknown }; externalId?: string; finalText?: string } | null {
+    _request: SpawnRequest,
+  ): { events: Array<{ type: RunStreamEventType; summary: string; data?: unknown }>; externalId?: string; finalText?: string } | null {
     const trimmed = line.trim();
     if (trimmed === "") return null;
     let parsed: unknown;
@@ -186,39 +200,44 @@ export class PiAdapter implements ExecutionAdapter {
       parsed = JSON.parse(trimmed);
     } catch {
       // Non-JSON output on stdout still tells the operator something happened.
-      return { event: { type: "shell", summary: trimmed } };
+      return { events: [{ type: "shell", summary: trimmed }] };
     }
     const record = parsed as Record<string, unknown>;
     const type = typeof record.type === "string" ? record.type : "";
 
     if (type === "session") {
-      return { externalId: typeof record.id === "string" ? record.id : undefined, event: { type: "status", summary: "session started" } };
+      return { externalId: typeof record.id === "string" ? record.id : undefined, events: [{ type: "status", summary: "session started" }] };
     }
-    if (type === "agent_start") return { event: { type: "status", summary: "agent started" } };
-    if (type === "agent_settled") return { event: { type: "status", summary: "agent settled" } };
+    if (type === "agent_start") return { events: [{ type: "status", summary: "agent started" }] };
+    if (type === "agent_settled") return { events: [{ type: "status", summary: "agent settled" }] };
     if (type === "message") {
       const message = record.message as Record<string, unknown> | undefined;
       const role = typeof message?.role === "string" ? message.role : "assistant";
       const content = Array.isArray(message?.content) ? message!.content : [];
       const texts: string[] = [];
+      const events: Array<{ type: RunStreamEventType; summary: string; data?: unknown }> = [];
       for (const part of content) {
         const block = part as Record<string, unknown>;
-        if (block.type === "text" && typeof block.text === "string") texts.push(block.text);
-        else if (block.type === "tool_use" || block.type === "tool_call") {
+        if (block.type === "text" && typeof block.text === "string") {
+          texts.push(block.text);
+        } else if (block.type === "tool_use" || block.type === "tool_call") {
           const name = typeof block.name === "string" ? block.name : "tool";
-          return { event: { type: "tool_call", summary: `${name}`, data: block.input ?? block.arguments } };
+          events.push({ type: "tool_call", summary: name, data: block.input ?? block.arguments });
         } else if (block.type === "tool_result") {
           const summary = typeof block.content === "string" ? block.content : JSON.stringify(block.content ?? "");
-          return { event: { type: "tool_result", summary } };
+          events.push({ type: "tool_result", summary });
         }
       }
       const text = texts.join("\n").trim();
-      if (text === "") return null;
-      if (role === "assistant") return { event: { type: "thinking", summary: text }, finalText: text };
-      return { event: { type: "status", summary: `[${role}] ${text}` } };
+      if (text !== "") {
+        if (role === "assistant") events.push({ type: "thinking", summary: text });
+        else events.push({ type: "status", summary: `[${role}] ${text}` });
+      }
+      if (events.length === 0) return null;
+      return { events, finalText: role === "assistant" && text !== "" ? text : undefined };
     }
     // Unknown event shapes are recorded verbatim so nothing is silently dropped.
-    return { event: { type: "status", summary: type || "unknown", data: record } };
+    return { events: [{ type: "status", summary: type || "unknown", data: record }] };
   }
 
   private clip(text: string): string {

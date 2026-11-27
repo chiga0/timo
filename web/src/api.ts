@@ -1,3 +1,46 @@
+export interface ExecutorDescriptor {
+  id: string;
+  kind: "mcp" | "cli";
+  available: boolean;
+  reason?: string;
+  capabilities: Record<string, boolean>;
+}
+
+export interface RunStreamEvent {
+  seq: number;
+  runId: string;
+  taskId: string;
+  type: "thinking" | "tool_call" | "tool_result" | "shell" | "patch" | "status" | "error";
+  at: number;
+  summary: string;
+  data?: unknown;
+}
+
+export interface RepoDeliveryState {
+  name: string;
+  sourcePath: string;
+  baseRef: string;
+  baseSha?: string | null;
+  headSha?: string | null;
+  worktreePath?: string | null;
+  branch?: string | null;
+  mrId?: string | null;
+  mrUrl?: string | null;
+  mrHeadSha?: string | null;
+  ciStatus?: "pending" | "passed" | "failed" | "stale" | "unknown" | null;
+  ciHeadSha?: string | null;
+}
+
+export interface OperationSummary {
+  operationId: string;
+  kind: string;
+  status: string;
+  operationKey: string | null;
+  clientRequestId: string;
+  receipt: unknown;
+  reconciledAt: string | null;
+}
+
 export interface TaskSummary {
   taskId: string;
   status: string;
@@ -8,12 +51,23 @@ export interface TaskSummary {
 }
 
 export interface TaskDetail extends TaskSummary {
+  kind?: "sse_log" | "repo_delivery";
+  executorId?: string | null;
   threadId: string | null;
   runId: string | null;
   result: unknown;
   failureReason: string | null;
   briefVersion: number;
-  verification: { result: string; verifierVersion: string; findings: unknown[]; createdAt: string } | null;
+  verification: {
+    result: string;
+    verifierVersion: string;
+    findings: unknown[];
+    createdAt: string;
+    stale?: boolean;
+    candidateDigest?: string | null;
+  } | null;
+  repos?: RepoDeliveryState[];
+  operations?: OperationSummary[];
 }
 
 export interface InboxItem {
@@ -98,8 +152,31 @@ export class Api {
     return parsed as T;
   }
 
-  health(): Promise<{ ok: boolean; latestSeq: number; t3: string }> {
+  health(): Promise<{ ok: boolean; latestSeq: number; t3: string; executors?: ExecutorDescriptor[] }> {
     return this.call("/api/health");
+  }
+
+  executors(): Promise<{ executors: ExecutorDescriptor[] }> {
+    return this.call("/api/executors");
+  }
+
+  taskRuns(taskId: string): Promise<{ taskId: string; runs: string[] }> {
+    return this.call(`/api/tasks/${encodeURIComponent(taskId)}/runs`);
+  }
+
+  runStream(taskId: string, runId: string, afterSeq = 0): Promise<{ taskId: string; runId: string; events: RunStreamEvent[] }> {
+    return this.call(`/api/tasks/${encodeURIComponent(taskId)}/runs/${encodeURIComponent(runId)}/stream?afterSeq=${afterSeq}&format=json`);
+  }
+
+  steer(taskId: string, message: string): Promise<{ taskId: string; accepted: boolean; runId: string | null; reason?: string }> {
+    return this.call(`/api/tasks/${encodeURIComponent(taskId)}/steer`, {
+      method: "POST",
+      body: JSON.stringify({ message }),
+    });
+  }
+
+  reconcileOperation(operationId: string): Promise<{ operationId: string; reconciled: boolean; status: string; message: string }> {
+    return this.call(`/api/operations/${encodeURIComponent(operationId)}/reconcile`, { method: "POST" });
   }
 
   listTasks(): Promise<{ tasks: TaskSummary[] }> {
@@ -213,5 +290,50 @@ export function subscribeEvents(
     if (retryTimer !== null) window.clearTimeout(retryTimer);
     socket?.close();
     onState("closed");
+  };
+}
+
+/** Subscribes to live NDJSON `RunStreamEvent`s for one run without touching `task_events`. */
+export function subscribeRunStream(
+  token: string | null,
+  taskId: string,
+  runId: string,
+  afterSeq: number,
+  onEvent: (event: RunStreamEvent) => void,
+): () => void {
+  let closed = false;
+  let cursor = afterSeq;
+  let socket: EventSource | null = null;
+  let retryTimer: number | null = null;
+
+  const connect = () => {
+    if (closed) return;
+    const query = token ? `&token=${encodeURIComponent(token)}` : "";
+    socket = new EventSource(
+      `/api/tasks/${encodeURIComponent(taskId)}/runs/${encodeURIComponent(runId)}/stream?afterSeq=${cursor}${query}`,
+    );
+    socket.addEventListener("run_event", (message) => {
+      try {
+        const event = JSON.parse((message as MessageEvent<string>).data) as RunStreamEvent;
+        if (event.seq <= cursor) return;
+        cursor = event.seq;
+        onEvent(event);
+      } catch {
+        // ignore malformed frame
+      }
+    });
+    socket.onerror = () => {
+      socket?.close();
+      socket = null;
+      if (closed) return;
+      retryTimer = window.setTimeout(connect, 2000);
+    };
+  };
+
+  connect();
+  return () => {
+    closed = true;
+    if (retryTimer !== null) window.clearTimeout(retryTimer);
+    socket?.close();
   };
 }

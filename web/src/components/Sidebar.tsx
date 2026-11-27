@@ -1,4 +1,4 @@
-import type { InboxItem, PolicySnapshot, TaskSummary } from "../api.js";
+import type { ExecutorDescriptor, InboxItem, PolicySnapshot, TaskSummary } from "../api.js";
 
 const STATUS_LABEL: Record<string, string> = {
   accepted: "已接单",
@@ -15,6 +15,7 @@ export function Sidebar(props: {
   tasks: TaskSummary[];
   inbox: InboxItem[];
   policy: PolicySnapshot | null;
+  executors: ExecutorDescriptor[];
   selectedId: string | null;
   onSelect: (taskId: string) => void;
 }): React.JSX.Element {
@@ -80,6 +81,20 @@ export function Sidebar(props: {
             {props.policy?.summary ?? "not loaded"}
           </div>
           {props.policy?.warning && <div className="muted" style={{ color: "var(--warning)" }}>{props.policy.warning}</div>}
+          {props.executors.length > 0 && (
+            <div className="stack" style={{ marginTop: 6, paddingTop: 6, borderTop: "1px solid var(--border)" }}>
+              <div className="muted" style={{ fontSize: 11 }}>已探测执行器</div>
+              {props.executors.map((exec) => (
+                <div key={exec.id} className="row" style={{ fontSize: 11 }}>
+                  <span className={exec.available ? "dot dot-success" : "dot dot-warning"} />
+                  <span className="mono">{exec.id}</span>
+                  <span className="muted" style={{ marginLeft: "auto", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: 130 }}>
+                    {exec.available ? "就绪" : "不可用"}
+                  </span>
+                </div>
+              ))}
+            </div>
+          )}
         </div>
       </div>
     </div>

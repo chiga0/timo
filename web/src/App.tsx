@@ -1,5 +1,19 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Api, ApiError, readSessionToken, subscribeEvents, type InboxItem, type PolicySnapshot, type Proposal, type TaskDetail, type TaskEvent, type TaskSummary } from "./api.js";
+import {
+  Api,
+  ApiError,
+  readSessionToken,
+  subscribeEvents,
+  subscribeRunStream,
+  type ExecutorDescriptor,
+  type InboxItem,
+  type PolicySnapshot,
+  type Proposal,
+  type RunStreamEvent,
+  type TaskDetail,
+  type TaskEvent,
+  type TaskSummary,
+} from "./api.js";
 import { Composer } from "./components/Composer.js";
 import { Inspector } from "./components/Inspector.js";
 import { Palette } from "./components/Palette.js";
@@ -13,10 +27,14 @@ export interface WorkbenchState {
   tasks: TaskSummary[];
   inbox: InboxItem[];
   policy: PolicySnapshot | null;
+  executors: ExecutorDescriptor[];
   selectedId: string | null;
   detail: TaskDetail | null;
   events: TaskEvent[];
   proposals: Proposal[];
+  runIds: string[];
+  activeRunId: string | null;
+  runEvents: RunStreamEvent[];
   connection: "open" | "reconnecting" | "closed";
   error: string | null;
 }
@@ -32,10 +50,14 @@ export function App(): React.JSX.Element {
     tasks: [],
     inbox: [],
     policy: null,
+    executors: [],
     selectedId: null,
     detail: null,
     events: [],
     proposals: [],
+    runIds: [],
+    activeRunId: null,
+    runEvents: [],
     connection: "closed",
     error: null,
   });
@@ -44,20 +66,24 @@ export function App(): React.JSX.Element {
 
   const refresh = async (selectId?: string) => {
     try {
-      const [tasks, inbox, policy] = await Promise.all([api.listTasks(), api.inbox(), api.policy()]);
+      const [tasks, inbox, policy, execRes] = await Promise.all([api.listTasks(), api.inbox(), api.policy(), api.executors()]);
       const nextId = selectId ?? selectedRef.current ?? tasks.tasks[0]?.taskId ?? null;
-      const [detail, events, proposalsRes] = nextId
-        ? await Promise.all([api.getTask(nextId), api.taskEvents(nextId, 0), api.listProposals(nextId)])
-        : [null, [], { proposals: [] }];
+      const [detail, events, proposalsRes, runsRes] = nextId
+        ? await Promise.all([api.getTask(nextId), api.taskEvents(nextId, 0), api.listProposals(nextId), api.taskRuns(nextId)])
+        : [null, [], { proposals: [] }, { runs: [] as string[] }];
+      const nextRunId = runsRes.runs[0] ?? null;
       setState((previous) => ({
         ...previous,
         tasks: tasks.tasks,
         inbox: inbox.items,
         policy,
+        executors: execRes.executors,
         selectedId: nextId,
         detail,
         events,
         proposals: proposalsRes.proposals,
+        runIds: runsRes.runs,
+        activeRunId: previous.selectedId === nextId && previous.activeRunId && runsRes.runs.includes(previous.activeRunId) ? previous.activeRunId : nextRunId,
         error: null,
       }));
     } catch (error) {
@@ -116,15 +142,42 @@ export function App(): React.JSX.Element {
     return () => window.removeEventListener("keydown", onKey);
   }, []);
 
+  // Live NDJSON run stream subscription for the selected task's active run.
+  useEffect(() => {
+    const taskId = state.selectedId;
+    const runId = state.activeRunId;
+    if (!taskId || !runId) {
+      setState((previous) => (previous.runEvents.length === 0 ? previous : { ...previous, runEvents: [] }));
+      return;
+    }
+    setState((previous) => ({ ...previous, runEvents: [] }));
+    const unsub = subscribeRunStream(readSessionToken(), taskId, runId, 0, (event) => {
+      setState((previous) => {
+        if (previous.selectedId !== taskId || previous.activeRunId !== runId) return previous;
+        if (previous.runEvents.some((existing) => existing.seq === event.seq)) return previous;
+        return { ...previous, runEvents: [...previous.runEvents, event].slice(-400) };
+      });
+    });
+    return unsub;
+  }, [state.selectedId, state.activeRunId]);
+
   const select = async (taskId: string) => {
-    setState((previous) => ({ ...previous, selectedId: taskId }));
+    setState((previous) => ({ ...previous, selectedId: taskId, activeRunId: null, runEvents: [] }));
     try {
-      const [detail, events, proposalsRes] = await Promise.all([
+      const [detail, events, proposalsRes, runsRes] = await Promise.all([
         api.getTask(taskId),
         api.taskEvents(taskId, 0),
         api.listProposals(taskId),
+        api.taskRuns(taskId),
       ]);
-      setState((previous) => ({ ...previous, detail, events, proposals: proposalsRes.proposals }));
+      setState((previous) => ({
+        ...previous,
+        detail,
+        events,
+        proposals: proposalsRes.proposals,
+        runIds: runsRes.runs,
+        activeRunId: runsRes.runs[0] ?? null,
+      }));
     } catch (error) {
       setState((previous) => ({ ...previous, error: describe(error) }));
     }
@@ -163,6 +216,7 @@ export function App(): React.JSX.Element {
               tasks={state.tasks}
               inbox={state.inbox}
               policy={state.policy}
+              executors={state.executors}
               selectedId={state.selectedId}
               onSelect={(taskId) => void select(taskId)}
             />
@@ -200,7 +254,16 @@ export function App(): React.JSX.Element {
             <Inspector
               detail={state.detail}
               events={state.events}
+              runIds={state.runIds}
+              activeRunId={state.activeRunId}
+              runEvents={state.runEvents}
               proposals={state.proposals}
+              onSelectRun={(runId) => setState((previous) => ({ ...previous, activeRunId: runId }))}
+              onSteer={async (taskId, message) => {
+                const res = await api.steer(taskId, message);
+                return { accepted: res.accepted, reason: res.reason };
+              }}
+              onReconcileOperation={(operationId) => run(async () => { await api.reconcileOperation(operationId); })}
               onStop={(taskId) => run(async () => { await api.stop(taskId); })}
               onProposeGoal={(taskId, goal) => run(async () => { await api.proposeGoal(taskId, goal); })}
               onConfirmProposal={(proposalId) => run(async () => { await api.confirmProposal(proposalId); })}

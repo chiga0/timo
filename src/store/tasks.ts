@@ -1,5 +1,7 @@
 import type { Database } from "./database.js";
-import type { SseCandidate, SseIncident, SseVerdict, Finding } from "../sse/contract.js";
+import type { SseCandidate, SseIncident, SseVerdict } from "../sse/contract.js";
+import type { RepoDeliveryState, TaskKind } from "../config.js";
+import type { VerificationFinding, VerificationPlan } from "../verify/pipeline.js";
 
 export type TaskStatus =
   | "accepted"
@@ -28,6 +30,8 @@ export type WaitingReason =
   | "effect_unknown"
   | "retrying"
   | "budget_exhausted"
+  /** Waiting on external CI checks with 0 model calls. */
+  | "waiting_external_ci"
   /** A red-line permission request is parked until the user decides. */
   | "needs_human_decision";
 
@@ -38,14 +42,20 @@ export interface ResultIncident {
 }
 
 export interface TaskResult {
-  verdict: SseVerdict;
-  incidents: ResultIncident[];
+  verdict: SseVerdict | "delivered" | "verified";
+  incidents?: ResultIncident[];
   inputDigest: string;
   verifierVersion: string;
+  candidateDigest?: string;
+  boundCommits?: Record<string, string>;
+  steps?: unknown[];
+  productionDeployed?: boolean;
 }
 
 export interface TaskRow {
   taskId: string;
+  kind: TaskKind;
+  executorId: string | null;
   requestId: string;
   requestDigest: string;
   status: TaskStatus;
@@ -56,6 +66,9 @@ export interface TaskRow {
   runId: string | null;
   result: TaskResult | null;
   failureReason: string | null;
+  repos: RepoDeliveryState[];
+  verificationPlan: VerificationPlan | null;
+  maxRepairRounds: number;
   createdAt: string;
   updatedAt: string;
 }
@@ -92,13 +105,17 @@ export interface TaskRecordView {
   verification: {
     result: string;
     verifierVersion: string;
-    findings: Finding[];
+    findings: VerificationFinding[];
     createdAt: string;
+    stale: boolean;
+    candidateDigest: string | null;
   } | null;
 }
 
 export interface NewTaskInput {
   taskId: string;
+  kind?: TaskKind;
+  executorId?: string | null;
   requestId: string;
   requestDigest: string;
   inputDigest: string;
@@ -106,6 +123,9 @@ export interface NewTaskInput {
   requestText: string;
   brief: BriefRequirements;
   grants: Grant[];
+  repos?: RepoDeliveryState[];
+  verificationPlan?: VerificationPlan | null;
+  maxRepairRounds?: number;
   environment: string;
   providerInstanceId: string;
   model: string;
@@ -118,6 +138,8 @@ export class RequestConflictError extends Error {
 
 interface TaskDbRow {
   task_id: string;
+  kind?: TaskKind | null;
+  executor_id?: string | null;
   request_id: string;
   request_digest: string;
   status: TaskStatus;
@@ -128,6 +150,9 @@ interface TaskDbRow {
   run_id: string | null;
   result_json: string | null;
   failure_reason: string | null;
+  repos_json?: string | null;
+  verification_plan_json?: string | null;
+  max_repair_rounds?: number | null;
   created_at: string;
   updated_at: string;
 }
@@ -135,6 +160,8 @@ interface TaskDbRow {
 function toTaskRow(row: TaskDbRow): TaskRow {
   return {
     taskId: row.task_id,
+    kind: row.kind ?? "sse_log",
+    executorId: row.executor_id ?? null,
     requestId: row.request_id,
     requestDigest: row.request_digest,
     status: row.status,
@@ -145,6 +172,9 @@ function toTaskRow(row: TaskDbRow): TaskRow {
     runId: row.run_id,
     result: row.result_json ? (JSON.parse(row.result_json) as TaskResult) : null,
     failureReason: row.failure_reason,
+    repos: row.repos_json ? (JSON.parse(row.repos_json) as RepoDeliveryState[]) : [],
+    verificationPlan: row.verification_plan_json ? (JSON.parse(row.verification_plan_json) as VerificationPlan) : null,
+    maxRepairRounds: typeof row.max_repair_rounds === "number" ? row.max_repair_rounds : 2,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
@@ -167,11 +197,24 @@ export class TaskStore {
       }
       this.db
         .prepare(
-          `INSERT INTO tasks (task_id, request_id, request_digest, status, waiting_reason, input_digest, artifact_path,
-             thread_id, run_id, result_json, failure_reason, created_at, updated_at)
-           VALUES (?, ?, ?, 'accepted', NULL, ?, ?, NULL, NULL, NULL, NULL, ?, ?)`,
+          `INSERT INTO tasks (task_id, kind, executor_id, request_id, request_digest, status, waiting_reason, input_digest, artifact_path,
+             thread_id, run_id, result_json, failure_reason, repos_json, verification_plan_json, max_repair_rounds, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, 'accepted', NULL, ?, ?, NULL, NULL, NULL, NULL, ?, ?, ?, ?, ?)`,
         )
-        .run(input.taskId, input.requestId, input.requestDigest, input.inputDigest, input.artifactPath, input.now, input.now);
+        .run(
+          input.taskId,
+          input.kind ?? "sse_log",
+          input.executorId ?? null,
+          input.requestId,
+          input.requestDigest,
+          input.inputDigest,
+          input.artifactPath,
+          input.repos ? JSON.stringify(input.repos) : null,
+          input.verificationPlan ? JSON.stringify(input.verificationPlan) : null,
+          input.maxRepairRounds ?? 2,
+          input.now,
+          input.now,
+        );
       this.db
         .prepare("INSERT INTO brief_revisions (task_id, version, request_text, requirements_json, created_at) VALUES (?, 1, ?, ?, ?)")
         .run(input.taskId, input.requestText, JSON.stringify(input.brief), input.now);
@@ -223,11 +266,13 @@ export class TaskStore {
       .all(taskId) as Array<{ thread_id: string; run_id: string; run_status: string; last_observed_at: string }>;
     const verificationRow = this.db
       .prepare(
-        `SELECT v.result, v.verifier_version, v.findings_json, v.created_at FROM verifications v
+        `SELECT v.result, v.verifier_version, v.findings_json, v.created_at, v.stale, COALESCE(v.candidate_digest, c.digest) AS candidate_digest FROM verifications v
          JOIN candidates c ON c.candidate_id = v.candidate_id
-         WHERE c.task_id = ? ORDER BY v.created_at DESC LIMIT 1`,
+         WHERE c.task_id = ? ORDER BY v.created_at DESC, v.rowid DESC LIMIT 1`,
       )
-      .get(taskId) as { result: string; verifier_version: string; findings_json: string; created_at: string } | undefined;
+      .get(taskId) as
+      | { result: string; verifier_version: string; findings_json: string; created_at: string; stale: number; candidate_digest: string | null }
+      | undefined;
 
     return {
       task,
@@ -249,8 +294,10 @@ export class TaskStore {
         ? {
             result: verificationRow.result,
             verifierVersion: verificationRow.verifier_version,
-            findings: JSON.parse(verificationRow.findings_json) as Finding[],
+            findings: JSON.parse(verificationRow.findings_json) as VerificationFinding[],
             createdAt: verificationRow.created_at,
+            stale: Number(verificationRow.stale) === 1,
+            candidateDigest: verificationRow.candidate_digest ?? null,
           }
         : null,
     };
@@ -283,12 +330,73 @@ export class TaskStore {
     this.db.prepare("UPDATE tasks SET result_json = ?, updated_at = ? WHERE task_id = ?").run(JSON.stringify(result), now, taskId);
   }
 
-  executionFor(taskId: string): { executionId: string; environment: string; providerInstanceId: string; model: string } | undefined {
+  setRepos(taskId: string, repos: RepoDeliveryState[], now: string): void {
+    this.db.prepare("UPDATE tasks SET repos_json = ?, updated_at = ? WHERE task_id = ?").run(JSON.stringify(repos), now, taskId);
+  }
+
+  /** Marks prior verifications for older candidate digests as stale so they cannot satisfy completion. */
+  invalidateStaleVerifications(taskId: string, currentCandidateDigest: string): number {
+    const result = this.db
+      .prepare(
+        `UPDATE verifications SET stale = 1
+         WHERE stale = 0
+           AND candidate_id IN (SELECT candidate_id FROM candidates WHERE task_id = ?)
+           AND COALESCE(candidate_digest, '') != ?`,
+      )
+      .run(taskId, currentCandidateDigest);
+    return Number(result.changes);
+  }
+
+  /** Lists all verification records for a task (newest first), including stale flags. */
+  listVerifications(
+    taskId: string,
+  ): Array<{
+    verificationId: string;
+    candidateId: string;
+    candidateDigest: string;
+    result: string;
+    verifierVersion: string;
+    findings: VerificationFinding[];
+    stale: boolean;
+    createdAt: string;
+  }> {
+    const rows = this.db
+      .prepare(
+        `SELECT v.verification_id, v.candidate_id, COALESCE(v.candidate_digest, c.digest) AS candidate_digest,
+                v.result, v.verifier_version, v.findings_json, v.stale, v.created_at
+         FROM verifications v
+         JOIN candidates c ON c.candidate_id = v.candidate_id
+         WHERE c.task_id = ?
+         ORDER BY v.created_at DESC, v.rowid DESC`,
+      )
+      .all(taskId) as Array<{
+      verification_id: string;
+      candidate_id: string;
+      candidate_digest: string;
+      result: string;
+      verifier_version: string;
+      findings_json: string;
+      stale: number;
+      created_at: string;
+    }>;
+    return rows.map((row) => ({
+      verificationId: row.verification_id,
+      candidateId: row.candidate_id,
+      candidateDigest: row.candidate_digest,
+      result: row.result,
+      verifierVersion: row.verifier_version,
+      findings: JSON.parse(row.findings_json) as VerificationFinding[],
+      stale: Number(row.stale) === 1,
+      createdAt: row.created_at,
+    }));
+  }
+
+  executionFor(taskId: string): { executionId: string; generation: number; environment: string; providerInstanceId: string; model: string } | undefined {
     const row = this.db
-      .prepare("SELECT execution_id, environment, provider_instance_id, model FROM executions WHERE task_id = ? ORDER BY generation DESC LIMIT 1")
-      .get(taskId) as { execution_id: string; environment: string; provider_instance_id: string; model: string } | undefined;
+      .prepare("SELECT execution_id, generation, environment, provider_instance_id, model FROM executions WHERE task_id = ? ORDER BY generation DESC LIMIT 1")
+      .get(taskId) as { execution_id: string; generation: number; environment: string; provider_instance_id: string; model: string } | undefined;
     return row
-      ? { executionId: row.execution_id, environment: row.environment, providerInstanceId: row.provider_instance_id, model: row.model }
+      ? { executionId: row.execution_id, generation: row.generation, environment: row.environment, providerInstanceId: row.provider_instance_id, model: row.model }
       : undefined;
   }
 
@@ -297,10 +405,67 @@ export class TaskStore {
     return row ? toOperationRow(row) : undefined;
   }
 
-  setOperationStatus(operationId: string, status: OperationStatus, receipt: unknown, now: string): void {
+  getOperationById(operationId: string): OperationRow | undefined {
+    const row = this.db.prepare("SELECT * FROM operations WHERE operation_id = ?").get(operationId) as OperationDbRow | undefined;
+    return row ? toOperationRow(row) : undefined;
+  }
+
+  getOperationByKey(operationKey: string): OperationRow | undefined {
+    const row = this.db.prepare("SELECT * FROM operations WHERE operation_key = ?").get(operationKey) as OperationDbRow | undefined;
+    return row ? toOperationRow(row) : undefined;
+  }
+
+  listOperations(taskId: string): OperationRow[] {
+    const rows = this.db
+      .prepare("SELECT * FROM operations WHERE task_id = ? ORDER BY created_at")
+      .all(taskId) as OperationDbRow[];
+    return rows.map(toOperationRow);
+  }
+
+  /**
+   * Intent-Before-Effect: persists an external operation intent with a stable
+   * idempotency key before invoking any external platform. If the same
+   * `(taskId, kind)` already exists, returns the existing row unchanged.
+   */
+  ensureOperationIntent(input: {
+    operationId: string;
+    taskId: string;
+    kind: string;
+    operationKey: string;
+    clientRequestId: string;
+    payload: Record<string, unknown>;
+    now: string;
+  }): { operation: OperationRow; created: boolean } {
+    return this.db.transaction(() => {
+      const existing = this.getOperation(input.taskId, input.kind);
+      if (existing) return { operation: existing, created: false };
+      this.db
+        .prepare(
+          `INSERT INTO operations (operation_id, task_id, kind, status, client_request_id, operation_key, payload_json, receipt_json, created_at, updated_at)
+           VALUES (?, ?, ?, 'pending', ?, ?, ?, NULL, ?, ?)`,
+        )
+        .run(
+          input.operationId,
+          input.taskId,
+          input.kind,
+          input.clientRequestId,
+          input.operationKey,
+          JSON.stringify(input.payload),
+          input.now,
+          input.now,
+        );
+      return { operation: this.getOperationById(input.operationId)!, created: true };
+    });
+  }
+
+  setOperationStatus(operationId: string, status: OperationStatus, receipt: unknown, now: string, reconciledAt?: string): void {
     this.db
-      .prepare("UPDATE operations SET status = ?, receipt_json = COALESCE(?, receipt_json), updated_at = ? WHERE operation_id = ?")
-      .run(status, receipt === undefined ? null : JSON.stringify(receipt), now, operationId);
+      .prepare(
+        `UPDATE operations
+         SET status = ?, receipt_json = COALESCE(?, receipt_json), reconciled_at = COALESCE(?, reconciled_at), updated_at = ?
+         WHERE operation_id = ?`,
+      )
+      .run(status, receipt === undefined ? null : JSON.stringify(receipt), reconciledAt ?? null, now, operationId);
   }
 
   recordAttempt(attemptId: string, operationId: string, errorKind: string | null, receipt: unknown, now: string): void {
@@ -319,7 +484,7 @@ export class TaskStore {
     briefVersion: number;
     candidate: unknown;
     candidateDigest: string;
-    verification: { result: string; verifierVersion: string; findings: Finding[]; environment: string | null };
+    verification: { result: string; verifierVersion: string; findings: VerificationFinding[]; environment: string | null };
     now: string;
   }): void {
     this.db.transaction(() => {
@@ -345,17 +510,18 @@ export class TaskStore {
         .run(candidateId, input.taskId, input.taskRunId, JSON.stringify(input.candidate), input.candidateDigest, input.now);
       this.db
         .prepare(
-          `INSERT INTO verifications (verification_id, candidate_id, brief_version, verifier_version, result, findings_json, environment, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+          `INSERT INTO verifications (verification_id, candidate_id, brief_version, verifier_version, result, findings_json, environment, stale, candidate_digest, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?)`,
         )
         .run(
-          `${candidateId}:v:${input.now}`,
+          `${candidateId}:v:${input.now}:${Math.random().toString(36).slice(2, 8)}`,
           candidateId,
           input.briefVersion,
           input.verification.verifierVersion,
           input.verification.result,
           JSON.stringify(input.verification.findings),
           input.verification.environment,
+          input.candidateDigest,
           input.now,
         );
     });
@@ -564,8 +730,10 @@ export interface OperationRow {
   kind: string;
   status: OperationStatus;
   clientRequestId: string;
+  operationKey: string | null;
   payload: Record<string, unknown>;
   receipt: unknown;
+  reconciledAt: string | null;
 }
 
 interface OperationDbRow {
@@ -574,8 +742,10 @@ interface OperationDbRow {
   kind: string;
   status: OperationStatus;
   client_request_id: string;
+  operation_key?: string | null;
   payload_json: string;
   receipt_json: string | null;
+  reconciled_at?: string | null;
 }
 
 function toOperationRow(row: OperationDbRow): OperationRow {
@@ -585,8 +755,10 @@ function toOperationRow(row: OperationDbRow): OperationRow {
     kind: row.kind,
     status: row.status,
     clientRequestId: row.client_request_id,
+    operationKey: row.operation_key ?? null,
     payload: JSON.parse(row.payload_json) as Record<string, unknown>,
     receipt: row.receipt_json ? JSON.parse(row.receipt_json) : null,
+    reconciledAt: row.reconciled_at ?? null,
   };
 }
 

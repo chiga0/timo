@@ -49,6 +49,51 @@ export interface SpawnRequest {
   model?: string;
   /** Hard wall-clock ceiling for the process, in ms. */
   timeoutMs?: number;
+  /** Scoped Capability MCP Gateway URL for this execution generation (Step 4.1). */
+  mcpGatewayUrl?: string;
+  /** Non-sensitive environment variables injected explicitly for the worker. */
+  env?: Record<string, string>;
+}
+
+/**
+ * Env vars carrying real platform/business credentials that must never enter a
+ * worker child process (docs/architecture.md "凭据物理隔离"). Only the local
+ * Capability MCP Gateway reads these.
+ */
+const SECRET_ENV_PATTERNS: ReadonlyArray<RegExp> = [
+  /^GH_TOKEN$/i,
+  /^GITHUB_TOKEN$/i,
+  /^GITLAB_TOKEN$/i,
+  /^A1_TOKEN$/i,
+  /^AONE_TOKEN$/i,
+  /^TIMO_SESSION_TOKEN$/i,
+  /^TIMO_PLATFORM_/i,
+  /^TIMO_SECRET_/i,
+  /^PROD_/i,
+  /^DEPLOY_/i,
+  /_SECRET_KEY$/i,
+  /_ACCESS_TOKEN$/i,
+];
+
+/** Builds a clean worker environment with sensitive business tokens removed. */
+export function buildIsolatedWorkerEnv(
+  baseEnv: NodeJS.ProcessEnv = process.env,
+  extraEnv?: Record<string, string>,
+): Record<string, string> {
+  const clean: Record<string, string> = {};
+  for (const [key, value] of Object.entries(baseEnv)) {
+    if (value === undefined) continue;
+    if (SECRET_ENV_PATTERNS.some((pattern) => pattern.test(key))) continue;
+    clean[key] = value;
+  }
+  clean.GIT_TERMINAL_PROMPT = "0";
+  if (extraEnv) {
+    for (const [key, value] of Object.entries(extraEnv)) {
+      if (SECRET_ENV_PATTERNS.some((pattern) => pattern.test(key))) continue;
+      clean[key] = value;
+    }
+  }
+  return clean;
 }
 
 export interface SpawnResult {
