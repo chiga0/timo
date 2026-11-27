@@ -1,4 +1,6 @@
-import { existsSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { T3Client, T3ClientFactory } from "../adapters/t3.js";
 import { T3Error, buildPrompt } from "../adapters/t3.js";
 import { RetryTracker, failureFingerprint, DEFAULT_RETRY_POLICY, type RetryPolicy } from "../adapters/retry.js";
@@ -853,9 +855,21 @@ export class TaskRunner {
       return;
     }
     const maxRounds = task.kind === "repo_delivery" ? Math.min(Math.max(0, task.maxRepairRounds), remainingBudget - 1) : 0;
-    const basePrompt = this.buildAdapterPrompt(taskId, prepared, generation);
+    // Provision an isolated per-task scratch TMPDIR for read-only review tasks so temporary
+    // MR clones/worktrees are deterministically cleaned up when the run settles.
+    let reviewTmpDir: string | undefined;
+    if (task.kind === "review") {
+      reviewTmpDir = mkdtempSync(join(tmpdir(), `timo-review-${taskId.slice(0, 8)}-`));
+      try {
+        chmodSync(reviewTmpDir, 0o700);
+      } catch {
+        // best-effort POSIX mode
+      }
+    }
+    const basePrompt = this.buildAdapterPrompt(taskId, prepared, generation, reviewTmpDir);
     let currentPrompt = basePrompt;
 
+    try {
     for (let round = 0; round <= maxRounds; round++) {
       const latestTask = store.get(taskId);
       if (!latestTask || isTerminal(latestTask.status) || latestTask.status === "stopping") return;
@@ -917,6 +931,7 @@ export class TaskRunner {
             prompt: currentPrompt,
             model: resolvedModel,
             ...(this.options.runDeadlineMs > 0 ? { timeoutMs: this.options.runDeadlineMs } : {}),
+            ...(reviewTmpDir ? { env: { TMPDIR: reviewTmpDir } } : {}),
             mcpGatewayUrl,
           },
           handleEvent,
@@ -1022,6 +1037,15 @@ export class TaskRunner {
       store.setStatus(taskId, "running", null, now());
       currentPrompt = `${basePrompt}\n\n${formatRepairFeedback(outcome, round + 1, maxRounds)}`;
     }
+    } finally {
+      if (reviewTmpDir) {
+        try {
+          rmSync(reviewTmpDir, { recursive: true, force: true });
+        } catch {
+          // best-effort cleanup
+        }
+      }
+    }
   }
 
   /**
@@ -1074,7 +1098,7 @@ export class TaskRunner {
     }
   }
 
-  private buildAdapterPrompt(taskId: string, workspace: PreparedWorkspace | null, generation = 1): string {
+  private buildAdapterPrompt(taskId: string, workspace: PreparedWorkspace | null, generation = 1, reviewTmpDir?: string): string {
     const view = this.options.store.view(taskId);
     if (!view) return "";
     if (view.task.kind === "sse_log") {
@@ -1107,7 +1131,11 @@ export class TaskRunner {
           `Must:\n${view.brief.must.map((m) => `- ${m}`).join("\n")}`,
           `Must Not:\n${view.brief.mustNot.map((m) => `- ${m}`).join("\n")}`,
           repoPaths.length > 0 ? `Read-only Context Repos:\n${view.task.repos.map((r) => `- ${r.name}: ${r.sourcePath}`).join("\n")}` : "",
-          "Hard Safety Boundary: This is a read-only review/investigation task. NEVER modify or commit changes to any existing local repository checkout or user home directory. If you need to inspect a remote branch or MR diff, use read-only git commands or a temporary mkdtemp directory and clean it up afterwards. Output a clear, thorough, well-structured Markdown report in the user's language.",
+          reviewTmpDir
+            ? `Scratch Directory ($TMPDIR): ${reviewTmpDir} — place any temporary git clone, worktree, or scratch files inside $TMPDIR; Timo automatically cleans up this directory when the task finishes.`
+            : "",
+          "Headless Execution Rule: You are running in a non-interactive background worker. NEVER call interactive prompting tools such as ask_user_question. Perform a read-only review and output the complete structured Markdown report directly; do NOT post comments, approve, or merge the remote MR — if remote MR actions are recommended, list them at the end of the report for the user to confirm.",
+          "Hard Safety Boundary: This is a read-only review/investigation task. NEVER modify or commit changes to any existing local repository checkout or user home directory. Output a clear, thorough, well-structured Markdown report in the user's language.",
         ]
           .filter(Boolean)
           .join("\n\n");
@@ -1147,6 +1175,7 @@ export class TaskRunner {
       `Must Not:\n${view.brief.mustNot.map((m) => `- ${m}`).join("\n")}`,
       repoLines.length > 0 ? `Worktrees:\n${repoLines.join("\n")}` : "",
       capsuleBlock,
+      "Headless Execution Rule: You are running in a non-interactive background worker. NEVER call interactive prompting tools such as ask_user_question; make sound engineering decisions within the brief and commit cleanly.",
       "Hard Safety Boundary: NEVER write, edit, or temporarily mutate any file outside the assigned worktree(s) above (never touch ~/.timo, ~/.codex, ~/.qwen, ~/.claude, or the original repo checkout). Use ephemeral mkdtemp directories for all tests and verification. Never introduce internal/non-public platform codenames, personal absolute paths, or real credentials into source, tests, or docs.",
       "Commit your changes cleanly inside each modified worktree before finishing.",
     ]

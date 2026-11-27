@@ -385,6 +385,7 @@ export class QwenCodeAdapter implements ExecutionAdapter {
       const content = Array.isArray(message?.content) ? message!.content : [];
       const events: Array<{ type: RunStreamEventType; summary: string; data?: unknown }> = [];
       const texts: string[] = [];
+      let hasToolUse = false;
       for (const item of content) {
         const block = item as Record<string, unknown>;
         if (block.type === "thinking" && typeof block.thinking === "string" && block.thinking.trim() !== "") {
@@ -392,6 +393,7 @@ export class QwenCodeAdapter implements ExecutionAdapter {
         } else if (block.type === "text" && typeof block.text === "string" && block.text.trim() !== "") {
           texts.push(block.text);
         } else if (block.type === "tool_use") {
+          hasToolUse = true;
           const name = typeof block.name === "string" ? block.name : "tool";
           const input = block.input;
           events.push({ type: "tool_call", summary: formatToolCallSummary(name, input), data: input });
@@ -403,7 +405,12 @@ export class QwenCodeAdapter implements ExecutionAdapter {
       }
       const joined = texts.join("\n").trim();
       if (joined !== "") {
-        events.push({ type: "thinking", summary: joined });
+        events.push({ type: "thinking", summary: joined, data: { fullText: joined } });
+        // When an assistant turn finishes writing prose with no follow-up tool call,
+        // emit an explicit settling status so the UI stays informative during CLI teardown.
+        if (!hasToolUse) {
+          events.push({ type: "status", summary: "已生成结论正文，等待执行器收尾…" });
+        }
       }
       if (events.length === 0) return sessionId ? { sessionId, events: [] } : null;
       return { sessionId, events, finalText: joined !== "" ? joined : undefined };
@@ -417,7 +424,13 @@ export class QwenCodeAdapter implements ExecutionAdapter {
         const block = item as Record<string, unknown>;
         if (block.type === "tool_result") {
           const text = typeof block.content === "string" ? block.content : JSON.stringify(block.content ?? "");
-          events.push({ type: block.is_error ? "error" : "tool_result", summary: text || "tool_result" });
+          // Keep non-zero tool outputs (e.g. grep exit 1) as `tool_result` so they stay
+          // visible in step details without falsely tripping Watchdog's failure-loop counter.
+          events.push({
+            type: "tool_result",
+            summary: text || "tool_result",
+            ...(block.is_error ? { data: { isError: true } } : {}),
+          });
         }
       }
       return events.length > 0 ? { sessionId, events } : null;

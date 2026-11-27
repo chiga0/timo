@@ -127,3 +127,35 @@ test("QwenCodeAdapter strips business secrets from child env while keeping gatew
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("QwenCodeAdapter keeps non-zero tool_result out of error events and emits settling status after final prose", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "timo-qwen-toolerr-"));
+  const cwd = mkdtempSync(join(tmpdir(), "timo-qwen-toolerr-cwd-"));
+  try {
+    const cli = fakeQwen(
+      dir,
+      [
+        "read -r turn1",
+        `echo '{"type":"assistant","session_id":"s-err","message":{"role":"assistant","content":[{"type":"tool_use","id":"tu1","name":"run_shell_command","input":{"command":"git grep missing"}}]}}'`,
+        `echo '{"type":"user","session_id":"s-err","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tu1","is_error":true,"content":"Command exited with code 1"}]}}'`,
+        `echo '{"type":"assistant","session_id":"s-err","message":{"role":"assistant","content":[{"type":"text","text":"评审结论：无阻塞问题"}]}}'`,
+        `echo '{"type":"result","subtype":"success","session_id":"s-err","is_error":false,"num_turns":2,"result":"评审结论：无阻塞问题","yolo_suppressed":"'"$QWEN_CODE_SUPPRESS_YOLO_WARNING"'"}'`,
+        "exit 0",
+      ].join("\n"),
+    );
+
+    const adapter = new QwenCodeAdapter({ command: cli });
+    const events: RunStreamEvent[] = [];
+    const result = await adapter.spawn({ taskId: "t-err", runId: "r-err", cwd, prompt: "review" }, (ev) => events.push(ev));
+
+    assert.equal(result.status, "succeeded");
+    assert.equal(events.filter((e) => e.type === "error").length, 0, "grep/tool_result is_error must not emit type=error");
+    const toolRes = events.find((e) => e.type === "tool_result");
+    assert.ok(toolRes);
+    assert.deepEqual(toolRes.data, { isError: true });
+    assert.ok(events.some((e) => e.type === "status" && e.summary.includes("等待执行器收尾")));
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

@@ -1,12 +1,15 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { defaultConfig } from "../src/config.js";
 import { AttachmentStore, MAX_ATTACHMENT_BYTES } from "../src/store/attachments.js";
 import { ChatStore, ChatStreamBus } from "../src/store/chat.js";
+import { TaskStore } from "../src/store/tasks.js";
+import { ArtifactStore } from "../src/store/artifacts.js";
 import { TaskService } from "../src/service/task-service.js";
+import { TaskRunner } from "../src/service/runner.js";
 import { MainChatRunner } from "../src/service/chat-runner.js";
 import { ExecutorRegistry, type ExecutionAdapter } from "../src/adapters/execution.js";
 import { Router } from "../src/http/server.js";
@@ -322,6 +325,80 @@ describe("Chat Attachments: storage, safety, persistence and prompt injection", 
           assert.equal(detail.kind, "review");
           assert.equal(reviewRes.taskCardMessage.role, "task_card");
         }
+      } finally {
+        service.close();
+      }
+    });
+  });
+
+  it("TaskRunner provisions an isolated TMPDIR for review tasks, forbids ask_user_question, and cleans up TMPDIR deterministically", async () => {
+    await withTempDir(async (dir) => {
+      const cfg = defaultConfig({}, dir);
+      const { service, db, bus, writer } = TaskService.open(cfg);
+      const store = new TaskStore(db);
+      const artifacts = ArtifactStore.create(dir);
+
+      let capturedPrompt = "";
+      let capturedTmpDir = "";
+      let createdScratchFile = "";
+      const reviewAdapter: ExecutionAdapter = {
+        id: "review-exec",
+        probe: async () => ({
+          id: "review-exec",
+          kind: "cli",
+          available: true,
+          capabilities: { streaming: true, resume: false, steer: false, mcpGateway: false, handoff: false, structuredOutput: false },
+        }),
+        spawn: async (req) => {
+          capturedPrompt = req.prompt;
+          capturedTmpDir = req.env?.TMPDIR ?? "";
+          if (capturedTmpDir) {
+            createdScratchFile = join(capturedTmpDir, "mr-clone.txt");
+            writeFileSync(createdScratchFile, "temporary clone artifact", "utf8");
+          }
+          return { runId: req.runId, externalId: null, status: "succeeded", output: "# 评审完成\n一切正常。", exitCode: 0 };
+        },
+        resume: async (runId) => ({ runId, externalId: null, status: "failed", output: "", exitCode: 1 }),
+        steer: async () => ({ accepted: false }),
+        interrupt: async () => ({ interrupted: true }),
+      };
+
+      const executors = new ExecutorRegistry();
+      executors.register(reviewAdapter);
+      await executors.probeAll();
+
+      const runner = new TaskRunner({
+        store,
+        service,
+        artifacts,
+        writer,
+        bus,
+        t3: null,
+        clientFactory: () => {
+          throw new Error("unused");
+        },
+        pollIntervalMs: 50,
+        waitTimeoutMs: 1000,
+        runDeadlineMs: cfg.runDeadlineMs,
+        executors,
+        log: () => undefined,
+      });
+
+      try {
+        const created = service.createTask({
+          requestId: "review-tmpdir-test",
+          kind: "review",
+          requestText: "评审 MR 42",
+          executorId: "review-exec",
+        });
+        await runner.runOnce();
+        const detail = service.getTask(created.taskId);
+        assert.equal(detail.status, "completed");
+        assert.ok(capturedPrompt.includes("ask_user_question"), "review prompt must explicitly forbid ask_user_question");
+        assert.ok(capturedTmpDir.length > 0, "review worker must receive isolated TMPDIR");
+        assert.ok(capturedPrompt.includes(capturedTmpDir), "review prompt must point worker to $TMPDIR");
+        assert.equal(existsSync(createdScratchFile), false, "scratch files inside $TMPDIR must be auto-cleaned");
+        assert.equal(existsSync(capturedTmpDir), false, "isolated review TMPDIR must be removed after completion");
       } finally {
         service.close();
       }
