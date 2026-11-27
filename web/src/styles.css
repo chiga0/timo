@@ -45,6 +45,7 @@ body,
 #root {
   height: 100%;
   margin: 0;
+  overflow: hidden;
 }
 
 body {
@@ -69,7 +70,7 @@ button {
 .shell {
   display: grid;
   grid-template-columns: 244px minmax(0, 1fr) 336px;
-  height: 100dvh;
+  height: calc(100dvh - 46px);
   overflow: hidden;
 }
 
@@ -365,6 +366,8 @@ button {
 
 .card-body {
   padding: 10px 12px;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .card-box {

@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { InboxItem, Proposal, RunStreamEvent, TaskDetail, TaskEvent } from "../api.js";
 
 type Tab = "overview" | "live";
@@ -31,9 +31,16 @@ export function Inspector(props: {
   const [goal, setGoal] = useState("");
   const [steerText, setSteerText] = useState("");
   const [steerFeedback, setSteerFeedback] = useState<string | null>(null);
+  const logRef = useRef<HTMLDivElement | null>(null);
   const detail = props.detail;
   const decision = props.inbox.find((item) => item.taskId === detail?.taskId && item.decisionKey === "decision_required");
   const unknownOps = (detail?.operations ?? []).filter((op) => op.status === "unknown");
+
+  useEffect(() => {
+    if (tab === "live" && logRef.current) {
+      logRef.current.scrollTop = logRef.current.scrollHeight;
+    }
+  }, [tab, props.runEvents.length]);
 
   if (!detail) {
     return (
@@ -324,7 +331,7 @@ export function Inspector(props: {
               ))}
             </select>
           )}
-          <div className="event-log">
+          <div className="event-log" ref={logRef}>
             {props.activeRunId ? (
               props.runEvents.length === 0 ? (
                 <div className="empty-box">等待执行器输出…</div>
