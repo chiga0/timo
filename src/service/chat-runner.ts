@@ -88,7 +88,8 @@ export class MainChatRunner {
 
     const explicitSource = input.sourcePath?.trim() ?? "";
     const matchedFolders = explicitSource ? [] : selectFoldersForRequest(text, settings?.folders ?? []);
-    if (explicitSource || matchedFolders.length > 0) {
+    const wantsRepoDelivery = explicitSource !== "" || (matchedFolders.length > 0 && hasDeliveryActionIntent(text));
+    if (wantsRepoDelivery) {
       const repos = explicitSource
         ? [
             {
@@ -149,7 +150,11 @@ export class MainChatRunner {
       return { kind: "task", userMessage, taskCardMessage, taskId: created.taskId };
     }
 
-    // Conversational / Chief-of-Staff direct streaming reply (ZERO tasks created!).
+    // Conversational or read-only repo inquiry: stream directly in Main Chat (ZERO tasks created!).
+    // If the user mentioned a single workspace folder for a read-only question
+    // (e.g. "帮我看看 timo 仓库最新进展"), pass that folder as read-only cwd so the
+    // CLI can inspect git log / docs directly and stream the answer in seconds.
+    const readOnlyFolder = matchedFolders.length === 1 ? matchedFolders[0] : undefined;
     const assistantMessage = this.deps.chatStore.append({
       role: "assistant",
       content: "",
@@ -158,7 +163,7 @@ export class MainChatRunner {
       status: "streaming",
     });
     this.deps.chatBus.publish({ event: "chat_message", data: assistantMessage });
-    void this.runStreamingTurn(assistantMessage.messageId, text, chosenExecutor, chosenModel);
+    void this.runStreamingTurn(assistantMessage.messageId, text, chosenExecutor, chosenModel, readOnlyFolder?.path);
     return { kind: "chat", userMessage, assistantMessage };
   }
 
@@ -190,7 +195,13 @@ export class MainChatRunner {
     return { stopped };
   }
 
-  private async runStreamingTurn(messageId: string, userText: string, executorId: string, model?: string): Promise<void> {
+  private async runStreamingTurn(
+    messageId: string,
+    userText: string,
+    executorId: string,
+    model?: string,
+    readOnlyCwd?: string,
+  ): Promise<void> {
     if (!this.deps.executors || !this.deps.executors.has(executorId)) {
       const updated = this.deps.chatStore.update(messageId, {
         content: `执行器 \`${executorId}\` 不可用，请在设置中检查代理状态或切换其他代理。`,
@@ -213,9 +224,9 @@ export class MainChatRunner {
     }
 
     const runId = `chat-${messageId.slice(0, 8)}-${newId().slice(0, 6)}`;
-    const chatCwd = join(this.deps.home, "chat-cwd");
+    const chatCwd = readOnlyCwd || join(this.deps.home, "chat-cwd");
     mkdirSync(chatCwd, { recursive: true, mode: 0o700 });
-    const prompt = this.buildChatPrompt(userText, messageId);
+    const prompt = this.buildChatPrompt(userText, messageId, readOnlyCwd);
 
     this.activeTurns.set(messageId, { executorId: adapter.id, runId });
     let accumulated = "";
@@ -289,12 +300,14 @@ export class MainChatRunner {
     }
   }
 
-  private buildChatPrompt(userText: string, currentAssistantMsgId: string): string {
+  private buildChatPrompt(userText: string, currentAssistantMsgId: string, readOnlyCwd?: string): string {
     const settings = this.deps.settingsStore?.load();
     const sections: string[] = [
       "你是 Timo（提莫），用户的本地个人研发总助理（Chief of Staff）。",
-      "当前处于「主对话」会话中：请用简洁、清晰的中文 Markdown 直接回答用户问题；不要擅自修改代码仓库或运行破坏性命令。",
-      "当用户明确提到某个工作区仓库需要开发、修改或修复代码时，系统会自动为其创建后台独立 Worktree 交付任务；否则你只需直接给出高质量回答或建议。",
+      "当前处于「主对话」只读会话中：请用简洁、清晰的中文 Markdown 直接回答用户问题；严禁修改任何文件、严禁创建 commit、严禁运行耗时的全量测试或破坏性命令。",
+      ...(readOnlyCwd
+        ? [`本次对话的工作目录已定位到 \`${readOnlyCwd}\`，你可以直接只读查看其中的 git log、文档或代码文件来精准回答用户问题，但不要修改任何文件。`]
+        : ["当用户明确要求开发、修复或修改某个工作区仓库代码时，系统会自动为其创建后台独立 Worktree 交付任务；否则你只需直接给出高质量回答或建议。"]),
     ];
 
     if (settings?.assistant.systemPrompt?.trim()) {
@@ -341,4 +354,15 @@ export class MainChatRunner {
     sections.push(`## 用户最新消息\n${userText}`);
     return sections.join("\n\n");
   }
+}
+
+/**
+ * Distinguishes actionable engineering delivery requests (modify/fix/implement/PR)
+ * from read-only repository questions ("帮我看看 timo 最新进展").
+ */
+export function hasDeliveryActionIntent(text: string): boolean {
+  const lowered = text.toLowerCase();
+  return /(修复|修改|改动|改一下|改下|改掉|实现|开发|新增|添加|加上|补充|补齐|重构|优化|重写|删除|移除|去掉|清理|升级|迁移|接入|集成|提交|发\s*pr|提\s*pr|提\s*mr|写一个|写个|写单测|补单测|修一下|修个|\b(fix|implement|refactor|modify|edit|patch|rewrite|migrate|upgrade|add|create|write|remove|delete|open\s+pr|create\s+mr|commit)\b)/i.test(
+    lowered,
+  );
 }

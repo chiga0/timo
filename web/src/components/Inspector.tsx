@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import type { ExecutorDescriptor, InboxItem, Proposal, RunStreamEvent, TaskDetail, TaskEvent } from "../api.js";
+import { Markdown } from "./Markdown.js";
 
 export type InspectorTab = "overview" | "live";
 
@@ -302,6 +303,24 @@ export function Inspector(props: {
                       )}
                     </div>
                   ))}
+                </div>
+              </section>
+            );
+          })()}
+
+          {(() => {
+            const assistantText =
+              detail.result && typeof detail.result === "object" && typeof (detail.result as { assistantText?: unknown }).assistantText === "string"
+                ? ((detail.result as { assistantText: string }).assistantText).trim()
+                : "";
+            if (!assistantText) return null;
+            return (
+              <section className="card">
+                <header className="card-head">
+                  <span>执行汇报</span>
+                </header>
+                <div className="card-body small">
+                  <Markdown content={assistantText} />
                 </div>
               </section>
             );

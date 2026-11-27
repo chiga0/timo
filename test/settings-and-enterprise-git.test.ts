@@ -662,12 +662,14 @@ describe("Settings HTTP Routes & Human-Readable Task Titles", () => {
           if (f.event === "chat_delta") deltas.push(f.data.delta);
         });
 
+        const spawnCwds: string[] = [];
         const fakeAdapter: ExecutionAdapter = {
           id: "qwen-code",
           async probe() {
             return { id: "qwen-code", kind: "cli", available: true, capabilities: { stream: true } };
           },
           async spawn(req: SpawnRequest, onEvent: (ev: RunStreamEvent) => void): Promise<SpawnResult> {
+            spawnCwds.push(req.cwd);
             onEvent({ seq: 1, runId: req.runId, taskId: req.taskId, type: "text_delta", at: Date.now(), summary: "你好，" });
             onEvent({ seq: 2, runId: req.runId, taskId: req.taskId, type: "text_delta", at: Date.now(), summary: "我是 Timo！" });
             return { runId: req.runId, externalId: "ext-1", status: "succeeded", exitCode: 0, output: "你好，我是 Timo！" };
@@ -696,7 +698,14 @@ describe("Settings HTTP Routes & Human-Readable Task Titles", () => {
         assert.equal(service.listTasks(50, undefined, { archived: "all" }).length, 0, "casual chat MUST NOT create a task");
         assert.equal(service.listInbox().length, 0, "casual chat MUST NOT create an inbox item");
 
-        // 3. Explicit repo mention delegates a background task and appends ONE task_card in Main Chat
+        // 2b. Read-only repo question stays in Main Chat with cwd set to that repo (ZERO worktree / task created!)
+        const readOnlyRes = chatRunner.send({ text: "帮我看看 demo-app 仓库最新的进展", executorId: "qwen-code" });
+        assert.equal(readOnlyRes.kind, "chat");
+        await new Promise((r) => setTimeout(r, 40));
+        assert.equal(spawnCwds.at(-1), repoDir);
+        assert.equal(service.listTasks(50, undefined, { archived: "all" }).length, 0, "read-only repo inquiry MUST NOT create a repo_delivery task");
+
+        // 3. Explicit delivery intent delegates a background task and appends ONE task_card in Main Chat
         const workRes = chatRunner.send({ text: "请帮我修复 demo-app 的超时逻辑", executorId: "qwen-code" });
         assert.equal(workRes.kind, "task");
         assert.equal(service.listTasks(50, undefined, { archived: "all" }).length, 1);

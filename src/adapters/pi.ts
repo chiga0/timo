@@ -218,7 +218,23 @@ export class PiAdapter implements ExecutionAdapter {
       }
       return null;
     }
-    if (type === "agent_end" || type === "turn_end" || type === "turn_start") return null;
+    if (type === "message_start" || type === "tool_execution_update" || type === "tool_execution_end" || type === "agent_end" || type === "turn_end" || type === "turn_start") {
+      return null;
+    }
+    if (type === "tool_execution_start") {
+      const name = typeof record.toolName === "string" ? record.toolName : typeof record.name === "string" ? record.name : "tool";
+      const args = record.args ?? record.input;
+      const events: Array<{ type: RunStreamEventType; summary: string; data?: unknown }> = [
+        { type: "tool_call", summary: formatPiToolSummary(name, args), data: args },
+      ];
+      if ((name === "edit" || name === "write") && args && typeof args === "object") {
+        const path = (args as Record<string, unknown>).path;
+        if (typeof path === "string" && path.trim() !== "") {
+          events.push({ type: "patch", summary: `modified ${path.trim()}`, data: { files: [path.trim()] } });
+        }
+      }
+      return { events };
+    }
     if (type === "message" || type === "message_end") {
       const message = record.message as Record<string, unknown> | undefined;
       const role = typeof message?.role === "string" ? message.role : "assistant";
@@ -278,6 +294,17 @@ export class PiAdapter implements ExecutionAdapter {
     }, 2_000);
     escalate.unref?.();
   }
+}
+
+function formatPiToolSummary(name: string, args: unknown): string {
+  if (args && typeof args === "object" && !Array.isArray(args)) {
+    const rec = args as Record<string, unknown>;
+    const target = rec.path ?? rec.file_path ?? rec.command ?? rec.pattern;
+    if (typeof target === "string" && target.trim() !== "") {
+      return `${name}(${target.trim()})`;
+    }
+  }
+  return name;
 }
 
 function resolveOnPath(command: string): string | null {
