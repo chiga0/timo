@@ -211,6 +211,35 @@ export function registerChiefTools(gateway: CapabilityMcpGateway, deps: ChiefToo
   });
 
   gateway.registerChiefTool({
+    name: "timo_resync_skills",
+    description:
+      "Re-sync already-managed skills in ~/.timo/skills from their external source directories (managed copies are real copies, so upstream edits do not propagate automatically). Returns a per-skill diff summary (unchanged / updated / missing-source); pass dryRun to preview without writing.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        sourceDirs: { type: "array", items: { type: "string" }, description: "Optional extra source skill dirs to search for matching skill ids" },
+        skillIds: { type: "array", items: { type: "string" }, description: "Optional subset of managed skill ids/names to resync" },
+        dryRun: { type: "boolean", description: "Only compute the diff summary, do not write (default false)" },
+      },
+    },
+    handler: async (args) => {
+      if (!deps.skillRegistry) return { isError: true, data: { code: "UNSUPPORTED", message: "skill registry not configured" } };
+      const sourceDirs = Array.isArray(args.sourceDirs)
+        ? args.sourceDirs.filter((d): d is string => typeof d === "string" && d.trim() !== "").map((d) => d.trim())
+        : undefined;
+      const skillIds = Array.isArray(args.skillIds)
+        ? args.skillIds.filter((s): s is string => typeof s === "string" && s.trim() !== "").map((s) => s.trim())
+        : undefined;
+      const report = deps.skillRegistry.resyncManaged({
+        sourceDirs,
+        skillIds: skillIds && skillIds.length > 0 ? skillIds : undefined,
+        dryRun: args.dryRun === true,
+      });
+      return { data: report };
+    },
+  });
+
+  gateway.registerChiefTool({
     name: "timo_save_skill",
     description: "Create or update a Timo-managed skill in ~/.timo/skills/<id>/SKILL.md so it works across all executors.",
     inputSchema: {

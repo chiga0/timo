@@ -54,6 +54,26 @@ export interface SkillRecord {
   filePath: string;
   bodyPreview: string;
   updatedAt: string;
+  sizeBytes?: number;
+  warnings?: string[];
+}
+
+export interface ResyncReport {
+  dryRun: boolean;
+  unchanged: string[];
+  updated: string[];
+  missingSource: string[];
+  entries: Array<{
+    skillId: string;
+    status: "unchanged" | "updated" | "missing-source";
+    sourcePath?: string;
+    added: string[];
+    modified: string[];
+    removed: string[];
+    bodyChanged?: boolean;
+    frontmatterChanged?: boolean;
+    warnings?: string[];
+  }>;
 }
 
 export interface ExternalSkillSource {
@@ -464,6 +484,13 @@ export class Api {
 
   importSkills(input: { sourceDir: string; skillIds?: string[]; overwrite?: boolean }): Promise<{ imported: string[]; skipped: string[]; skills: SkillRecord[] }> {
     return this.call("/api/skills/import", {
+      method: "POST",
+      body: JSON.stringify(input),
+    });
+  }
+
+  resyncSkills(input: { sourceDirs?: string[]; skillIds?: string[]; dryRun?: boolean } = {}): Promise<ResyncReport & { skills: SkillRecord[] }> {
+    return this.call("/api/skills/resync", {
       method: "POST",
       body: JSON.stringify(input),
     });

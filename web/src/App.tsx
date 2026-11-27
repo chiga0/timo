@@ -603,6 +603,18 @@ export function App(): React.JSX.Element {
             }));
             return { imported: res.imported, skipped: res.skipped };
           }}
+          onResyncSkills={async (input) => {
+            const res = await api.resyncSkills(input);
+            if (!input?.dryRun) {
+              const [sp, chatRes] = await Promise.all([api.getSkills(), api.getChat(200)]);
+              setState((previous) => ({
+                ...previous,
+                skillsPayload: sp,
+                contextSummary: chatRes.contextSummary ?? previous.contextSummary,
+              }));
+            }
+            return res;
+          }}
           onPickFolder={() => api.pickFolder()}
           onInspectFolder={(path) => api.inspectFolder(path)}
           onScanRoot={(path) => api.scanWorkspaceRoot(path)}

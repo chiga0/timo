@@ -368,7 +368,13 @@ export class TaskService {
       brief: {
         goal: requestText,
         must: ["在独立 worktree 中完成修改并提交候选 commit", "通过声明式独立验收管线且绑定精确候选 SHA"],
-        mustNot: ["禁止生产发布（deploy_prod）", "禁止修改原仓库工作目录", "禁止绕过独立验收自报通过"],
+        mustNot: [
+          "禁止生产发布（deploy_prod）",
+          "禁止修改原仓库工作目录",
+          "禁止写入、修改或临时改动 worktree 之外的任何本机文件或用户目录（如 ~/.timo、~/.codex、~/.qwen、~/.claude 等），一切测试与验证必须在临时目录（mkdtemp）中进行",
+          "禁止在代码、测试或文档中写入内部非公开平台代号、真实凭证或本机绝对路径",
+          "禁止绕过独立验收自报通过",
+        ],
         evidence: verificationPlan.steps.map((step) => `${step.type}:${step.name ?? ("repo" in step ? step.repo ?? "all" : "check")}`),
       },
       grants: [

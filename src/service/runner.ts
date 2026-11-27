@@ -1123,6 +1123,7 @@ export class TaskRunner {
       `Must Not:\n${view.brief.mustNot.map((m) => `- ${m}`).join("\n")}`,
       repoLines.length > 0 ? `Worktrees:\n${repoLines.join("\n")}` : "",
       capsuleBlock,
+      "Hard Safety Boundary: NEVER write, edit, or temporarily mutate any file outside the assigned worktree(s) above (never touch ~/.timo, ~/.codex, ~/.qwen, ~/.claude, or the original repo checkout). Use ephemeral mkdtemp directories for all tests and verification. Never introduce internal/non-public platform codenames, personal absolute paths, or real credentials into source, tests, or docs.",
       "Commit your changes cleanly inside each modified worktree before finishing.",
     ]
       .filter(Boolean)

@@ -439,6 +439,19 @@ export function registerApi(router: Router, deps: ApiDeps): void {
     };
   });
 
+  router.add("POST", "/api/skills/resync", (context) => {
+    if (!deps.skillRegistry) {
+      throw new RouteError(501, "unsupported", "skill registry is not configured");
+    }
+    const body = asRecord(context.body);
+    const sourceDirs = optionalStringArray(body.sourceDirs);
+    const skillIds = optionalStringArray(body.skillIds);
+    const dryRun = body.dryRun === true;
+    const report = withMappedErrors(() => deps.skillRegistry!.resyncManaged({ sourceDirs, skillIds, dryRun }));
+    const settings = deps.settingsStore?.load();
+    return { body: { ...report, skills: deps.skillRegistry.list(settings) } };
+  });
+
   router.add("POST", "/api/chat/send", (context) => {
     if (!deps.chatRunner) {
       throw new RouteError(501, "unsupported", "main chat runner is not configured");

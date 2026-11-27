@@ -656,6 +656,7 @@ button.list-row:hover { background: var(--muted-bg); }
               <tr><td>固定「待我处理」与任务管理</td><td>左侧栏依次为「主对话」「固定置顶的待我处理（仅红线审批/阻塞失败/效果未知，已完成绝不入待办）」「后台任务列表（支持重命名/归档/删除与活跃/已归档切换）」和底部「设置」。</td></tr>
               <tr><td>单任务详情页（以任务为中心）</td><td>点击主对话任务卡「查看详情 →」或左侧任务项时，主区切换为宽屏单任务详情页（顶部 <code>← 返回主对话</code> + 标题重命名 + 停止/重试/归档/删除）；左主栏展示完整不截断的 Markdown/Mermaid 最终结论、实时执行进展流与运行中纠偏（Steer）；右证据栏收纳原始需求、代码改动/MR/CI、折叠式独立验收输出与跨执行器交接（Handoff）。</td></tr>
               <tr><td>独立设置视图（工作区、Skills 与凭证隔离）</td><td>按「通用（外观）/ 开发（主助手与代理、统一工作区与受管 Worktree、Timo 统一 Skills 仓库与本机 Agent 一键导入、平台与本地/独立凭证）/ 系统（安全护栏与状态）」分组收纳；主对话自动装配知识库、服务目录、已启用 Skills 及受控 Chief-of-Staff MCP 控制面工具（支持 <code>/skill-name</code> 显式调用），密钥独立存于 <code>0600</code> 保险箱，绝不进知识库或执行器。</td></tr>
+              <tr><td>Skill 导入与再同步语义</td><td>从本机 Agent 目录导入 Skill 时，除 <code>SKILL.md</code> 外一并迁移同目录的 <code>references/</code>、<code>scripts/</code>、<code>assets/</code>、<code>templates/</code> 等辅助子目录与辅助文件（文本逐个脱敏、脚本保留可执行位、二进制原样复制并标 warning、路径穿越一律拦截）；未识别的 frontmatter 字段（<code>version</code>、<code>files</code>、<code>x-source</code> 等）原样保留并可往返；<code>SKILL.md</code> 全文完整读取（仅列表预览限长，超限时在设置页显式展示体积与「全文已完整加载」提示而非静默截断）；托管副本为真实拷贝，支持在「设置 → Skills」点击「检查同步」以 <code>dryRun</code> 预览正文/元数据与附属文件的增删改差异，确认后调用 <code>/api/skills/resync</code> 或 Chief <code>timo_resync_skills</code> 同步落盘并自动清理上游已删除的过期附属文件。</td></tr>
             </tbody>
           </table>
         </div>

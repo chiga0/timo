@@ -10,6 +10,7 @@ import type {
   PlatformConnectionConfig,
   PolicyRuleItem,
   PolicySnapshot,
+  ResyncReport,
   SettingsPayload,
   SkillRecord,
   SkillsPayload,
@@ -62,6 +63,7 @@ export function SettingsView(props: {
   onUpdateSkill: (id: string, patch: { enabled?: boolean; scope?: string }) => Promise<void>;
   onDeleteSkill: (id: string) => Promise<void>;
   onImportSkills: (input: { sourceDir: string; skillIds?: string[]; overwrite?: boolean }) => Promise<{ imported: string[]; skipped: string[] }>;
+  onResyncSkills: (input?: { sourceDirs?: string[]; skillIds?: string[]; dryRun?: boolean }) => Promise<ResyncReport>;
   onPickFolder: () => Promise<{ cancelled: boolean; folder?: InspectedFolder; error?: string }>;
   onInspectFolder: (path: string) => Promise<{ folder: InspectedFolder }>;
   onScanRoot: (path?: string) => Promise<{ cancelled: boolean; rootPath?: string; folders: InspectedFolder[]; error?: string }>;
@@ -93,6 +95,8 @@ export function SettingsView(props: {
   const [skillBody, setSkillBody] = useState("");
   const [customSkillDir, setCustomSkillDir] = useState("");
   const [importingSkillSource, setImportingSkillSource] = useState<string | null>(null);
+  const [resyncing, setResyncing] = useState(false);
+  const [resyncPreview, setResyncPreview] = useState<ResyncReport | null>(null);
 
   // Add platform / service connection form state
   const [newConnName, setNewConnName] = useState("");
@@ -1051,6 +1055,28 @@ export function SettingsView(props: {
                 <header className="card-head">
                   <span>已管理 Skill（{skills.length}）</span>
                   <div className="row" style={{ gap: 6 }}>
+                    {skills.some((s) => s.source === "managed") && (
+                      <button
+                        type="button"
+                        className="btn btn-sm"
+                        disabled={resyncing}
+                        onClick={async () => {
+                          setResyncing(true);
+                          setNotice(null);
+                          setErrorMsg(null);
+                          try {
+                            const report = await props.onResyncSkills({ dryRun: true });
+                            setResyncPreview(report);
+                          } catch (err) {
+                            setErrorMsg(formatError(err));
+                          } finally {
+                            setResyncing(false);
+                          }
+                        }}
+                      >
+                        {resyncing ? "检查中…" : "检查同步"}
+                      </button>
+                    )}
                     <button
                       type="button"
                       className="btn btn-sm"
@@ -1074,6 +1100,80 @@ export function SettingsView(props: {
                     </button>
                   </div>
                 </header>
+
+                {resyncPreview && (
+                  <div className="card-body stack" style={{ borderBottom: "1px solid var(--border)", background: "var(--sidebar)" }}>
+                    <div className="row" style={{ justifyContent: "space-between", flexWrap: "wrap", gap: 8 }}>
+                      <div className="row" style={{ gap: 8, flexWrap: "wrap" }}>
+                        <strong className="small">源目录同步差异预览</strong>
+                        <span className="badge-pill">有更新 {resyncPreview.updated.length}</span>
+                        <span className="badge-pill">无变化 {resyncPreview.unchanged.length}</span>
+                        {resyncPreview.missingSource.length > 0 && (
+                          <span className="badge-pill" style={{ color: "var(--warning)" }}>
+                            源缺失 {resyncPreview.missingSource.length}
+                          </span>
+                        )}
+                      </div>
+                      <div className="row" style={{ gap: 6 }}>
+                        {resyncPreview.updated.length > 0 && (
+                          <button
+                            type="button"
+                            className="btn btn-primary btn-sm"
+                            disabled={resyncing}
+                            onClick={async () => {
+                              setResyncing(true);
+                              setNotice(null);
+                              setErrorMsg(null);
+                              try {
+                                const applied = await props.onResyncSkills({ dryRun: false });
+                                setResyncPreview(null);
+                                setNotice(
+                                  `已同步更新 ${applied.updated.length} 个托管 Skill` +
+                                    `（无变化 ${applied.unchanged.length} 个` +
+                                    (applied.missingSource.length > 0 ? `，源缺失 ${applied.missingSource.length} 个` : "") +
+                                    "）",
+                                );
+                              } catch (err) {
+                                setErrorMsg(formatError(err));
+                              } finally {
+                                setResyncing(false);
+                              }
+                            }}
+                          >
+                            {resyncing ? "同步中…" : `确认同步更新（${resyncPreview.updated.length}）`}
+                          </button>
+                        )}
+                        <button type="button" className="btn btn-sm" onClick={() => setResyncPreview(null)}>
+                          关闭
+                        </button>
+                      </div>
+                    </div>
+                    {resyncPreview.updated.length === 0 ? (
+                      <div className="muted small">
+                        所有托管 Skill 的正文、元数据与附属文件均已与本机源目录保持一致。
+                      </div>
+                    ) : (
+                      <div className="stack" style={{ gap: 4 }}>
+                        {resyncPreview.entries
+                          .filter((e) => e.status === "updated")
+                          .map((entry) => {
+                            const tags: string[] = [];
+                            if (entry.bodyChanged) tags.push("正文更新");
+                            if (entry.frontmatterChanged) tags.push("元数据更新");
+                            if (entry.added.length > 0) tags.push(`+${entry.added.length} 附属文件`);
+                            if (entry.modified.length > 0) tags.push(`~${entry.modified.length} 附属修改`);
+                            if (entry.removed.length > 0) tags.push(`-${entry.removed.length} 附属移除`);
+                            return (
+                              <div key={entry.skillId} className="card-box row" style={{ justifyContent: "space-between", flexWrap: "wrap", gap: 6 }}>
+                                <span className="mono" style={{ fontWeight: 600 }}>/{entry.skillId}</span>
+                                <span className="muted small">{tags.join(" · ") || "内容有变更"}</span>
+                              </div>
+                            );
+                          })}
+                      </div>
+                    )}
+                  </div>
+                )}
 
                 {showSkillEditor && (
                   <div className="card-body stack" style={{ borderBottom: "1px solid var(--border)", background: "var(--sidebar)" }}>
@@ -1169,6 +1269,18 @@ export function SettingsView(props: {
                           <span style={{ fontWeight: 600 }}>{skill.name}</span>
                           <span className="badge-pill mono">/{skill.id}</span>
                           <span className="badge-pill">{skill.sourceLabel}</span>
+                          {typeof skill.sizeBytes === "number" && (
+                            <span className="muted mono" style={{ fontSize: 11 }}>{formatBytes(skill.sizeBytes)}</span>
+                          )}
+                          {skill.warnings && skill.warnings.length > 0 && (
+                            <span
+                              className="badge-pill"
+                              style={{ color: "var(--warning)" }}
+                              title={skill.warnings.join("；")}
+                            >
+                              提示 ({skill.warnings.length})
+                            </span>
+                          )}
                           <div className="row" style={{ marginLeft: "auto", gap: 6 }}>
                             <select
                               aria-label={`${skill.name} 范围`}
@@ -1233,6 +1345,11 @@ export function SettingsView(props: {
                           </div>
                         </div>
                         <div className="muted small">{skill.description}</div>
+                        {skill.warnings && skill.warnings.length > 0 && (
+                          <div className="small" style={{ color: "var(--warning)" }}>
+                            {skill.warnings.join("；")}
+                          </div>
+                        )}
                         <details className="finding-details" style={{ marginTop: 2 }}>
                           <summary>预览 SKILL.md（{skill.filePath}）</summary>
                           <pre className="finding-pre mono">{skill.bodyPreview}</pre>
@@ -1477,4 +1594,10 @@ function formatPolicyRules(rules: PolicyRuleItem[]): string {
       return rule.environment ? `${label}（${rule.environment}）` : label;
     })
     .join(" · ");
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  const kb = bytes / 1024;
+  return kb >= 100 ? `${Math.round(kb)} KB` : `${kb.toFixed(1)} KB`;
 }
